@@ -1,0 +1,90 @@
+[package]
+name = "mf-perch"
+version = "0.1.0"
+description = "让 AI Agent 像人类一样通过 MCP 与 SSH 访问和管理主机"
+authors = ["mf-perch"]
+edition = "2021"
+license = "Apache-2.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "mf_perch_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+# MCP Server 实现（阶段二）单独置于特性开关下，
+# 便于阶段一聚焦 SSH 引擎与数据层的编译与测试。
+mcp = ["dep:rmcp", "dep:axum"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-os = "2"
+tauri-plugin-store = "2"
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 异步运行时
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process"] }
+futures = "0.3"
+
+# SSH（D9：纯 Rust、异步、无 C 依赖）
+# 刻意使用 ring 而非默认的 aws-lc-rs：后者需要 cmake 与 nasm，
+# 在本机与多数开发机上并不具备，会让构建直接失败。ring 只需 C 编译器，
+# 与本项目"跨平台打包干净"的目标一致（D8）。
+# 密钥解析与 passphrase 解密由 russh 自带的 `keys` 模块提供，
+# 无需额外的 russh-keys 依赖（该 crate 的 ring 特性实际并不存在）。
+russh = { version = "0.63", default-features = false, features = ["flate2", "ring", "rsa"] }
+
+# MCP（D1：官方 Rust SDK，仅 Streamable HTTP）
+# 设为可选：阶段一不编译 MCP 层，缩短构建时间；阶段二用 --features mcp 启用。
+rmcp = { version = "3", features = ["transport-streamable-http-server"], optional = true }
+axum = { version = "0.8", optional = true }
+
+# 数据库
+rusqlite = { version = "0.40", features = ["bundled", "serde_json"] }
+
+# 加密与密钥管理（D6）
+aes-gcm = "0.11"
+argon2 = "0.6"
+rand = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+# 密钥管理（D6：K1 系统钥匙串，跨平台）
+# v1 特性包含 Windows 凭据管理器、macOS 钥匙串、Linux Secret Service（zbus，纯 Rust 实现）
+keyring = { version = "4", features = ["v1"] }
+base64 = "0.22"
+# 主机密钥指纹（SHA256，与 OpenSSH 显示格式一致）
+sha2 = "0.10"
+
+# 工具
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

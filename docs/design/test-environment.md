@@ -75,7 +75,7 @@ wsl --install -d Ubuntu
 | 项 | 状态 |
 | ---- | ---- |
 | openssh-server | ✅ 监听 `127.0.0.1:2222` |
-| 测试用户 `mfperch`（有 sudo 密码 `mfperch-test-pw`） | ✅ |
+| 测试用户 `mfperch`（有 sudo 密码 本地测试口令） | ✅ |
 | 免密 sudo 用户 `mfperch-nopass` | ✅ |
 | 测试密钥对（ed25519，无 passphrase） | ✅ |
 | 搭建脚本 | `/home/mf/setup-mfperch-test.sh` |
@@ -126,3 +126,30 @@ wsl --install -d Ubuntu
 - 免密 sudo 快速路径；
 - 长命令异步执行与轮询；
 - 连接断开、终端 broken 状态、归档与恢复。
+
+### 5.4 阶段一端到端实测结果（2026-09-10）
+
+阶段一的 SSH 会话层已在该环境完成端到端验证：`src-tauri/tests/ssh_integration.rs`
+的 5 项集成测试全部通过（走真实 SSH 协议，非 mock）。
+
+| 测试 | 验证内容 | 结果 |
+| ---- | ---- | ---- |
+| `connect_and_execute_simple_command` | 连接、认证、建会话、执行命令、退出码回传 | ✅ |
+| `session_preserves_cwd_and_env` | **`cd` 与 `export` 跨命令保留**（方案 C 核心语义，D3） | ✅ |
+| `session_reports_nonzero_exit_code` | 非零退出码正确回传，且会话仍可继续使用 | ✅ |
+| `session_handles_quoting_and_special_chars` | 含引号与 `$` 的命令无需转义（NUL 分帧的价值） | ✅ |
+| `session_is_not_confused_by_marker_like_output` | 输出中出现形似结束标记的文本时**不误判**（nonce 机制） | ✅ |
+
+运行方式（需先导出目标主机信息）：
+
+```bash
+export MFPERCH_TEST_HOST=127.0.0.1
+export MFPERCH_TEST_PORT=2222
+export MFPERCH_TEST_USER=mfperch
+export MFPERCH_TEST_KEY=<测试私钥路径>
+cargo test --test ssh_integration -- --ignored --test-threads=1
+```
+
+> 测试私钥位于 `.tmp-test/`（已被 `.gitignore` 排除，**绝不入库**）。
+
+单元测试合计 **104 项**，覆盖协议解析、输出截断、加解密、密钥分层、仓储与配额等。

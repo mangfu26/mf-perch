@@ -345,7 +345,7 @@
   - **发现并修复设计缺陷**：`sudo -A` 将 askpass 的 stdout 第一行视为密码，故"请求标记"必须写 **stderr**；`docs/design/sudo.md` 已修正。
 - **影响**：
   - 该环境可直接用于编码阶段的集成测试与回归验证。
-  - 测试凭据（`mfperch-test-pw`）为本地假值，仅存在于 WSL，**不入仓库**。
+  - 测试凭据（本地测试口令）为本地假值，仅存在于 WSL，**不入仓库**。
   - 老 RHEL `Defaults requiretty` 等真机特例无法在 WSL 覆盖，上线前建议真机抽验。
 
 ---
