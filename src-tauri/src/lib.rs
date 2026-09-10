@@ -7,6 +7,7 @@
 //! - [`terminal`]：终端运行时（会话池、串行命令队列、输出泵）
 //! - [`mcp`]：MCP Server（Streamable HTTP，供 AI Agent 调用）
 //! - [`ipc`]：Tauri IPC（供人类界面管理主机、凭据与 MCP 启停）
+//! - [`tray`]：托盘常驻与窗口关闭行为（D16：关窗不退出，MCP 持续运行）
 //!
 //! 安全边界（AGENTS.md 0.1 / D6）：
 //! 认证信息与 sudo 密码对 AI Agent 完全不可见，仅在应用进程内按需解密使用。
@@ -18,6 +19,7 @@ pub mod ssh;
 pub mod state;
 pub mod store;
 pub mod terminal;
+pub mod tray;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;
@@ -100,7 +102,17 @@ pub fn run() {
             ipc::mcp::mcp_set_auto_start,
             ipc::mcp::mcp_client_config,
         ])
+        .on_window_event(|window, event| {
+            // 关窗隐藏到托盘而非退出（D16）：否则 MCP 会随之下线、Agent 断连。
+            tray::on_window_event(window, event);
+        })
         .setup(move |app| {
+            // 创建托盘图标与菜单（D16）。
+            if let Err(e) = tray::setup(app.handle()) {
+                // 托盘失败不应阻断应用启动，但必须明确报出原因（P1）。
+                tracing::error!("创建托盘图标失败：{e}；关闭窗口可能直接退出应用");
+            }
+
             #[cfg(feature = "mcp")]
             {
                 // 若配置为自动启动，则在应用就绪后启动 MCP Server（D16：托盘常驻）。
