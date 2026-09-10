@@ -35,6 +35,17 @@ fn test_state() -> (Arc<AppState>, [u8; 32]) {
     (state, key)
 }
 
+/// 递归检查 JSON Schema 中是否存在数组形式的 `type`。
+fn contains_array_type(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .any(|(k, v)| (k == "type" && v.is_array()) || contains_array_type(v)),
+        serde_json::Value::Array(items) => items.iter().any(contains_array_type),
+        _ => false,
+    }
+}
+
 /// 读取测试目标环境变量；缺失时返回 `None`（测试跳过）。
 fn test_target() -> Option<(String, u16, String, String)> {
     Some((
@@ -216,6 +227,28 @@ async fn mcp_full_lifecycle_over_real_ssh() {
     ] {
         assert!(names.contains(&expected.to_string()), "缺少工具 {expected}，实际：{names:?}");
     }
+
+    // 工具 schema 必须是客户端普遍能接受的形态：`type` 不能是数组
+    // （MCP Inspector 等会告警，个别客户端会丢弃约束甚至拒绝工具）。
+    // 可空参数应表达为 `anyOf: [{...}, {"type": "null"}]`。
+    let tools_json = tools["result"]["tools"].as_array().expect("工具数组");
+    for tool in tools_json {
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["type"], serde_json::json!("object"), "{tool}");
+        assert!(
+            !contains_array_type(schema),
+            "工具 {} 的 inputSchema 含数组形式 type：{schema}",
+            tool["name"]
+        );
+    }
+    assert_eq!(
+        tools_json
+            .iter()
+            .find(|t| t["name"] == "run_command")
+            .expect("run_command")["inputSchema"]["properties"]["wait_seconds"]["anyOf"][1]["type"],
+        serde_json::json!("null"),
+        "wait_seconds 应以 anyOf + null 表达可空"
+    );
 
     // --- 3) list_hosts：应看到已种入的主机，且 ready ---
     let (hosts_resp, _) = mcp_call(

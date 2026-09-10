@@ -28,6 +28,44 @@ const MAX_WAIT_SECS: u64 = crate::domain::MAX_SYNC_WAIT_SECS;
 
 // ============================ 工具入参 ============================
 
+/// 可空参数的 JSON Schema 包装器（只参与 schema 生成，不参与序列化）。
+///
+/// schemars 1.x 默认把 `Option<T>` 生成为 `"type": ["integer", "null"]`。
+/// 这是合法的 JSON Schema 2020-12，但不少 MCP 客户端只接受 `type` 为单个
+/// 字符串，遇到数组形式的 `type` 会告警、丢弃该约束，甚至拒绝整个工具。
+/// 这里改用语义等价的 `anyOf` 表达可空，兼容性最好。
+///
+/// 用法：字段类型保持 `Option<T>`，改用
+/// `#[schemars(with = "Nullable<T>")]` 覆盖其 schema；两者需同时
+/// 保留 `#[serde(default)]`，否则字段会被判为必填。
+struct Nullable<T>(std::marker::PhantomData<T>);
+
+impl<T: JsonSchema> JsonSchema for Nullable<T> {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        format!("Nullable_{}", T::schema_name()).into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        format!("Nullable<{}>", T::schema_id()).into()
+    }
+
+    fn json_schema(generator: &mut rmcp::schemars::SchemaGenerator) -> rmcp::schemars::Schema {
+        let inner = generator.subschema_for::<T>();
+        rmcp::schemars::json_schema!({
+            "anyOf": [
+                inner,
+                { "type": "null" }
+            ]
+        })
+    }
+
+    /// 内联到使用处，避免生成 `$defs` + `$ref`：约束直接出现在参数上，
+    /// 对只做浅层解析的客户端更友好。
+    fn inline_schema() -> bool {
+        true
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EmptyParams {}
 
@@ -37,6 +75,7 @@ pub struct CreateTerminalParams {
     pub host_id: String,
     /// Optional human-readable name for this terminal.
     #[serde(default)]
+    #[schemars(with = "Nullable<String>")]
     pub name: Option<String>,
 }
 
@@ -55,6 +94,7 @@ pub struct RunCommandParams {
     /// Seconds to wait synchronously before returning a handle.
     /// Defaults to 30, maximum 50. Use `run_command_async` for long tasks.
     #[serde(default)]
+    #[schemars(with = "Nullable<u64>")]
     pub wait_seconds: Option<u64>,
 }
 
@@ -64,6 +104,7 @@ pub struct CommandStatusParams {
     pub command_id: String,
     /// Return only the last N lines of output. Omit to get everything.
     #[serde(default)]
+    #[schemars(with = "Nullable<usize>")]
     pub tail_lines: Option<usize>,
 }
 
@@ -296,6 +337,7 @@ impl McpService {
 pub struct OptionalHostIdParams {
     /// Optional host ID to filter terminals by.
     #[serde(default)]
+    #[schemars(with = "Nullable<String>")]
     pub host_id: Option<String>,
 }
 
@@ -314,11 +356,15 @@ impl McpService {
             );
         }
 
+        // 配额以用户设置为准：Agent 需据此判断何时该先归档终端。
+        // 若这里返回默认值，用户调高配额后 Agent 仍会误以为已满。
+        let settings = crate::settings::load(&conn)?;
+
         Ok(HostList {
             hosts: list,
             active_terminals: active,
-            quota_per_host: crate::domain::DEFAULT_TERMINAL_LIMIT_PER_HOST,
-            quota_global: crate::domain::DEFAULT_TERMINAL_LIMIT_GLOBAL,
+            quota_per_host: settings.quota_per_host,
+            quota_global: settings.quota_global,
         })
     }
 
@@ -526,5 +572,166 @@ mod tests {
     #[test]
     fn default_wait_seconds_matches_design() {
         assert_eq!(DEFAULT_WAIT_SECS, 30);
+    }
+
+    /// 递归查找指定键名，用于确认 schema 中没有出现 `$defs` / `$ref`。
+    fn find_key(
+        value: &serde_json::Value,
+        path: &str,
+        keys: &[&str],
+        hits: &mut Vec<String>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    if keys.contains(&k.as_str()) {
+                        hits.push(format!("{path}/{k}"));
+                    }
+                    find_key(v, &format!("{path}/{k}"), keys, hits);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    find_key(v, &format!("{path}[{i}]"), keys, hits);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 递归查找形如 `"type": ["integer", "null"]` 的数组形式 `type`。
+    fn find_array_type(value: &serde_json::Value, path: &str, hits: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(t) = map.get("type") {
+                    if t.is_array() {
+                        hits.push(format!("{path}/type = {t}"));
+                    }
+                }
+                for (k, v) in map {
+                    find_array_type(v, &format!("{path}/{k}"), hits);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    find_array_type(v, &format!("{path}[{i}]"), hits);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn tool_schemas_do_not_use_array_type() {
+        // 数组形式的 `type` 会触发 MCP Inspector 等客户端的 schema 告警，
+        // 个别客户端还会丢弃约束甚至拒绝工具。可空参数一律用 anyOf 表达。
+        let mut hits = Vec::new();
+        for t in McpService::tool_router().list_all() {
+            find_array_type(
+                &serde_json::Value::Object(t.input_schema.as_ref().clone()),
+                &t.name,
+                &mut hits,
+            );
+        }
+        assert!(hits.is_empty(), "存在数组形式的 type：{hits:#?}");
+    }
+
+    /// 断言某个可空参数用 `anyOf` + `null` 表达，且不在 `required` 中。
+    fn assert_nullable_anyof(tool: &str, field: &str, inner_type: &str) {
+        let router = McpService::tool_router();
+        let def = router.get(tool).unwrap_or_else(|| panic!("缺少工具 {tool}"));
+        let prop = &def.input_schema["properties"][field];
+        let branches = prop["anyOf"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{tool}.{field} 应为 anyOf：{prop}"));
+
+        assert!(
+            branches
+                .iter()
+                .any(|b| b["type"] == serde_json::json!("null")),
+            "{tool}.{field} 的 anyOf 应包含 null 分支：{prop}"
+        );
+        assert!(
+            branches
+                .iter()
+                .any(|b| b["type"] == serde_json::json!(inner_type)),
+            "{tool}.{field} 的 anyOf 应包含 {inner_type} 分支：{prop}"
+        );
+
+        // 可空不等于必填：带 default 的字段不应出现在 required 中。
+        if let Some(required) = def.input_schema.get("required").and_then(|v| v.as_array()) {
+            assert!(
+                !required.iter().any(|v| v == field),
+                "{tool}.{field} 不应是必填项"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_params_use_anyof_with_null() {
+        assert_nullable_anyof("create_terminal", "name", "string");
+        assert_nullable_anyof("list_terminals", "host_id", "string");
+        assert_nullable_anyof("run_command", "wait_seconds", "integer");
+        assert_nullable_anyof("run_command_async", "wait_seconds", "integer");
+        assert_nullable_anyof("get_command_status", "tail_lines", "integer");
+    }
+
+    #[test]
+    fn optional_params_accept_absent_and_null() {
+        // 两种写法都必须能反序列化：缺省字段与显式 null 均表示"未提供"。
+        let absent: RunCommandParams =
+            serde_json::from_value(serde_json::json!({
+                "terminal_id": "t1", "command": "ls"
+            }))
+            .expect("缺省 wait_seconds 应可解析");
+        assert_eq!(absent.wait_seconds, None);
+
+        let explicit_null: RunCommandParams =
+            serde_json::from_value(serde_json::json!({
+                "terminal_id": "t1", "command": "ls", "wait_seconds": null
+            }))
+            .expect("wait_seconds 为 null 应可解析");
+        assert_eq!(explicit_null.wait_seconds, None);
+
+        let value: RunCommandParams =
+            serde_json::from_value(serde_json::json!({
+                "terminal_id": "t1", "command": "ls", "wait_seconds": 12
+            }))
+            .expect("应可解析");
+        assert_eq!(value.wait_seconds, Some(12));
+    }
+
+    #[tokio::test]
+    async fn list_hosts_reports_configured_quota() {
+        // 用户调高配额后，Agent 必须看到新值；否则它会误以为已达上限，
+        // 在明明还能创建终端时提前归档。
+        let conn = crate::store::db::open_in_memory().expect("内存库");
+        crate::settings::set(&conn, crate::settings::SETTING_QUOTA_PER_HOST, "8")
+            .expect("写入配额");
+        crate::settings::set(&conn, crate::settings::SETTING_QUOTA_GLOBAL, "50")
+            .expect("写入配额");
+
+        let key = crate::store::crypto::generate_master_key();
+        let service = McpService::new(Arc::new(AppState::new_for_test(conn, key)));
+        let list = service.list_hosts_impl().await.expect("list_hosts 应成功");
+
+        assert_eq!(list.quota_per_host, 8);
+        assert_eq!(list.quota_global, 50);
+    }
+
+    #[test]
+    fn tool_schemas_have_no_refs_or_defs() {
+        // 内联生成可避免 $defs/$ref，对只做浅层解析的客户端更稳妥。
+        let router = McpService::tool_router();
+        let mut hits = Vec::new();
+        for t in router.list_all() {
+            find_key(
+                &serde_json::Value::Object(t.input_schema.as_ref().clone()),
+                &t.name,
+                &["$defs", "$ref"],
+                &mut hits,
+            );
+        }
+        assert!(hits.is_empty(), "schema 中不应出现 $defs / $ref：{hits:#?}");
     }
 }
