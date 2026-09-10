@@ -8,6 +8,7 @@
 //! - [`mcp`]：MCP Server（Streamable HTTP，供 AI Agent 调用）
 //! - [`ipc`]：Tauri IPC（供人类界面管理主机、凭据与 MCP 启停）
 //! - [`tray`]：托盘常驻与窗口关闭行为（D16：关窗不退出，MCP 持续运行）
+//! - [`sudo_bridge`]：ask 模式的用户确认桥接（Q33）
 //!
 //! 安全边界（AGENTS.md 0.1 / D6）：
 //! 认证信息与 sudo 密码对 AI Agent 完全不可见，仅在应用进程内按需解密使用。
@@ -18,6 +19,7 @@ pub mod ipc;
 pub mod ssh;
 pub mod state;
 pub mod store;
+pub mod sudo_bridge;
 pub mod terminal;
 pub mod tray;
 
@@ -56,6 +58,9 @@ pub fn run() {
     #[cfg(feature = "mcp")]
     let mcp_manager = Arc::new(mcp::McpManager::new(state.clone()));
 
+    // ask 模式的用户确认桥接（Q33）。
+    let sudo_bridge = sudo_bridge::SudoBridge::new();
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -63,7 +68,8 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_store::Builder::new().build())
-        .manage(state);
+        .manage(state)
+        .manage(sudo_bridge.clone());
 
     #[cfg(feature = "mcp")]
     let builder = builder.manage(mcp_manager.clone());
@@ -101,6 +107,8 @@ pub fn run() {
             ipc::mcp::mcp_set_allow_remote,
             ipc::mcp::mcp_set_auto_start,
             ipc::mcp::mcp_client_config,
+            // sudo 确认（Q33 ask 模式）
+            sudo_bridge::sudo_respond,
         ])
         .on_window_event(|window, event| {
             // 关窗隐藏到托盘而非退出（D16）：否则 MCP 会随之下线、Agent 断连。
@@ -111,6 +119,20 @@ pub fn run() {
             if let Err(e) = tray::setup(app.handle()) {
                 // 托盘失败不应阻断应用启动，但必须明确报出原因（P1）。
                 tracing::error!("创建托盘图标失败：{e}；关闭窗口可能直接退出应用");
+            }
+
+            // 把 ask 模式的确认桥接注入终端运行时（Q33）。
+            // 未注入时 ask 模式一律按拒绝处理（fail-closed），
+            // 因此这一步是 ask 模式可用的前提。
+            {
+                let runtime = {
+                    let state = app.state::<Arc<state::AppState>>().inner().clone();
+                    state.terminals.clone()
+                };
+                let asker = sudo_bridge.as_asker(app.handle().clone());
+                tauri::async_runtime::spawn(async move {
+                    runtime.set_sudo_asker(asker).await;
+                });
             }
 
             #[cfg(feature = "mcp")]

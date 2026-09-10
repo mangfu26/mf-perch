@@ -168,7 +168,9 @@ impl Session {
             .await
             .map_err(|e| AppError::SshConnect(format!("打开 SSH 会话通道失败：{e}")))?;
 
-        let script = protocol::wrapper_script(&nonce, host.init_script.as_deref());
+        // sudo_enabled 决定是否注入 sudo 拦截函数（Q33 三模式）。
+        let script =
+            protocol::wrapper_script(&nonce, host.init_script.as_deref(), sudo_enabled);
         channel
             .exec(true, script.as_bytes())
             .await
@@ -309,34 +311,84 @@ impl Session {
         Ok(())
     }
 
-    /// 向 sudo FIFO 写入密码（Q33 模式二/三）。
+    /// 向 sudo FIFO 写入密码（Q33 模式二/三的"允许注入"）。
     ///
     /// 走**独立的 SSH channel**，避免污染命令帧协议与输出解析；
     /// 密码经内存传递，不落盘、不进环境变量。
+    ///
+    /// 用 heredoc 写入而非 `printf`：密码可能含 `%`、`\`、`$`、引号等，
+    /// 带引号的 heredoc（`<<'标记'`）不做任何展开，无需转义即可安全传递。
+    ///
+    /// 写端不会阻塞：askpass 已用 `exec 3<>fifo`（O_RDWR）打开 FIFO，
+    /// 因此这里的 `cat > fifo`（O_WRONLY）一定能立刻找到读者。
     pub async fn send_sudo_password(&self, password: &str) -> Result<()> {
+        // 随机结尾标记，避免密码内容恰好包含标记串而提前结束 heredoc。
+        let marker = format!("MFPERCH_SUDO_{}", protocol::new_nonce());
+        let fifo = self.fifo_path();
+
+        debug_assert!(!password.contains(&marker));
+
+        let script = format!(
+            "cat > \"{fifo}\" <<'{marker}'\n{password}\n{marker}\n",
+            fifo = fifo,
+            marker = marker,
+            password = password,
+        );
+
+        self.exec_sudo_helper(&script, "写入 sudo 密码").await
+    }
+
+    /// 让 sudo 认证失败（Q33 "拒绝"）。
+    ///
+    /// 写入一个**空行**：askpass 读到空密码交给 sudo，认证随即失败，
+    /// 命令正常结束并返回非零退出码。
+    ///
+    /// 为什么不用"关闭 FIFO 让 read 得到 EOF"：askpass 以 O_RDWR 持有该
+    /// FIFO，EOF 不会因外部关闭写端而出现。写入空值是更直接、更可靠的做法。
+    ///
+    /// 这一步**必不可少**：若不响应，askpass 会一直阻塞在 `read` 上，
+    /// 而命令串行执行，后续排队命令会全部卡死。
+    pub async fn deny_sudo(&self) -> Result<()> {
+        let fifo = self.fifo_path();
+        let script = format!("printf '\\n' > \"{fifo}\"\n");
+        self.exec_sudo_helper(&script, "拒绝 sudo 注入").await
+    }
+
+    /// 本会话专属的 sudo FIFO 路径。
+    ///
+    /// 按会话唯一（含 nonce），避免多个会话的 FIFO 互相替换文件节点。
+    fn fifo_path(&self) -> String {
+        format!(
+            "$HOME/{}/{}",
+            protocol::REMOTE_DIR,
+            protocol::sudo_fifo_name(&self.nonce)
+        )
+    }
+
+    /// 在独立 channel 上执行一段 sudo 辅助脚本。
+    async fn exec_sudo_helper(&self, script: &str, what: &str) -> Result<()> {
         let channel = self
             .handle
             .channel_open_session()
             .await
             .map_err(|e| AppError::SshConnect(format!("打开 sudo 通道失败：{e}")))?;
 
-        let fifo = format!("$HOME/{}/{}", protocol::REMOTE_DIR, protocol::SUDO_FIFO_NAME);
-        // 用 printf 写入，避免 echo 的行为差异；单引号包裹防止内容被解释。
-        let cmd = format!("printf '%s\\n' {}\n", shell_single_quote(password));
-        let script = format!("cat > {fifo} <<'MFPERCH_SUDO'\n{password}\nMFPERCH_SUDO\n");
-
-        // 优先使用 heredoc：无需转义密码中的特殊字符。
-        let _ = cmd;
-
         channel
             .exec(true, script.as_bytes())
             .await
-            .map_err(|e| AppError::SshConnect(format!("写入 sudo 密码失败：{e}")))?;
+            .map_err(|e| AppError::SshConnect(format!("{what}失败：{e}")))?;
 
-        channel
-            .eof()
-            .await
-            .map_err(|e| AppError::SshConnect(format!("关闭 sudo 通道失败：{e}")))?;
+        // 等待命令结束，确保写入在返回前完成——
+        // 否则调用方可能在 FIFO 尚未写入时就继续，askpass 仍会读到旧值。
+        let mut reader = channel.split().0;
+        loop {
+            match reader.wait().await {
+                Some(russh::ChannelMsg::Eof)
+                | Some(russh::ChannelMsg::Close)
+                | None => break,
+                Some(_) => {}
+            }
+        }
 
         Ok(())
     }
@@ -358,11 +410,6 @@ impl Session {
             .map_err(|e| AppError::SshConnect(format!("断开连接失败：{e}")))?;
         Ok(())
     }
-}
-
-/// 把单引号转义为可在 shell 单引号字符串中安全使用。
-fn shell_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// 从字节缓冲中切分完整行，逐行解析为会话事件。
@@ -442,15 +489,6 @@ fn parse_env_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shell_single_quote_escapes_quotes() {
-        assert_eq!(shell_single_quote("abc"), "'abc'");
-        // 密码中的单引号必须被转义，否则会破坏 shell 语法。
-        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
-        // 特殊字符在单引号内无需转义。
-        assert_eq!(shell_single_quote("$HOME `id`;rm -rf /"), "'$HOME `id`;rm -rf /'");
-    }
 
     #[test]
     fn consume_lines_handles_partial_line() {

@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{oneshot, Mutex, Notify};
 
 use crate::domain::command::{CommandRecord, CommandStatus};
 use crate::domain::host::SudoPolicy;
@@ -35,8 +35,21 @@ use crate::ssh::{Session, SessionOutput};
 use crate::store::crypto::KEY_LEN;
 use crate::store::{commands as cmd_store, credentials, hosts, terminals};
 
+pub mod sudo;
+
+pub use sudo::{
+    resolve_action, policy_description, validate_for_policy, SudoAction, SudoContext,
+    SudoDecision, SudoRequest,
+};
+
 /// 数据库句柄类型（见 [`crate::store::Db`]）。
 pub type Db = crate::store::Db;
+
+/// ask 模式下等待用户响应的回调。
+///
+/// 由上层（Tauri 层）实现：发系统通知并等待用户点"允许/拒绝"。
+/// 运行时不直接依赖 Tauri，以便在测试中使用固定决策的替身。
+pub type SudoAsker = Arc<dyn Fn(SudoRequest) -> oneshot::Receiver<SudoDecision> + Send + Sync>;
 
 /// 正在执行的命令的共享状态。
 struct ActiveCommand {
@@ -59,6 +72,12 @@ struct TerminalEntry {
     active: Arc<Mutex<Option<ActiveCommand>>>,
     /// 命令结束时唤醒等待者（同步调用用）。
     finished: Arc<Notify>,
+    /// sudo 配置（Q33）；密码在内，会话结束时随条目释放。
+    sudo: Arc<SudoContext>,
+    /// 主机显示名，用于 ask 模式的通知文案。
+    host_label: String,
+    /// ask 模式下的用户确认回调。
+    asker: SudoAsker,
 }
 
 /// 终端运行时。
@@ -69,6 +88,8 @@ pub struct TerminalRuntime {
     max_output_bytes: AtomicUsize,
     max_output_lines: AtomicUsize,
     queue_limit: AtomicUsize,
+    /// ask 模式的确认回调；未设置时 ask 模式一律按拒绝处理（fail-closed）。
+    asker: Mutex<Option<SudoAsker>>,
 }
 
 /// 执行命令的结果（对应 Q4 的同步/异步两种返回）。
@@ -91,7 +112,16 @@ impl TerminalRuntime {
             max_output_bytes: AtomicUsize::new(DEFAULT_MAX_OUTPUT_BYTES),
             max_output_lines: AtomicUsize::new(DEFAULT_MAX_OUTPUT_LINES),
             queue_limit: AtomicUsize::new(DEFAULT_COMMAND_QUEUE_LIMIT),
+            asker: Mutex::new(None),
         }
+    }
+
+    /// 设置 ask 模式的用户确认回调（由 Tauri 层在启动时注入）。
+    ///
+    /// 未设置时 ask 模式一律按拒绝处理——宁可不提权，
+    /// 也不能在无人确认的情况下悄悄注入密码（Q33 / P2）。
+    pub async fn set_sudo_asker(&self, asker: SudoAsker) {
+        *self.asker.lock().await = Some(asker);
     }
 
     /// 配置输出与队列上限（供设置页调整）。
@@ -125,7 +155,7 @@ impl TerminalRuntime {
         name: Option<String>,
     ) -> Result<Terminal> {
         // --- 阶段 1：读取所需信息并落库终端记录 ---
-        let (terminal, host, credential, sudo_enabled) = {
+        let (terminal, host, credential, sudo_ctx) = {
             let conn = db.lock().await;
 
             let host = hosts::get(&conn, host_id)?;
@@ -140,16 +170,18 @@ impl TerminalRuntime {
             // 配额校验（Q11）：归档终端不占配额。
             terminals::check_quota_default(&conn, host_id)?;
 
+            // 解析 sudo 密码（Q33）：可能来自主机单独配置，或复用登录密码。
+            let sudo_ctx = build_sudo_context(&conn, &host, &credential, key)?;
+
             let terminal = Terminal::new(host_id, name);
             terminals::insert(&conn, &terminal)?;
 
-            // `deny` 模式下不部署 askpass，使 sudo 天然失败（Q33 模式一）。
-            let sudo_enabled = matches!(host.sudo_policy, SudoPolicy::Ask | SudoPolicy::Auto);
-
-            (terminal, host, credential, sudo_enabled)
+            (terminal, host, credential, sudo_ctx)
             // 锁在此释放——SSH 连接期间不占用数据库。
         };
 
+        // askpass 仅在三模式中的 ask/auto 下部署（Q33）。
+        let sudo_enabled = sudo_ctx.needs_askpass();
         let auth = AuthMethod::from_credential(&credential);
 
         // --- 阶段 2：建立会话（无数据库锁） ---
@@ -169,7 +201,8 @@ impl TerminalRuntime {
                     terminal.env_snapshot = Some(snapshot);
                 }
 
-                self.register(&terminal.id, session, rx).await;
+                self.register(&terminal.id, session, rx, sudo_ctx, host_label(&host))
+                    .await;
                 Ok(terminal)
             }
             Err(e) => {
@@ -189,13 +222,27 @@ impl TerminalRuntime {
         terminal_id: &str,
         session: Session,
         rx: tokio::sync::mpsc::Receiver<SessionOutput>,
+        sudo: SudoContext,
+        host_label: String,
     ) {
+        // ask 模式需要确认回调；未注入时保持 `None`，
+        // 届时 resolve_action 会按"无人确认"处理为拒绝（fail-closed）。
+        let asker: SudoAsker = self
+            .asker
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| Arc::new(|_| oneshot::channel().1));
+
         let entry = Arc::new(TerminalEntry {
             session: Arc::new(session),
             exec_lock: Arc::new(Mutex::new(())),
             inflight: Arc::new(AtomicUsize::new(0)),
             active: Arc::new(Mutex::new(None)),
             finished: Arc::new(Notify::new()),
+            sudo: Arc::new(sudo),
+            host_label,
+            asker,
         });
 
         spawn_output_pump(entry.clone(), rx);
@@ -237,7 +284,7 @@ impl TerminalRuntime {
         terminal_id: &str,
     ) -> Result<Terminal> {
         // --- 阶段 1：校验并取所需信息 ---
-        let (terminal, host, credential, sudo_enabled) = {
+        let (terminal, host, credential, sudo_ctx) = {
             let conn = db.lock().await;
 
             let terminal = terminals::get(&conn, terminal_id)?;
@@ -257,16 +304,19 @@ impl TerminalRuntime {
                 .ok_or_else(|| AppError::CredentialNotFound("该主机尚未绑定认证信息".into()))?;
             let credential = credentials::get(&conn, &credential_id, key)?;
 
-            let sudo_enabled = matches!(host.sudo_policy, SudoPolicy::Ask | SudoPolicy::Auto);
+            // 恢复时同样按当前主机配置重建 sudo 上下文（Q33）。
+            let sudo_ctx = build_sudo_context(&conn, &host, &credential, key)?;
 
-            (terminal, host, credential, sudo_enabled)
+            (terminal, host, credential, sudo_ctx)
         };
 
+        let sudo_enabled = sudo_ctx.needs_askpass();
         let auth = AuthMethod::from_credential(&credential);
 
         // --- 阶段 2：重建会话 ---
         let (session, rx) = Session::connect(&terminal.id, &host, auth, sudo_enabled).await?;
-        self.register(&terminal.id, session, rx).await;
+        self.register(&terminal.id, session, rx, sudo_ctx, host_label(&host))
+            .await;
 
         // --- 阶段 3：更新状态 ---
         let mut t = terminal;
@@ -557,8 +607,13 @@ fn spawn_output_pump(entry: Arc<TerminalEntry>, mut rx: tokio::sync::mpsc::Recei
                     entry.finished.notify_waiters();
                 }
                 SessionOutput::SudoRequest => {
-                    // sudo 注入逻辑在阶段三实现（Q33）。
-                    tracing::debug!("收到 sudo 密码请求，等待注入策略处理");
+                    // Q33：按该主机的策略决定是否注入密码。
+                    // 关键词：ask 模式会等待用户确认，因此这里必须
+                    // **脱离输出泵的读取循环**去处理，否则会阻塞后续输出。
+                    let entry = entry.clone();
+                    tokio::spawn(async move {
+                        handle_sudo_request(&entry).await;
+                    });
                 }
                 SessionOutput::Disconnected { reason } => {
                     tracing::warn!("终端连接已断开：{reason}");
@@ -603,6 +658,122 @@ fn tail(s: &str, n: usize) -> String {
         return s.to_string();
     }
     lines[lines.len() - n..].join("\n")
+}
+
+/// 主机的显示名，用于 sudo 通知文案。
+fn host_label(host: &crate::domain::host::Host) -> String {
+    host.name
+        .clone()
+        .unwrap_or_else(|| format!("{}:{}", host.address, host.port))
+}
+
+/// 解析主机的 sudo 配置（Q33）。
+///
+/// 密码来源有两种：主机单独配置，或复用 SSH 登录密码。
+/// 复用仅在登录认证为密码方式时可行——密钥登录没有密码可复用，
+/// 此时明确报错而不是让 sudo 在后面神秘失败（P1）。
+fn build_sudo_context(
+    conn: &rusqlite::Connection,
+    host: &crate::domain::host::Host,
+    credential: &crate::domain::credential::Credential,
+    key: &[u8; KEY_LEN],
+) -> Result<SudoContext> {
+    use crate::domain::host::SudoPasswordSource;
+    use crate::domain::credential::CredentialKind;
+    use zeroize::Zeroizing;
+
+    // deny 模式不需要密码，直接返回，避免无谓地解密敏感数据。
+    if host.sudo_policy == SudoPolicy::Deny {
+        return Ok(SudoContext {
+            policy: SudoPolicy::Deny,
+            password: None,
+        });
+    }
+
+    let password: Option<Zeroizing<String>> = match host.sudo_password_source {
+        SudoPasswordSource::Own => hosts::get_sudo_password(conn, &host.id, key)?
+            .map(Zeroizing::new),
+        SudoPasswordSource::ReuseLogin => match credential.kind {
+            CredentialKind::Password => Some(Zeroizing::new(credential.secret.clone())),
+            CredentialKind::Key => None,
+        },
+    };
+
+    let ctx = SudoContext {
+        policy: host.sudo_policy,
+        password,
+    };
+
+    // 配置不自洽时立即报错：提前在创建终端时暴露，
+    // 好过让 Agent 执行 sudo 时收到难以理解的失败。
+    validate_for_policy(host.sudo_policy, ctx.password.is_some())?;
+
+    Ok(ctx)
+}
+
+/// 等待用户对 sudo 请求的响应超时（Q33：拒绝或超时都让 sudo 失败）。
+const SUDO_ASK_TIMEOUT: Duration = Duration::from_secs(crate::domain::SUDO_ASK_TIMEOUT_SECS);
+
+/// 处理一次 sudo 请求：按策略决定注入还是拒绝（Q33）。
+async fn handle_sudo_request(entry: &TerminalEntry) {
+    let sudo = entry.sudo.clone();
+    let has_password = sudo.password.is_some();
+
+    // ask 模式：先取用户决策，带超时。
+    let decision = if sudo.policy == SudoPolicy::Ask {
+        let request = SudoRequest {
+            request_id: crate::domain::new_id("sudo"),
+            terminal_id: entry.session.terminal_id().to_string(),
+            host_label: entry.host_label.clone(),
+        };
+
+        let rx = (entry.asker)(request);
+        match tokio::time::timeout(SUDO_ASK_TIMEOUT, rx).await {
+            Ok(Ok(d)) => Some(d),
+            // 用户拒绝、通道异常、或超时：一律视为拒绝。
+            Ok(Err(_)) => Some(SudoDecision::Deny),
+            Err(_) => {
+                tracing::info!("sudo 确认请求超时，按拒绝处理");
+                Some(SudoDecision::on_timeout())
+            }
+        }
+    } else {
+        None
+    };
+
+    match resolve_action(sudo.policy, has_password, decision) {
+        SudoAction::Inject => {
+            let password = sudo
+                .password
+                .as_deref()
+                .map(|s| s.as_str())
+                .unwrap_or_default();
+
+            match entry.session.send_sudo_password(password).await {
+                Ok(()) => tracing::info!(
+                    host = %entry.host_label,
+                    "已按策略注入 sudo 密码"
+                ),
+                Err(e) => {
+                    // 注入失败仍必须让 sudo 结束，否则命令会一直挂着。
+                    tracing::error!("注入 sudo 密码失败：{e}");
+                    let _ = entry.session.deny_sudo().await;
+                }
+            }
+        }
+        SudoAction::Deny => {
+            // 关键：必须主动关闭 FIFO 让 askpass 的 read 返回 EOF。
+            // 否则 askpass 永久阻塞，命令串行执行，整条队列都会被拖死。
+            if let Err(e) = entry.session.deny_sudo().await {
+                tracing::error!("关闭 sudo FIFO 失败：{e}");
+            }
+            tracing::info!(
+                host = %entry.host_label,
+                policy = ?sudo.policy,
+                "已拒绝 sudo 密码注入"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

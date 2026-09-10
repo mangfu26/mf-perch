@@ -249,6 +249,19 @@ export default {
     disclaimer: "认证信息与 sudo 密码均由系统级加密保护，AI Agent 无法读取。",
   },
 
+  sudo: {
+    title: "sudo 提权请求",
+    message:
+      "AI Agent 在主机「{host}」上执行了需要 sudo 的命令，正在等待你决定是否注入密码。",
+    allow: "允许并执行",
+    deny: "拒绝",
+    timeoutHint: "剩余响应时间（超时视为拒绝）",
+    denyHint:
+      "拒绝后该命令会因缺少密码而失败。允许则本次会注入密码，密码不会写入远端磁盘。",
+    injected: "已注入密码",
+    denied: "已拒绝",
+  },
+
   status: {
     connected: "已连接",
     disconnected: "未连接",

@@ -1,19 +1,22 @@
 <script setup lang="ts">
 /**
- * 应用外壳：侧边栏 + 主内容区 + 全局提示。
+ * 应用外壳：侧边栏 + 主内容区 + 全局提示 + sudo 确认。
  *
  * 全局提示承载后端错误（如密钥未解锁、MCP 启动失败），
  * 避免错误只落在某个组件里被忽略（P1：明确报错）。
  */
-import { onMounted } from "vue";
+import { onMounted, onUnmounted } from "vue";
 import { useI18n } from "vue-i18n";
 import { AlertCircle, CheckCircle2, X } from "lucide-vue-next";
 import AppSidebar from "@/components/layout/AppSidebar.vue";
+import SudoConfirmDialog from "@/components/sudo/SudoConfirmDialog.vue";
 import { useAppStore } from "@/stores/app";
 import { useMcpStore } from "@/stores/mcp";
+import { useSudoStore } from "@/stores/sudo";
 
 const app = useAppStore();
 const mcp = useMcpStore();
+const sudo = useSudoStore();
 const { t } = useI18n();
 
 onMounted(async () => {
@@ -21,7 +24,11 @@ onMounted(async () => {
   await app.refreshKeyStatus();
   await mcp.refresh();
   await mcp.loadClientConfig();
+  // 监听 sudo 提权请求（Q33 ask 模式）。
+  await sudo.startListening();
 });
+
+onUnmounted(() => sudo.stopListening());
 </script>
 
 <template>
@@ -86,6 +93,10 @@ onMounted(async () => {
         <p class="text-[12.5px] text-text-base">{{ app.lastNotice }}</p>
       </div>
     </Transition>
+
+    <!-- sudo 提权确认（Q33 ask 模式）：必须挂在外壳层，
+         因为窗口可能被隐藏到托盘后由后端唤出，此时路由组件未必已挂载 -->
+    <SudoConfirmDialog />
   </div>
   <span class="sr-only">{{ t("app.tagline") }}</span>
 </template>
