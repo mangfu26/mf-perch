@@ -10,6 +10,8 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "vue-tsc --noEmit",
+    "dev:clean": "node scripts/clean-dev.mjs",
+    "check:secrets": "bash scripts/check-secrets.sh",
     "tauri": "tauri"
   },
   "dependencies": {
