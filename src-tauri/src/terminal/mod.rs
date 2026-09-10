@@ -24,10 +24,7 @@ use tokio::sync::{oneshot, Mutex, Notify};
 use crate::domain::command::{CommandRecord, CommandStatus};
 use crate::domain::host::SudoPolicy;
 use crate::domain::terminal::{Terminal, TerminalStatus};
-use crate::domain::{
-    now_rfc3339, DEFAULT_COMMAND_QUEUE_LIMIT, DEFAULT_MAX_OUTPUT_BYTES,
-    DEFAULT_MAX_OUTPUT_LINES,
-};
+use crate::domain::now_rfc3339;
 use crate::error::{AppError, Result};
 use crate::ssh::auth::AuthMethod;
 use crate::ssh::output::OutputAccumulator;
@@ -81,13 +78,12 @@ struct TerminalEntry {
 }
 
 /// 终端运行时。
+///
+/// 输出与队列上限**不在此缓存**：执行命令时从数据库读取（见 [`TerminalRuntime::run_command`]），
+/// 这样用户在设置页调整后立即生效，也少一处"忘记同步"的可能。
 #[derive(Default)]
 pub struct TerminalRuntime {
     entries: Mutex<HashMap<String, Arc<TerminalEntry>>>,
-    /// 命令输出上限（字节 / 行），可配置。
-    max_output_bytes: AtomicUsize,
-    max_output_lines: AtomicUsize,
-    queue_limit: AtomicUsize,
     /// ask 模式的确认回调；未设置时 ask 模式一律按拒绝处理（fail-closed）。
     asker: Mutex<Option<SudoAsker>>,
 }
@@ -109,9 +105,6 @@ impl TerminalRuntime {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
-            max_output_bytes: AtomicUsize::new(DEFAULT_MAX_OUTPUT_BYTES),
-            max_output_lines: AtomicUsize::new(DEFAULT_MAX_OUTPUT_LINES),
-            queue_limit: AtomicUsize::new(DEFAULT_COMMAND_QUEUE_LIMIT),
             asker: Mutex::new(None),
         }
     }
@@ -122,13 +115,6 @@ impl TerminalRuntime {
     /// 也不能在无人确认的情况下悄悄注入密码（Q33 / P2）。
     pub async fn set_sudo_asker(&self, asker: SudoAsker) {
         *self.asker.lock().await = Some(asker);
-    }
-
-    /// 配置输出与队列上限（供设置页调整）。
-    pub fn configure(&self, max_bytes: usize, max_lines: usize, queue_limit: usize) {
-        self.max_output_bytes.store(max_bytes, Ordering::Relaxed);
-        self.max_output_lines.store(max_lines, Ordering::Relaxed);
-        self.queue_limit.store(queue_limit, Ordering::Relaxed);
     }
 
     /// 该终端是否已建立连接。
@@ -167,8 +153,14 @@ impl TerminalRuntime {
             })?;
             let credential = credentials::get(&conn, &credential_id, key)?;
 
-            // 配额校验（Q11）：归档终端不占配额。
-            terminals::check_quota_default(&conn, host_id)?;
+            // 配额校验（Q11）：归档终端不占配额，上限取自可配置设置。
+            let settings = crate::settings::load(&conn)?;
+            terminals::check_quota(
+                &conn,
+                host_id,
+                settings.quota_per_host,
+                settings.quota_global,
+            )?;
 
             // 解析 sudo 密码（Q33）：可能来自主机单独配置，或复用登录密码。
             let sudo_ctx = build_sudo_context(&conn, &host, &credential, key)?;
@@ -295,7 +287,13 @@ impl TerminalRuntime {
             }
 
             // 恢复前重新校验配额——期间可能已被其他终端占满（Q11）。
-            terminals::check_quota_default(&conn, &terminal.host_id)?;
+            let settings = crate::settings::load(&conn)?;
+            terminals::check_quota(
+                &conn,
+                &terminal.host_id,
+                settings.quota_per_host,
+                settings.quota_global,
+            )?;
 
             let host = hosts::get(&conn, &terminal.host_id)?;
             let credential_id = host
@@ -353,21 +351,23 @@ impl TerminalRuntime {
             .cloned()
             .ok_or_else(|| AppError::TerminalBroken(terminal_id.to_string()))?;
 
-        // 队列上限（Q4）：超出直接拒绝，避免无限堆积。
-        let limit = self.queue_limit.load(Ordering::Relaxed);
-        if entry.inflight.load(Ordering::SeqCst) >= limit {
-            return Err(AppError::CommandQueueFull { limit });
-        }
-
-        // 落库命令记录。初始状态为 `queued`——同一终端串行执行，
-        // 真正开始跑时（取得执行锁后）才置为 `running`（Q4）。
-        let record = {
+        // 每次执行都读取一次设置：这样用户在设置页调整后立即生效，
+        // 无需额外的"同步配置到运行时"路径（少一处可能忘记同步的地方）。
+        // 与该命令记录的写入合并到同一次加锁，避免多占一次锁。
+        let (record, cfg) = {
             let conn = db.lock().await;
+            let cfg = crate::settings::load(&conn)?;
             let seq = cmd_store::next_seq(&conn, terminal_id)?;
             let r = CommandRecord::new(terminal_id, seq, command);
             cmd_store::insert(&conn, &r)?;
-            r
+            (r, cfg)
         };
+
+        // 队列上限（Q4）：超出直接拒绝，避免无限堆积。
+        let limit = cfg.queue_limit;
+        if entry.inflight.load(Ordering::SeqCst) >= limit {
+            return Err(AppError::CommandQueueFull { limit });
+        }
 
         entry.inflight.fetch_add(1, Ordering::SeqCst);
 
@@ -379,8 +379,8 @@ impl TerminalRuntime {
         let command_owned = command.to_string();
         let command_id_for_task = command_id.clone();
         let db_for_task = db.clone();
-        let max_bytes = self.max_output_bytes.load(Ordering::Relaxed);
-        let max_lines = self.max_output_lines.load(Ordering::Relaxed);
+        let max_bytes = cfg.max_output_bytes;
+        let max_lines = cfg.max_output_lines;
 
         // 后台执行。关键：**取得执行锁之后**才注册"当前命令"并标记 running。
         //
@@ -786,24 +786,6 @@ mod tests {
         assert_eq!(tail(text, 2), "4\n5");
         assert_eq!(tail(text, 10), text);
         assert_eq!(tail(text, 0), "");
-    }
-
-    #[test]
-    fn queue_limit_defaults_to_ten() {
-        let rt = TerminalRuntime::new();
-        assert_eq!(
-            rt.queue_limit.load(Ordering::Relaxed),
-            DEFAULT_COMMAND_QUEUE_LIMIT
-        );
-    }
-
-    #[test]
-    fn configure_updates_limits() {
-        let rt = TerminalRuntime::new();
-        rt.configure(2048, 100, 3);
-        assert_eq!(rt.max_output_bytes.load(Ordering::Relaxed), 2048);
-        assert_eq!(rt.max_output_lines.load(Ordering::Relaxed), 100);
-        assert_eq!(rt.queue_limit.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]

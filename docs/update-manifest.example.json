@@ -1,0 +1,12 @@
+{
+  "version": "0.1.0",
+  "notes": "首个可用版本。\n\n- 支持在桌面界面管理 SSH 主机与认证信息\n- 内嵌 MCP Server（Streamable HTTP），让 AI Agent 创建终端、执行命令、查询执行状态\n- sudo 三模式：禁止注入（默认）/ 每次询问 / 自动注入\n- 命令历史审计：时间线、全文搜索、按主机与终端筛选\n- 暗色与亮色双主题",
+  "pub_date": "2026-09-10T00:00:00Z",
+  "platforms": {
+    "windows-x86_64": {
+      "url": "https://github.com/mangfu26/mf-perch/releases/latest",
+      "sha256": "",
+      "size": 0
+    }
+  }
+}

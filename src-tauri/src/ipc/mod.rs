@@ -14,6 +14,8 @@
 //! 前端据 `code` 做差异化提示。
 
 pub mod mcp;
+pub mod settings;
+pub mod update;
 
 #[cfg(test)]
 mod tests;

@@ -18,10 +18,12 @@ pub mod error;
 pub mod ipc;
 pub mod ssh;
 pub mod state;
+pub mod settings;
 pub mod store;
 pub mod sudo_bridge;
 pub mod terminal;
 pub mod tray;
+pub mod update;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;
@@ -109,6 +111,15 @@ pub fn run() {
             ipc::mcp::mcp_client_config,
             // sudo 确认（Q33 ask 模式）
             sudo_bridge::sudo_respond,
+            // 更新检查（D23）
+            ipc::update::update_info,
+            ipc::update::update_check,
+            ipc::update::update_ignore_version,
+            ipc::update::update_set_source,
+            ipc::update::update_set_auto_check,
+            // 运行期设置（Q11 / Q12 / Q4）
+            ipc::settings::runtime_settings,
+            ipc::settings::set_runtime_setting,
         ])
         .on_window_event(|window, event| {
             // 关窗隐藏到托盘而非退出（D16）：否则 MCP 会随之下线、Agent 断连。
@@ -132,6 +143,90 @@ pub fn run() {
                 let asker = sudo_bridge.as_asker(app.handle().clone());
                 tauri::async_runtime::spawn(async move {
                     runtime.set_sudo_asker(asker).await;
+                });
+            }
+
+            // 历史保留期清理（Q12）：启动时执行一次，之后每 24 小时一次。
+            // 此前只实现了清理函数却从未调用，导致"30 天保留"实际不生效。
+            {
+                let state = app.state::<Arc<state::AppState>>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        let retention_hours = {
+                            let conn = state.db.lock().await;
+                            crate::settings::load(&conn)
+                                .map(|s| s.retention_hours)
+                                .unwrap_or(crate::settings::DEFAULT_RETENTION_HOURS)
+                        };
+
+                        // retention_hours == 0 表示永久保留，不做清理。
+                        if retention_hours > 0 {
+                            let conn = state.db.lock().await;
+                            match crate::store::commands::cleanup_expired(
+                                &conn,
+                                retention_hours,
+                                chrono::Utc::now(),
+                            ) {
+                                Ok(report) if report.deleted > 0 => {
+                                    // 清理行为需留痕（D14），便于确认"历史为何变少"。
+                                    tracing::info!(
+                                        deleted = report.deleted,
+                                        cutoff = %report.cutoff,
+                                        "已按保留期清理活跃终端的历史"
+                                    );
+                                }
+                                Ok(_) => tracing::debug!("保留期清理：无需删除的记录"),
+                                Err(e) => tracing::warn!("保留期清理失败：{e}"),
+                            }
+                        }
+
+                        tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
+                    }
+                });
+            }
+
+            // 启动时的自动更新检查（D23）：后台执行、静默失败、24 小时缓存。
+            // 不阻塞启动，也不在失败时打扰用户。
+            {
+                let state = app.state::<Arc<state::AppState>>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    let (enabled, url, ignored, fresh) = {
+                        let conn = state.db.lock().await;
+                        (
+                            update::auto_check_enabled(&conn).unwrap_or(true),
+                            update::source_url(&conn).unwrap_or_default(),
+                            update::ignored_version(&conn).unwrap_or(None),
+                            update::cache_is_fresh(&conn).unwrap_or(false),
+                        )
+                    };
+
+                    // 未启用、未配置更新源、或缓存仍有效时都不发请求。
+                    if !enabled || url.trim().is_empty() || fresh {
+                        tracing::debug!("跳过自动更新检查（未启用、未配置源或缓存有效）");
+                        return;
+                    }
+
+                    // 网络请求在数据库锁之外进行（最长 5 秒）。
+                    match update::fetch_manifest(&url).await {
+                        Ok(manifest) => {
+                            let current = update::current_version();
+                            let status = update::evaluate(
+                                &manifest,
+                                &current,
+                                ignored.as_deref(),
+                                update::platform_key(),
+                            );
+                            if let update::UpdateStatus::Available { latest, .. } = &status {
+                                tracing::info!(latest = %latest, "发现新版本");
+                            }
+
+                            // 回写缓存（短暂加锁）。
+                            let conn = state.db.lock().await;
+                            let _ = update::store_cached(&conn, &status);
+                        }
+                        // 自动检查失败不改动状态、不提示用户：网络不通是常见情况。
+                        Err(e) => tracing::debug!("自动更新检查失败（已忽略）：{e}"),
+                    }
                 });
             }
 

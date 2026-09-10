@@ -84,11 +84,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "6"
 
+# 更新检查（D23）：从可配置的远端地址读取版本清单
+# rustls-tls：纯 Rust TLS，无 OpenSSL native 依赖，保持跨平台打包干净（D8）
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# 语义化版本比对：避免自行为版本号排序
+semver = "1"
+
 [dev-dependencies]
 tempfile = "3"
-# 集成测试通过真实 HTTP 调用 MCP 端点
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

@@ -109,3 +109,45 @@ export const mcpSetAutoStart = (enabled: boolean) =>
   call<boolean>("mcp_set_auto_start", { enabled });
 
 export const mcpClientConfig = () => call<string>("mcp_client_config");
+
+// ==================== 更新检查（D23） ====================
+
+export interface UpdateInfo {
+  current_version: string;
+  source_url: string;
+  auto_check: boolean;
+  ignored_version: string | null;
+  last_result: unknown;
+}
+
+export const updateInfo = () => call<UpdateInfo>("update_info");
+
+export const updateCheck = (force: boolean) =>
+  call<unknown>("update_check", { force });
+
+export const updateIgnoreVersion = (version: string) =>
+  call<boolean>("update_ignore_version", { version });
+
+export const updateSetSource = (url: string) =>
+  call<boolean>("update_set_source", { url });
+
+export const updateSetAutoCheck = (enabled: boolean) =>
+  call<boolean>("update_set_auto_check", { enabled });
+
+// ==================== 运行期设置（Q11 / Q12 / Q4） ====================
+
+export interface RuntimeSettings {
+  quota_per_host: number;
+  quota_global: number;
+  /** 历史保留小时数；0 表示永久保留。 */
+  retention_hours: number;
+  max_output_bytes: number;
+  max_output_lines: number;
+  queue_limit: number;
+}
+
+export const runtimeSettings = () => call<RuntimeSettings>("runtime_settings");
+
+/** 写入设置，返回夹紧后的实际生效值。 */
+export const setRuntimeSetting = (key: string, value: string) =>
+  call<string>("set_runtime_setting", { key, value });
