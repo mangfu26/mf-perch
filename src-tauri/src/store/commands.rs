@@ -93,11 +93,27 @@ pub fn get(conn: &Connection, id: &str) -> Result<CommandRecord> {
 
 /// 保存（或覆盖）命令输出。输出在命令执行过程中会多次追加，
 /// 因此使用 upsert 语义；FTS 索引由触发器自动同步。
+///
+/// 注意：这是**整体覆盖**语义。向已有输出追加说明文字（如失败原因）请用
+/// [`append_output`]，否则会把命令已产生的真实输出抹掉（V8）。
 pub fn save_output(conn: &Connection, command_id: &str, output: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO command_outputs (command_id, output) VALUES (?1, ?2)
          ON CONFLICT(command_id) DO UPDATE SET output = excluded.output",
         params![command_id, output],
+    )?;
+    Ok(())
+}
+
+/// 在已有输出**末尾追加**一段文字，保留原有内容（V8）。
+///
+/// 用于"命令未能完成"这类说明：必须与命令真实输出共存，
+/// 直接覆盖会让执行证据永久丢失，违反完整审计要求。
+pub fn append_output(conn: &Connection, command_id: &str, extra: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO command_outputs (command_id, output) VALUES (?1, ?2)
+         ON CONFLICT(command_id) DO UPDATE SET output = command_outputs.output || excluded.output",
+        params![command_id, extra],
     )?;
     Ok(())
 }
@@ -220,10 +236,59 @@ pub fn fail_pending_for_terminal(conn: &Connection, terminal_id: &str, reason: &
             .query_map(params![terminal_id, now], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for id in ids {
-            let msg = format!("[mf-perch] 命令未能完成：{reason}\n");
-            save_output(conn, &id, &msg)?;
+            // 追加而非覆盖：保留命令已产生的真实输出（V8）。
+            let msg = format!("\n[mf-perch] 命令未能完成：{reason}\n");
+            append_output(conn, &id, &msg)?;
         }
     }
+    Ok(affected)
+}
+
+/// 把用户输入包装成 FTS5 的**字面量短语**（V11）。
+///
+/// FTS5 的 MATCH 参数是查询语言而非纯文本，用户输入 `"`、`NOT`、`-`、`*`
+/// 等会让查询报语法错误（搜索直接失败而非返回空结果），构造 `NEAR` 之类的
+/// 表达式还可能带来高开销查询。做法：整串加双引号、内部双引号翻倍转义，
+/// 使其退化为字面量短语匹配。
+fn fts_phrase(raw: &str) -> String {
+    let escaped = raw.replace('"', "\"\"");
+    format!("\"{escaped}\"")
+}
+
+/// 应用启动时收尾：把所有仍处于 queued/running 的命令标记为失败（V9）。
+///
+/// 上一轮的会话已随进程退出而不存在，这些命令永远不会再收到结束标记；
+/// 若不处理，它们会一直占用队列计数（导致该终端后续命令被判定为"队列已满"），
+/// 并在审计中永远显示"执行中"，也不会有任何失败原因。
+pub fn fail_all_pending_on_startup(conn: &Connection, reason: &str) -> Result<usize> {
+    let now = now_rfc3339();
+
+    // 先取出待处理 id（更新后无法再用 status 精确定位到这一批）。
+    let ids: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM commands WHERE status IN ('queued','running')",
+        )?;
+        let v = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        v
+    };
+
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    let affected = conn.execute(
+        "UPDATE commands SET status = 'failed', finished_at = ?1
+         WHERE status IN ('queued','running')",
+        [&now],
+    )?;
+
+    for id in ids {
+        let msg = format!("\n[mf-perch] 命令未能完成：{reason}\n");
+        append_output(conn, &id, &msg)?;
+    }
+
     Ok(affected)
 }
 
@@ -264,7 +329,9 @@ pub struct HistoryFilter {
 /// 按条件查询命令历史；`query` 走 FTS5，否则走普通索引。
 pub fn search_history(conn: &Connection, filter: &HistoryFilter) -> Result<Vec<CommandRecord>> {
     let limit = filter.limit.unwrap_or(100).min(1000) as i64;
-    let offset = filter.offset.unwrap_or(0) as i64;
+    // 夹紧 offset（V22）：直接用 `as i64` 会让超过 i64::MAX 的值回绕成负数，
+    // SQLite 把负 OFFSET 当作 0，分页会静默退回首页而非报错。
+    let offset = filter.offset.unwrap_or(0).min(i64::MAX as usize) as i64;
     let order = match filter.order {
         SortOrder::Asc => "ASC",
         SortOrder::Desc => "DESC",
@@ -294,7 +361,12 @@ pub fn search_history(conn: &Connection, filter: &HistoryFilter) -> Result<Vec<C
 
     let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if let Some(q) = &filter.query {
-        params_vec.push(Box::new(q.clone()));
+        // 把用户输入转成"字面量短语"再交给 FTS5（V11）。
+        //
+        // FTS5 的 MATCH 有自己的一套查询语法，孤立引号、`NOT`、`-`、`*`、
+        // `col:` 等都会导致语法错误，使搜索**硬失败**而不是返回"无结果"。
+        // 这里把整串用双引号包起来、并转义内部双引号，使其只作字面量匹配。
+        params_vec.push(Box::new(fts_phrase(q)));
     }
     if let Some(t) = &filter.terminal_id {
         params_vec.push(Box::new(t.clone()));
@@ -358,9 +430,14 @@ pub fn cleanup_expired(
     let cutoff = now - chrono::Duration::hours(retention_hours);
     let cutoff_str = cutoff.to_rfc3339();
 
+    // 只清理**已进入终态**的旧命令（V7）：
+    // queued/running 的命令可能仍在执行（长任务的 created_at 可能早于 cutoff），
+    // 删除它们会让终态无处落库、队列计数失效、审计断档。
+    // 这些命令会在结束后由下一轮清理正常回收。
     let deleted = conn.execute(
         "DELETE FROM commands
          WHERE created_at < ?1
+           AND status NOT IN ('queued','running')
            AND terminal_id IN (SELECT id FROM terminals WHERE status != 'archived')",
         [&cutoff_str],
     )?;
@@ -696,5 +773,128 @@ mod tests {
             status_view(&conn, "cmd_nope", true, None),
             Err(AppError::CommandNotFound(_))
         ));
+    }
+
+    #[test]
+    fn fts_query_with_special_chars_does_not_error() {
+        // V11 回归：孤立引号、NOT、连字符等 FTS5 语法字符
+        // 过去会让搜索**直接报错**而不是返回"无结果"。
+        let conn = setup();
+        insert(&conn, &CommandRecord::new("term_1", 1, "echo hello")).unwrap();
+
+        for q in ["\"", "NOT", "-", "*", "col:", "a\"b", "NEAR("] {
+            let filter = HistoryFilter {
+                query: Some(q.to_string()),
+                terminal_id: None,
+                host_id: None,
+                status: None,
+                limit: Some(10),
+                offset: Some(0),
+                order: SortOrder::Desc,
+            };
+            let r = search_history(&conn, &filter);
+            assert!(r.is_ok(), "查询 {q:?} 不应报错，实际：{r:?}");
+        }
+    }
+
+    #[test]
+    fn fts_query_still_finds_matching_command() {
+        // 包装成字面量短语后，正常关键词仍应能命中。
+        let conn = setup();
+        insert(&conn, &CommandRecord::new("term_1", 1, "systemctl restart nginx")).unwrap();
+
+        let filter = HistoryFilter {
+            query: Some("nginx".to_string()),
+            terminal_id: None,
+            host_id: None,
+            status: None,
+            limit: Some(10),
+            offset: Some(0),
+            order: SortOrder::Desc,
+        };
+        let r = search_history(&conn, &filter).unwrap();
+        assert_eq!(r.len(), 1, "应命中 nginx 命令");
+    }
+
+    #[test]
+    fn cleanup_keeps_in_flight_commands() {
+        // V7 回归：正在执行的命令即便 created_at 早于保留期也不得删除，
+        // 否则终态无处落库、队列计数失效、审计断档。
+        let conn = setup();
+        let old = "2020-01-01T00:00:00+00:00";
+
+        let mut running = CommandRecord::new("term_1", 1, "long-build");
+        running.status = CommandStatus::Running;
+        insert(&conn, &running).unwrap();
+        conn.execute(
+            "UPDATE commands SET created_at = ?1 WHERE id = ?2",
+            params![old, running.id],
+        )
+        .unwrap();
+
+        let mut done = CommandRecord::new("term_1", 2, "quick");
+        done.status = CommandStatus::Completed;
+        insert(&conn, &done).unwrap();
+        conn.execute(
+            "UPDATE commands SET created_at = ?1 WHERE id = ?2",
+            params![old, done.id],
+        )
+        .unwrap();
+
+        let report = cleanup_expired(&conn, 1, chrono::Utc::now()).unwrap();
+        assert_eq!(report.deleted, 1, "只应删除已结束的旧命令");
+
+        assert!(
+            get(&conn, &running.id).is_ok(),
+            "正在执行的命令必须保留"
+        );
+        assert!(get(&conn, &done.id).is_err(), "已结束的旧命令应被清理");
+    }
+
+    #[test]
+    fn failure_reason_appends_instead_of_overwriting_output() {
+        // V8 回归：写入失败原因不得抹掉命令已产生的真实输出。
+        let conn = setup();
+        let r = CommandRecord::new("term_1", 1, "build");
+        insert(&conn, &r).unwrap();
+        save_output(&conn, &r.id, "编译中...\n已生成 3 个产物\n").unwrap();
+
+        fail_pending_for_terminal(&conn, "term_1", "SSH 连接已断开").unwrap();
+
+        let out = get_output(&conn, &r.id).unwrap().unwrap();
+        assert!(
+            out.contains("编译中"),
+            "原有输出必须保留，实际：{out}"
+        );
+        assert!(
+            out.contains("SSH 连接已断开"),
+            "应追加失败原因，实际：{out}"
+        );
+    }
+
+    #[test]
+    fn startup_finalizes_orphan_pending_commands() {
+        // V9 回归：重启后遗留的 queued/running 命令必须收尾为 failed，
+        // 否则会永久占用队列计数、审计里永远显示"执行中"。
+        let conn = setup();
+        let mut q = CommandRecord::new("term_1", 1, "queued-cmd");
+        q.status = CommandStatus::Queued;
+        insert(&conn, &q).unwrap();
+
+        let mut run = CommandRecord::new("term_1", 2, "running-cmd");
+        run.status = CommandStatus::Running;
+        insert(&conn, &run).unwrap();
+
+        let n = fail_all_pending_on_startup(&conn, "应用已重启，会话不存在").unwrap();
+        assert_eq!(n, 2, "两条未完成命令都应被收尾");
+
+        assert_eq!(pending_count(&conn, "term_1").unwrap(), 0);
+        for id in [&q.id, &run.id] {
+            let rec = get(&conn, id).unwrap();
+            assert_eq!(rec.status, CommandStatus::Failed);
+            assert!(rec.finished_at.is_some(), "应写入结束时间");
+        }
+        let out = get_output(&conn, &run.id).unwrap().unwrap_or_default();
+        assert!(out.contains("应用已重启"), "应写明失败原因：{out}");
     }
 }

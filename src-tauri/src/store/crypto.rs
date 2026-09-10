@@ -91,6 +91,51 @@ pub fn decrypt(key: &[u8; KEY_LEN], stored: &str) -> Result<String> {
         .map_err(|e| AppError::Crypto(format!("解密结果不是合法 UTF-8：{e}")))
 }
 
+/// 加密一个内部机密（如 MCP Bearer Token），**无主密钥时优雅降级**。
+///
+/// 与 [`encrypt`] 的区别：这里用于"缺少主密钥也不能让功能不可用"的场景。
+/// 例如 K2（主密码）模式下，MCP 端点需要 Token 才能工作，
+/// 而此时用户可能尚未输入主密码；若强制加密，MCP 将无法启动。
+///
+/// 降级行为（**必须显式记录，不得静默**）：
+/// - `key` 为 `Some`：返回 `enc:v1:...` 密文；
+/// - `key` 为 `None`：返回 `plain:v1:...` 明文，调用方应视需要提示用户。
+///
+/// 读取见 [`decrypt_internal`]；它同时兼容历史遗留的**无前缀明文**。
+pub fn encrypt_internal(key: Option<&[u8; KEY_LEN]>, plaintext: &str) -> Result<String> {
+    match key {
+        Some(k) => Ok(format!("enc:{}", encrypt(k, plaintext)?)),
+        None => Ok(format!("plain:{FORMAT_V1}:{plaintext}")),
+    }
+}
+
+/// 解密由 [`encrypt_internal`] 写出的内部机密。
+///
+/// 兼容三种形态：
+/// - `enc:v1:<nonce>:<ct>` → 用主密钥解密；
+/// - `plain:v1:<text>`     → 明文（写入时无主密钥）；
+/// - 其它（历史遗留的值）   → 视为明文原样返回。
+pub fn decrypt_internal(key: Option<&[u8; KEY_LEN]>, stored: &str) -> Result<String> {
+    if let Some(rest) = stored.strip_prefix("plain:") {
+        // 去掉明文前缀里的版本段。
+        return Ok(rest
+            .split_once(':')
+            .map(|(_, t)| t)
+            .unwrap_or(rest)
+            .to_string());
+    }
+
+    if let Some(rest) = stored.strip_prefix("enc:") {
+        let k = key.ok_or_else(|| {
+            AppError::KeyServiceUnavailable("该数据已加密，需要先解锁凭据".into())
+        })?;
+        return decrypt(k, rest);
+    }
+
+    // 历史遗留：早期版本直接存明文，无前缀。
+    Ok(stored.to_string())
+}
+
 /// 把主密钥编码为可导出/导入的字符串（供二期"导出加密备份"使用）。
 pub fn encode_key(key: &[u8; KEY_LEN]) -> String {
     B64.encode(key)

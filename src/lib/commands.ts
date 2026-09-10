@@ -85,12 +85,9 @@ export const searchHistory = (params: HistoryQuery = {}) =>
 export const historyStats = () => call<HistoryStats>("history_stats");
 
 // ==================== 设置 ====================
-
-export const getSetting = (key: string) =>
-  call<string | null>("get_setting", { key });
-
-export const setSetting = (key: string, value: string) =>
-  call<boolean>("set_setting", { key, value });
+//
+// 刻意不提供通用的 get/set 设置读写：它会绕过语义校验并暴露 mcp_token（V18）。
+// 具体设置请使用下列类型化接口（runtimeSettings / update* / mcp*）。
 
 // ==================== MCP 管理 ====================
 

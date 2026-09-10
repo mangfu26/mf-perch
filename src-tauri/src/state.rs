@@ -37,6 +37,9 @@ impl MasterKey {
     }
 
     pub fn set(&mut self, key: [u8; KEY_LEN]) {
+        // 先清理旧值再覆盖（V19）：直接赋值会让上一份密钥残留在内存中，
+        // 重复解锁（换方式/重试）时旧副本无人清理。
+        self.clear();
         self.0 = Some(key);
     }
 
@@ -45,6 +48,13 @@ impl MasterKey {
             use zeroize::Zeroize;
             k.zeroize();
         }
+    }
+}
+
+impl Drop for MasterKey {
+    /// 进程内持有期间不清理；对象析构时抹掉密钥（V19）。
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
@@ -104,6 +114,15 @@ impl AppState {
             tracing::info!("启动时标记 {broken} 个终端为连接已断开");
         }
 
+        // 同时把上一轮遗留的 queued/running 命令收尾为 failed（V9）：
+        // 它们的会话已不存在，永远不会收到结束标记；
+        // 否则会永久占用队列计数，并在审计里永远显示"执行中"。
+        let pending =
+            crate::store::commands::fail_all_pending_on_startup(&conn, "应用已重启，会话不存在")?;
+        if pending > 0 {
+            tracing::info!("启动时收尾 {pending} 条未完成命令");
+        }
+
         Ok(Arc::new(Self {
             db: std::sync::Arc::new(Mutex::new(conn)),
             master_key: Mutex::new(master_key),
@@ -135,8 +154,20 @@ impl AppState {
     /// 初始化密钥保护方式（首次引导）。
     ///
     /// 钥匙串不可用时**不静默降级**，而是返回错误由前端让用户显式选择（P2）。
+    ///
+    /// **拒绝重复初始化（V21）**：各分支都会生成新的密钥或 salt 并覆盖旧值，
+    /// 重复调用会让既有凭据**永久无法解密**。这里显式拒绝已初始化的库，
+    /// 把"破坏数据"变成"明确报错"。
     pub async fn initialize_key_provider(&self, provider: KeyProvider, password: Option<&str>) -> Result<()> {
         let conn = self.db.lock().await;
+
+        // 已初始化的库不允许再次初始化（换密钥需要专门的迁移流程，不支持直接覆盖）。
+        if !matches!(keyring::inspect(&conn)?, KeySetupState::NotInitialized) {
+            return Err(AppError::InvalidArgument(
+                "密钥保护方式已初始化，不能重复设置；如需更换请使用备份与迁移流程".into(),
+            ));
+        }
+
         let key = match provider {
             KeyProvider::Keyring => {
                 if !keyring::is_keyring_available() {
@@ -157,5 +188,61 @@ impl AppState {
 
         self.master_key.lock().await.set(key);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::keyring::{self, KeyProvider, KeySetupState};
+
+    fn test_state() -> Arc<AppState> {
+        let conn = crate::store::db::open_in_memory().unwrap();
+        let key = crate::store::crypto::generate_master_key();
+        Arc::new(AppState::new_for_test(conn, key))
+    }
+
+    #[tokio::test]
+    async fn init_key_provider_rejects_second_initialization() {
+        // V21：重复初始化会覆盖主密钥/salt，令既有凭据永久无法解密。
+        // 必须显式拒绝，而不是悄悄破坏数据。
+        let state = test_state();
+
+        state
+            .initialize_key_provider(KeyProvider::MasterPassword, Some("pw-one"))
+            .await
+            .expect("首次初始化应成功");
+
+        let err = state
+            .initialize_key_provider(KeyProvider::MasterPassword, Some("pw-two"))
+            .await
+            .expect_err("重复初始化必须被拒绝");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("已初始化"),
+            "应给出明确原因，实际：{msg}"
+        );
+
+        // 原始密钥仍然有效（未被覆盖）。
+        {
+            let conn = state.db.lock().await;
+            assert_eq!(
+                keyring::inspect(&conn).unwrap(),
+                KeySetupState::Ready(KeyProvider::MasterPassword)
+            );
+            let k = keyring::load_with_master_password(&conn, "pw-one").unwrap();
+            let stored = crate::store::crypto::encrypt(&k, "secret").unwrap();
+            assert_eq!(crate::store::crypto::decrypt(&k, &stored).unwrap(), "secret");
+        }
+    }
+
+    #[tokio::test]
+    async fn init_key_provider_works_on_fresh_db() {
+        let state = test_state();
+        state
+            .initialize_key_provider(KeyProvider::MasterPassword, Some("pw"))
+            .await
+            .expect("全新库应能初始化");
     }
 }

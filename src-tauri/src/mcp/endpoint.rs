@@ -16,6 +16,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{AppError, Result};
+use crate::store::crypto::{self, KEY_LEN};
 use crate::store::db;
 
 /// 端口起始值与上限（Q2：从 50001 开始迭代）。
@@ -51,10 +52,19 @@ impl RunningEndpoint {
 /// 生成或读取访问令牌。
 ///
 /// Token 一旦生成即持久化，避免每次启动都要求用户更新客户端配置（Q2）。
-pub fn ensure_token(conn: &rusqlite::Connection) -> Result<String> {
-    if let Some(t) = db::get_setting(conn, SETTING_TOKEN)? {
-        if !t.is_empty() {
-            return Ok(t);
+/// 读取访问令牌；不存在时生成并持久化。
+///
+/// 令牌**不透明**：可能以 `enc:`（已加密）或 `plain:`（无主密钥时降级）或
+/// 历史明文形态存储，统一由 [`crypto::decrypt_internal`] 还原（V16）。
+///
+/// `key` 为当前主密钥：有则加密落库，没有则明文落库（K2 未解锁时 MCP 仍需可用）。
+pub fn ensure_token(
+    conn: &rusqlite::Connection,
+    key: Option<&[u8; KEY_LEN]>,
+) -> Result<String> {
+    if let Some(stored) = db::get_setting(conn, SETTING_TOKEN)? {
+        if !stored.is_empty() {
+            return crypto::decrypt_internal(key, &stored);
         }
     }
 
@@ -63,14 +73,31 @@ pub fn ensure_token(conn: &rusqlite::Connection) -> Result<String> {
     rand::rng().fill_bytes(&mut bytes);
     let token = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
 
-    db::set_setting(conn, SETTING_TOKEN, &token)?;
+    let stored = crypto::encrypt_internal(key, &token)?;
+    db::set_setting(conn, SETTING_TOKEN, &stored)?;
     Ok(token)
 }
 
+/// 读取已存在的令牌（不解密生成新值）；用于状态展示。
+///
+/// 返回 `None` 表示尚未生成过。
+pub fn existing_token(
+    conn: &rusqlite::Connection,
+    key: Option<&[u8; KEY_LEN]>,
+) -> Result<Option<String>> {
+    match db::get_setting(conn, SETTING_TOKEN)? {
+        Some(s) if !s.is_empty() => Ok(Some(crypto::decrypt_internal(key, &s)?)),
+        _ => Ok(None),
+    }
+}
+
 /// 重新生成令牌（旧 Token 即刻失效）。
-pub fn regenerate_token(conn: &rusqlite::Connection) -> Result<String> {
+pub fn regenerate_token(
+    conn: &rusqlite::Connection,
+    key: Option<&[u8; KEY_LEN]>,
+) -> Result<String> {
     db::delete_setting(conn, SETTING_TOKEN)?;
-    ensure_token(conn)
+    ensure_token(conn, key)
 }
 
 /// 是否允许远程连接。
@@ -187,22 +214,61 @@ mod tests {
     #[test]
     fn token_is_generated_and_persisted() {
         let conn = mem_conn();
-        let t1 = ensure_token(&conn).unwrap();
+        let t1 = ensure_token(&conn, None).unwrap();
         assert_eq!(t1.len(), 64, "32 字节转十六进制应为 64 字符");
         assert!(t1.chars().all(|c| c.is_ascii_hexdigit()));
 
         // 再次读取应返回同一个 Token（避免客户端配置失效）。
-        let t2 = ensure_token(&conn).unwrap();
+        let t2 = ensure_token(&conn, None).unwrap();
         assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn token_is_encrypted_at_rest_when_key_available() {
+        // V16：有主密钥时，落库的必须是密文，库里不得出现 Token 明文。
+        let conn = mem_conn();
+        let key = crate::store::crypto::generate_master_key();
+        let token = ensure_token(&conn, Some(&key)).unwrap();
+
+        let stored = db::get_setting(&conn, SETTING_TOKEN).unwrap().unwrap();
+        assert!(stored.starts_with("enc:"), "应加密存储：{stored}");
+        assert!(
+            !stored.contains(&token),
+            "数据库中不得出现 Token 明文"
+        );
+
+        // 仍能正确读回并兼容解密。
+        assert_eq!(ensure_token(&conn, Some(&key)).unwrap(), token);
+    }
+
+    #[test]
+    fn token_falls_back_to_plaintext_without_key() {
+        // K2 未解锁时 MCP 仍需可用：此时降级为显式明文前缀，而非静默。
+        let conn = mem_conn();
+        let token = ensure_token(&conn, None).unwrap();
+        let stored = db::get_setting(&conn, SETTING_TOKEN).unwrap().unwrap();
+        assert!(stored.starts_with("plain:"), "应带显式明文前缀：{stored}");
+
+        // 后续解锁后仍能读回同一个 Token。
+        let key = crate::store::crypto::generate_master_key();
+        assert_eq!(ensure_token(&conn, Some(&key)).unwrap(), token);
+    }
+
+    #[test]
+    fn legacy_plaintext_token_still_readable() {
+        // 兼容历史数据：早期版本直接存明文、无前缀。
+        let conn = mem_conn();
+        db::set_setting(&conn, SETTING_TOKEN, "deadbeef").unwrap();
+        assert_eq!(ensure_token(&conn, None).unwrap(), "deadbeef");
     }
 
     #[test]
     fn regenerate_token_replaces_old_one() {
         let conn = mem_conn();
-        let old = ensure_token(&conn).unwrap();
-        let new = regenerate_token(&conn).unwrap();
+        let old = ensure_token(&conn, None).unwrap();
+        let new = regenerate_token(&conn, None).unwrap();
         assert_ne!(old, new, "重新生成应产生新 Token");
-        assert_eq!(ensure_token(&conn).unwrap(), new, "新 Token 应被持久化");
+        assert_eq!(ensure_token(&conn, None).unwrap(), new, "新 Token 应被持久化");
     }
 
     #[test]

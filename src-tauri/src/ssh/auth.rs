@@ -77,6 +77,9 @@ pub fn check_host_key(recorded: Option<&str>, presented: &PublicKey) -> HostKeyC
 }
 
 /// 认证方式（由已解密的凭据构造）。
+///
+/// 内含明文密码/私钥/口令，因此实现 [`Drop`] 在析构时清零（V20）——
+/// 与 sudo 密码一样，这些副本不应在内存中长期残留。
 pub enum AuthMethod {
     /// 用户名 + 密码。
     Password { username: String, password: String },
@@ -86,6 +89,25 @@ pub enum AuthMethod {
         private_key_pem: String,
         passphrase: Option<String>,
     },
+}
+
+impl Drop for AuthMethod {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        match self {
+            Self::Password { password, .. } => password.zeroize(),
+            Self::Key {
+                private_key_pem,
+                passphrase,
+                ..
+            } => {
+                private_key_pem.zeroize();
+                if let Some(p) = passphrase.as_mut() {
+                    p.zeroize();
+                }
+            }
+        }
+    }
 }
 
 impl AuthMethod {

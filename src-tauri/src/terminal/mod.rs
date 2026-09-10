@@ -6,7 +6,9 @@
 //! - 异步命令会占用该终端直到结束，若要并行需创建多个终端。
 //!
 //! 输出归属：由于串行，任一时刻每个终端最多只有一条"当前命令"，
-//! 因此输出泵可以把到达的输出行记到该命令上，无需在协议层携带命令 ID。
+//! 因此输出泵可以把到达的输出行记到该命令上。
+//! **命令结束则按 `command_id` 精确配对**（V5）：结束标记由远端回显应用侧
+//! 生成的 id，不依赖两侧各自自增的序号——两者在恢复终端等场景下必然错位。
 //!
 //! 数据库访问策略：`rusqlite::Connection` 是 `Send` 但**不是** `Sync`，
 //! 因此不能把 `&Connection` 借用跨越 `.await`（那样 future 将不再是 `Send`）。
@@ -19,7 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{oneshot, Mutex, Notify};
+use tokio::sync::{oneshot, watch, Mutex};
 
 use crate::domain::command::{CommandRecord, CommandStatus};
 use crate::domain::host::SudoPolicy;
@@ -51,11 +53,75 @@ pub type SudoAsker = Arc<dyn Fn(SudoRequest) -> oneshot::Receiver<SudoDecision> 
 /// 正在执行的命令的共享状态。
 struct ActiveCommand {
     command_id: String,
-    seq: u64,
     output: OutputAccumulator,
     /// 命令结束后的退出码；`None` 表示仍在执行。
     exit_code: Option<i32>,
     started: Instant,
+}
+
+/// 命令结束信号，用于唤醒同步等待者。
+///
+/// 用 `watch` 而非 `Notify`（V4）：`Notify::notify_waiters()` 不保留许可，
+/// 若"置位结束状态"与"通知"发生在等待者调用 `notified()` **之前**，
+/// 通知就被丢掉，等待者永久阻塞、执行锁永不释放、该终端后续命令全部堆积。
+/// `watch` 会记住最新值，等待者无论何时订阅都能立即读到结束状态，
+/// 从根本上消除丢失唤醒。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum FinishSignal {
+    #[default]
+    Idle,
+    /// 已有一条命令结束（值仅用于触发变更通知，不参与业务判断）。
+    Done(u64),
+    /// 会话已断开。
+    Disconnected,
+}
+
+/// 结束信号的可共享持有者。
+///
+/// 单独抽出来（而非直接放在 `TerminalEntry` 上）是为了能**脱离真实 SSH 会话**
+/// 对唤醒语义做单元测试——这正是 V4 缺陷过去没被测出来的原因。
+#[derive(Clone)]
+struct FinishNotifier {
+    tx: Arc<watch::Sender<FinishSignal>>,
+}
+
+impl FinishNotifier {
+    fn new() -> Self {
+        Self {
+            tx: Arc::new(watch::channel(FinishSignal::Idle).0),
+        }
+    }
+
+    /// 订阅变更；无论信号何时发出，订阅者都能观察到最新值。
+    fn subscribe(&self) -> watch::Receiver<FinishSignal> {
+        self.tx.subscribe()
+    }
+
+    /// 当前信号值（供测试与诊断使用）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn current(&self) -> FinishSignal {
+        *self.tx.borrow()
+    }
+
+    /// 通知"当前命令已结束"。用单调递增计数作为值：
+    /// 每次结束都产生一次**不同的值**，确保 `changed()` 一定被唤醒。
+    fn mark_finished(&self) {
+        self.tx.send_modify(|s| {
+            // 已断开是终态，不再被覆盖为 Done。
+            if *s != FinishSignal::Disconnected {
+                let next = match s {
+                    FinishSignal::Done(n) => n.wrapping_add(1),
+                    _ => 1,
+                };
+                *s = FinishSignal::Done(next);
+            }
+        });
+    }
+
+    /// 通知"会话已断开"：所有等待者都应立即返回失败。
+    fn mark_disconnected(&self) {
+        let _ = self.tx.send_replace(FinishSignal::Disconnected);
+    }
 }
 
 /// 一个活跃终端对应的运行时条目。
@@ -67,8 +133,8 @@ struct TerminalEntry {
     inflight: Arc<AtomicUsize>,
     /// 当前命令状态，供输出泵与轮询共享。
     active: Arc<Mutex<Option<ActiveCommand>>>,
-    /// 命令结束时唤醒等待者（同步调用用）。
-    finished: Arc<Notify>,
+    /// 命令结束信号（见 [`FinishNotifier`]）：唤醒同步等待者，且不会丢失通知。
+    finished: FinishNotifier,
     /// sudo 配置（Q33）；密码在内，会话结束时随条目释放。
     sudo: Arc<SudoContext>,
     /// 主机显示名，用于 ask 模式的通知文案。
@@ -231,7 +297,7 @@ impl TerminalRuntime {
             exec_lock: Arc::new(Mutex::new(())),
             inflight: Arc::new(AtomicUsize::new(0)),
             active: Arc::new(Mutex::new(None)),
-            finished: Arc::new(Notify::new()),
+            finished: FinishNotifier::new(),
             sudo: Arc::new(sudo),
             host_label,
             asker,
@@ -245,8 +311,12 @@ impl TerminalRuntime {
     }
 
     /// 注销会话并关闭底层连接。
+    ///
+    /// 先发出"已断开"信号：否则正在等待命令结束的同步调用
+    /// 会一直挂在结束信号上（归档/删除终端时尤其明显，V4）。
     async fn unregister(&self, terminal_id: &str) {
         if let Some(entry) = self.entries.lock().await.remove(terminal_id) {
+            entry.finished.mark_disconnected();
             entry.session.close().await.ok();
             entry.session.disconnect().await.ok();
         }
@@ -371,7 +441,7 @@ impl TerminalRuntime {
 
         entry.inflight.fetch_add(1, Ordering::SeqCst);
 
-        let seq = record.seq;
+        // `seq` 仍写入数据库供人类侧排序展示，但**不再参与协议配对**（V5）。
         let command_id = record.id.clone();
 
         let exec_lock = entry.exec_lock.clone();
@@ -399,12 +469,14 @@ impl TerminalRuntime {
                 let mut active = entry_for_task.active.lock().await;
                 *active = Some(ActiveCommand {
                     command_id: command_id_for_task.clone(),
-                    seq,
                     output: OutputAccumulator::new(max_bytes, max_lines),
                     exit_code: None,
                     started,
                 });
             }
+            // 订阅"结束信号"必须在发送命令之前完成，
+            // 否则可能错过命令结束的通知（V4）。
+            let mut finished_rx = entry_for_task.finished.subscribe();
 
             // 标记为 running 并落库（此前为 queued）。
             {
@@ -419,11 +491,28 @@ impl TerminalRuntime {
                 }
             }
 
-            if let Err(e) = entry_for_task.session.send_command(&command_owned).await {
+            if let Err(e) = entry_for_task
+                .session
+                .send_command(&command_id_for_task, &command_owned)
+                .await
+            {
                 finish_with_error(&entry_for_task, &e.to_string()).await;
             } else {
                 // 等待输出泵置位 exit_code（或连接断开）。
+                //
+                // 用 `watch` 订阅而非 `Notify`：`Notify` 的许可不保留，
+                // 若结束信号在等待者订阅前发出就会丢失唤醒，导致命令永久挂起（V4）。
+                //
+                // 顺序很关键：**先 `borrow_and_update` 记录当前代次，再检查状态，
+                // 最后 `changed()`**。
+                //  - 若结束发生在本轮记录之前 → 上面的状态检查已能看到 exit_code；
+                //  - 若结束发生在本轮记录之后 → `changed()` 会立即返回（无需等待下一次）。
+                // 因此不存在"信号已发出却永远等不到"的窗口。
                 loop {
+                    // 1) 记录当前代次（把已有变更标记为已读）。
+                    let signal = *finished_rx.borrow_and_update();
+
+                    // 2) 检查命令状态。
                     {
                         let active = entry_for_task.active.lock().await;
                         match active.as_ref() {
@@ -436,7 +525,17 @@ impl TerminalRuntime {
                             _ => break,
                         }
                     }
-                    entry_for_task.finished.notified().await;
+
+                    // 3) 会话已断开则无需继续等待。
+                    if signal == FinishSignal::Disconnected {
+                        break;
+                    }
+
+                    // 4) 等待下一次变更（若已变更则立即返回）。
+                    if finished_rx.changed().await.is_err() {
+                        // 发送端已释放（终端被注销），按中断处理。
+                        break;
+                    }
                 }
             }
 
@@ -595,16 +694,30 @@ fn spawn_output_pump(entry: Arc<TerminalEntry>, mut rx: tokio::sync::mpsc::Recei
                         a.output.push_line(&line);
                     }
                 }
-                SessionOutput::Finished { seq, exit_code } => {
+                SessionOutput::Finished {
+                    command_id,
+                    exit_code,
+                } => {
                     let mut active = entry.active.lock().await;
-                    if let Some(a) = active.as_mut() {
-                        if a.seq == seq {
+                    // 按 command_id 精确配对（V5）：只有当前正在执行的命令
+                    // 才接受该结束标记，避免错位标记污染状态。
+                    let matched = active
+                        .as_ref()
+                        .is_some_and(|a| a.command_id == command_id);
+                    if matched {
+                        if let Some(a) = active.as_mut() {
                             a.exit_code = Some(exit_code);
                         }
+                    } else {
+                        tracing::debug!(
+                            command_id = %command_id,
+                            "收到非当前命令的结束标记，已忽略"
+                        );
                     }
                     drop(active);
-                    // 唤醒等待该命令结束的同步调用。
-                    entry.finished.notify_waiters();
+                    // 无论是否配对成功都通知一次：让等待者重新检查状态，
+                    // 避免因标记错位而永久阻塞。
+                    entry.finished.mark_finished();
                 }
                 SessionOutput::SudoRequest => {
                     // Q33：按该主机的策略决定是否注入密码。
@@ -627,7 +740,7 @@ fn spawn_output_pump(entry: Arc<TerminalEntry>, mut rx: tokio::sync::mpsc::Recei
                         }
                     }
                     drop(active);
-                    entry.finished.notify_waiters();
+                    entry.finished.mark_disconnected();
                     break;
                 }
             }
@@ -645,7 +758,7 @@ async fn finish_with_error(entry: &TerminalEntry, reason: &str) {
                 .push_line(&format!("[mf-perch] 命令发送失败：{reason}"));
         }
     }
-    entry.finished.notify_waiters();
+    entry.finished.mark_finished();
 }
 
 /// 取字符串末尾 n 行。
@@ -795,6 +908,71 @@ mod tests {
         assert_eq!(rt.connected_count().await, 0);
     }
 
+    #[tokio::test]
+    async fn finish_signal_is_not_lost_when_sent_before_waiting() {
+        // V4 回归：结束信号若在等待者订阅**之前**发出，用 Notify 会丢失唤醒，
+        // 等待者永久阻塞。watch 会保留最新值，等待者仍能立即观察到变化。
+        let notifier = FinishNotifier::new();
+        let mut rx = notifier.subscribe();
+
+        // 先发信号（模拟"命令极快结束"，早于等待者注册）。
+        notifier.mark_finished();
+
+        // 再等待：不应挂起。
+        let got = tokio::time::timeout(Duration::from_millis(200), rx.changed()).await;
+        assert!(got.is_ok(), "先发出的结束信号不得丢失");
+        assert!(matches!(*rx.borrow_and_update(), FinishSignal::Done(_)));
+    }
+
+    #[tokio::test]
+    async fn repeated_finishes_each_produce_a_change() {
+        // 每次结束都必须产生一次可观察的变更，否则第二条命令会等不到通知。
+        let notifier = FinishNotifier::new();
+        let mut rx = notifier.subscribe();
+
+        notifier.mark_finished();
+        assert!(rx.changed().await.is_ok());
+        rx.borrow_and_update();
+
+        notifier.mark_finished();
+        let second = tokio::time::timeout(Duration::from_millis(200), rx.changed()).await;
+        assert!(second.is_ok(), "第二次结束也应触发变更");
+    }
+
+    #[tokio::test]
+    async fn concurrent_waiters_all_wake_up() {
+        // 多个等待者订阅同一信号时，都应被唤醒（例如同步调用与轮询同时等待）。
+        let notifier = FinishNotifier::new();
+        let mut a = notifier.subscribe();
+        let mut b = notifier.subscribe();
+
+        notifier.mark_finished();
+
+        for (name, rx) in [("a", &mut a), ("b", &mut b)] {
+            let got = tokio::time::timeout(Duration::from_millis(200), rx.changed()).await;
+            assert!(got.is_ok(), "等待者 {name} 应被唤醒");
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_signal_wakes_waiter() {
+        let notifier = FinishNotifier::new();
+        let mut rx = notifier.subscribe();
+        notifier.mark_disconnected();
+        let got = tokio::time::timeout(Duration::from_millis(200), rx.changed()).await;
+        assert!(got.is_ok(), "断开信号应唤醒等待者");
+        assert_eq!(*rx.borrow_and_update(), FinishSignal::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn disconnect_is_terminal_and_not_overwritten_by_finish() {
+        // 断开后即使再有结束标记，也应保持 Disconnected，便于等待者判断中断。
+        let notifier = FinishNotifier::new();
+        notifier.mark_disconnected();
+        notifier.mark_finished();
+        assert_eq!(notifier.current(), FinishSignal::Disconnected);
+    }
+
     #[test]
     fn auth_from_credential_maps_both_kinds() {
         use crate::domain::credential::{Credential, CredentialKind};
@@ -817,7 +995,8 @@ mod tests {
             AuthMethod::from_credential(&key),
             AuthMethod::Key { .. }
         ));
-        match AuthMethod::from_credential(&key) {
+        // AuthMethod 实现了 Drop（析构清零），因此只能按引用匹配、不能移动字段。
+        match &AuthMethod::from_credential(&key) {
             AuthMethod::Key {
                 username,
                 passphrase,

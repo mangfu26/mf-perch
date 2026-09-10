@@ -98,9 +98,7 @@ pub fn run() {
             // 审计
             ipc::search_history,
             ipc::history_stats,
-            // 设置
-            ipc::get_setting,
-            ipc::set_setting,
+            // 设置：无通用读写入口（V18），一律走下列类型化命令
             // MCP 管理
             ipc::mcp::mcp_status,
             ipc::mcp::mcp_start,

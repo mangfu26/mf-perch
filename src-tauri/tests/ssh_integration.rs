@@ -50,7 +50,7 @@ fn test_target() -> Option<(Host, AuthMethod)> {
 /// 等待并收集某个序号命令的输出，直到收到结束标记或超时。
 async fn wait_for_command(
     rx: &mut tokio::sync::mpsc::Receiver<SessionOutput>,
-    seq: u64,
+    command_id: &str,
     timeout: Duration,
 ) -> (String, Option<i32>) {
     let mut output = String::new();
@@ -68,9 +68,9 @@ async fn wait_for_command(
                 output.push('\n');
             }
             Ok(Some(SessionOutput::Finished {
-                seq: done_seq,
+                command_id: done_id,
                 exit_code,
-            })) if done_seq == seq => {
+            })) if done_id == command_id => {
                 return (output, Some(exit_code));
             }
             Ok(Some(_)) => {}
@@ -92,9 +92,9 @@ async fn connect_and_execute_simple_command() {
         .await
         .expect("会话应能建立");
 
-    session.send_command("echo hello-mfperch").await.unwrap();
+    session.send_command("c1", "echo hello-mfperch").await.unwrap();
 
-    let (out, code) = wait_for_command(&mut rx, 1, Duration::from_secs(10)).await;
+    let (out, code) = wait_for_command(&mut rx, "c1", Duration::from_secs(10)).await;
     assert_eq!(code, Some(0), "退出码应为 0，实际 {code:?}");
     assert!(out.contains("hello-mfperch"), "输出应包含命令结果，实际：{out}");
 
@@ -116,13 +116,13 @@ async fn session_preserves_cwd_and_env() {
         .expect("会话应能建立");
 
     // 1) cd 到 /tmp
-    session.send_command("cd /tmp").await.unwrap();
-    let (_, code) = wait_for_command(&mut rx, 1, Duration::from_secs(10)).await;
+    session.send_command("c1", "cd /tmp").await.unwrap();
+    let (_, code) = wait_for_command(&mut rx, "c1", Duration::from_secs(10)).await;
     assert_eq!(code, Some(0));
 
     // 2) pwd 应输出 /tmp —— 证明工作目录被保留
-    session.send_command("pwd").await.unwrap();
-    let (out, code) = wait_for_command(&mut rx, 2, Duration::from_secs(10)).await;
+    session.send_command("c2", "pwd").await.unwrap();
+    let (out, code) = wait_for_command(&mut rx, "c2", Duration::from_secs(10)).await;
     assert_eq!(code, Some(0));
     assert!(
         out.contains("/tmp"),
@@ -130,13 +130,13 @@ async fn session_preserves_cwd_and_env() {
     );
 
     // 3) export 一个变量
-    session.send_command("export MFPERCH_IT_VAR=preserved").await.unwrap();
-    let (_, code) = wait_for_command(&mut rx, 3, Duration::from_secs(10)).await;
+    session.send_command("c3", "export MFPERCH_IT_VAR=preserved").await.unwrap();
+    let (_, code) = wait_for_command(&mut rx, "c3", Duration::from_secs(10)).await;
     assert_eq!(code, Some(0));
 
     // 4) 读取该变量 —— 证明环境变量被保留
-    session.send_command("echo \"var=$MFPERCH_IT_VAR\"").await.unwrap();
-    let (out, code) = wait_for_command(&mut rx, 4, Duration::from_secs(10)).await;
+    session.send_command("c4", "echo \"var=$MFPERCH_IT_VAR\"").await.unwrap();
+    let (out, code) = wait_for_command(&mut rx, "c4", Duration::from_secs(10)).await;
     assert_eq!(code, Some(0));
     assert!(
         out.contains("var=preserved"),
@@ -158,13 +158,13 @@ async fn session_reports_nonzero_exit_code() {
         .await
         .expect("会话应能建立");
 
-    session.send_command("false").await.unwrap();
-    let (_, code) = wait_for_command(&mut rx, 1, Duration::from_secs(10)).await;
+    session.send_command("c1", "false").await.unwrap();
+    let (_, code) = wait_for_command(&mut rx, "c1", Duration::from_secs(10)).await;
     assert_eq!(code, Some(1), "false 的退出码应为 1");
 
     // 会话应仍可用（串行执行未破坏状态机）。
-    session.send_command("echo still-alive").await.unwrap();
-    let (out, code) = wait_for_command(&mut rx, 2, Duration::from_secs(10)).await;
+    session.send_command("c2", "echo still-alive").await.unwrap();
+    let (out, code) = wait_for_command(&mut rx, "c2", Duration::from_secs(10)).await;
     assert_eq!(code, Some(0));
     assert!(out.contains("still-alive"));
 
@@ -185,10 +185,10 @@ async fn session_handles_quoting_and_special_chars() {
 
     // 含引号与 $ 的命令：若用行协议 + base64 需额外编码，NUL 分帧则原样可用。
     session
-        .send_command(r#"echo "quoted $HOME" && echo 'single'"#)
+        .send_command("c1", r#"echo "quoted $HOME" && echo 'single'"#)
         .await
         .unwrap();
-    let (out, code) = wait_for_command(&mut rx, 1, Duration::from_secs(10)).await;
+    let (out, code) = wait_for_command(&mut rx, "c1", Duration::from_secs(10)).await;
     assert_eq!(code, Some(0));
     assert!(out.contains("quoted /"), "$HOME 应被展开，实际：{out}");
     assert!(out.contains("single"), "单引号内容应输出，实际：{out}");
@@ -210,11 +210,11 @@ async fn session_is_not_confused_by_marker_like_output() {
 
     // 故意输出形似结束标记的内容（但 nonce 不同）。
     session
-        .send_command("echo '__MF_PERCH_END__fake__1__0__'")
+        .send_command("c1", "echo '__MF_PERCH_END__fake__1__0__'")
         .await
         .unwrap();
 
-    let (out, code) = wait_for_command(&mut rx, 1, Duration::from_secs(10)).await;
+    let (out, code) = wait_for_command(&mut rx, "c1", Duration::from_secs(10)).await;
     assert_eq!(
         code,
         Some(0),

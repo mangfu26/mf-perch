@@ -16,6 +16,25 @@ const HOST_COLUMNS: &str = "id, name, address, port, credential_id, proxy_jump_h
      sudo_policy, sudo_password_source, sudo_password_enc, shell_env_mode, init_script, \
      host_key, host_key_fingerprint, created_at, updated_at";
 
+/// 把库中的 `i64` 端口转为 `u16`，越界即报错（V23）。
+///
+/// 直接 `as u16` 会把 70000 静默截断成 4464，导致连到**错误的端口**却毫无提示。
+/// 正常写入路径受 `u16` 类型约束不会越界，但库被手工改写或跨版本迁移时可能出现。
+fn port_from_db(v: i64) -> rusqlite::Result<u16> {
+    u16::try_from(v).map_err(|_| {
+        rusqlite::Error::IntegralValueOutOfRange(
+            0,
+            // 复用 rusqlite 的错误形态，便于上层报出明确原因。
+            v,
+        )
+    })
+}
+
+/// 把库中的计数转为 `u32`，超出取上限而非静默回绕（V23）。
+fn count_from_db(v: i64) -> u32 {
+    v.clamp(0, u32::MAX as i64) as u32
+}
+
 fn row_to_host(row: &Row<'_>) -> rusqlite::Result<Host> {
     let sudo_policy_raw: String = row.get("sudo_policy")?;
     let sudo_source_raw: String = row.get("sudo_password_source")?;
@@ -25,7 +44,7 @@ fn row_to_host(row: &Row<'_>) -> rusqlite::Result<Host> {
         id: row.get("id")?,
         name: row.get("name")?,
         address: row.get("address")?,
-        port: row.get::<_, i64>("port")? as u16,
+        port: port_from_db(row.get::<_, i64>("port")?)?,
         credential_id: row.get("credential_id")?,
         proxy_jump_host_id: row.get("proxy_jump_host_id")?,
         sudo_policy: SudoPolicy::parse(&sudo_policy_raw).unwrap_or_default(),
@@ -214,11 +233,11 @@ pub fn list_summaries(conn: &Connection) -> Result<Vec<HostSummary>> {
             id: r.get(0)?,
             name: r.get(1)?,
             address: r.get(2)?,
-            port: r.get::<_, i64>(3)? as u16,
+            port: port_from_db(r.get::<_, i64>(3)?)?,
             has_credential: r.get::<_, Option<String>>(4)?.is_some(),
             sudo_policy: SudoPolicy::parse(&policy_raw).unwrap_or_default(),
-            active_terminals: r.get::<_, i64>(6)? as u32,
-            archived_terminals: r.get::<_, i64>(7)? as u32,
+            active_terminals: count_from_db(r.get::<_, i64>(6)?),
+            archived_terminals: count_from_db(r.get::<_, i64>(7)?),
         })
     })?;
 

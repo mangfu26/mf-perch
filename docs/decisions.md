@@ -447,3 +447,85 @@
     并在 MCP e2e 中通过真实 HTTP `tools/list` 再次校验。
   - 后续新增带可选参数的工具时，凡 `Option<T>` 字段都需加 `#[schemars(with = "Nullable<T>")]`，
     否则会重新引入告警。
+
+---
+
+## D33 — 协议标记按 `command_id` 配对；sudo 密码经 stdin 投递
+
+- **日期**：2026-09-10
+- **决策**（修复 V5 / V14，源于安全审计）：
+  1. 命令帧格式改为 `<command_id>\n<command>`，结束标记回显该 id：
+     `__MF_PERCH_END__<nonce>__<command_id>__<rc>__`。**不再使用自增序号**做配对。
+  2. sudo 密码改经 SSH channel 的 **stdin** 投递（远端 `cat > fifo`），
+     不再把它拼进 heredoc 脚本。
+- **背景**：
+  - 远端序号是**会话内**自增，应用用的是**数据库历史**序号，两套命名空间。
+    `restore_terminal` 重建会话后远端序号重置，此后每条命令的结束标记都对不上，
+    `exit_code` 永不置位，该终端**永久卡死**（必然触发，非偶发）。
+  - 密码走 heredoc 会被 sshd以 `sh -c '<脚本>'` 执行，密码出现在远端
+    `ps` / `/proc/<pid>/cmdline` 中，同机用户可读。
+- **影响**：
+  - `encode_frame` 签名变为 `encode_frame(command_id, command)`；
+    `Session::send_command` 同样需要 command_id。
+  - `SessionEvent::CommandFinished` 与 `SessionOutput::Finished` 改为携带 `command_id`；
+    `ActiveCommand` 不再保存 `seq`（`seq` 仍写入数据库供人类侧排序展示）。
+  - 结束标记不再匹配非当前命令的 id，收到不匹配的标记只记 debug 日志并唤醒等待者，
+    不会污染状态。
+  - 相关测试与集成测试同步更新。
+
+---
+
+## D34 — 结束通知改用 `watch`，消除丢失唤醒
+
+- **日期**：2026-09-10
+- **决策**（修复 V4）：命令结束通知由 `tokio::sync::Notify` 改为 `watch` 通道
+  （封装为 `FinishNotifier`）。
+- **背景**：`Notify::notify_waiters()` **不保留许可**。等待侧是"先查状态、再 await"，
+  若结束侧在等待者订阅之前完成置位与通知，通知即丢失，等待任务永久阻塞，
+  `exec_lock` 永不释放，该终端后续命令全部堆积直至队列上限。
+- **影响**：
+  - 信号值用单调递增计数，保证每次结束都产生一次可观察变更。
+  - 等待顺序固定为"先 `borrow_and_update` 记录代次 → 再查状态 → 最后 `changed()`"，
+    任何时序下都不会错过唤醒。
+  - 会话注销（归档/删除）时发出 `Disconnected`，避免等待者挂在信号上。
+  - `FinishNotifier` 独立成类型，使其可**脱离真实 SSH 会话**做单元测试——
+    这正是 V4 过去没被测出的原因。
+
+---
+
+## D35 — 内部机密（MCP Token）落盘加密，无主密钥时显式降级
+
+- **日期**：2026-09-10
+- **决策**（修复 V16）：MCP Bearer Token 不再明文存 `settings` 表。
+  有主密钥时以 `enc:v1:...` 加密存储；**无主密钥时以 `plain:v1:...` 显式降级**。
+  读取通过 `crypto::decrypt_internal`，同时兼容历史遗留的无前缀明文。
+- **背景**：Token 等价于"对所有已配置主机的命令执行权"。此前它与凭据不同，
+  以明文存在数据库里；读到库文件即等于拿到执行权。
+- **影响**：
+  - 采用**显式前缀**而非"能不能加密就加密"的模糊行为，
+    降级必须可被观察到（P2：安全降级不得静默）。
+  - **不阻断 K2（主密码）未解锁时的 MCP 可用性**：若强制加密，
+    未输入主密码时 MCP 将无法启动，破坏既有使用方式。
+  - `endpoint::ensure_token` / `regenerate_token` 新增 `key: Option<&[u8; KEY_LEN]>` 参数；
+    新增 `existing_token` 用于只读展示（不生成新值）。
+
+---
+
+## D36 — 移除通用设置读写 IPC；启用内容安全策略（CSP）
+
+- **日期**：2026-09-10
+- **决策**（修复 V18）：
+  1. **删除** `get_setting` / `set_setting` 两个 Tauri 命令。设置一律走类型化入口
+     （`runtime_settings`、`update_*`、`mcp_*`）。
+  2. 配置 CSP：生产 `script-src 'self'`（无 `unsafe-inline`），
+     开发用 `devCsp` 放开 HMR 所需指令。
+- **背景**：
+  - 通用读写会绕过各设置项的语义校验，且可直接读出 `mcp_token`、
+    改写 `key_provider` / `mcp_allow_remote` 等安全相关项。
+    核实后确认这两个命令**没有任何前端调用方**，属"无人使用却敞开高危面"。
+  - `csp: null` 使 WebView 完全没有脚本注入的第二道防线。
+- **影响**：
+  - 前端 `src/lib/commands.ts` 中的 `getSetting` / `setSetting` 一并移除。
+  - 新增设置项时**必须**提供类型化命令，不得恢复通用读写。
+  - CSP 需兼顾 Tauri 自身注入的脚本（Tauri 会自动计算其哈希并加入策略）；
+    生产构建已验证界面正常渲染。

@@ -31,19 +31,31 @@ pub enum SessionEvent {
     /// 会话已就绪，可以开始发送命令。
     Ready,
     /// 收到某条命令的结束标记。
-    CommandFinished { seq: u64, exit_code: i32 },
+    ///
+    /// 用**应用侧生成的 command_id** 关联，而不是各自自增的序号（V5）：
+    /// 远端序号在会话内从 1 开始，应用侧序号是数据库历史累加，
+    /// 两者在恢复终端等场景下必然错位，会导致命令永远等不到结束标记。
+    CommandFinished { command_id: String, exit_code: i32 },
     /// 有 sudo 正在索要密码（Q33 `ask` / `auto` 模式据此决定是否注入）。
     SudoRequest,
     /// 普通输出行（命令产生的输出）。
     OutputLine(String),
 }
 
-/// 生成每会话随机 nonce。
+/// 生成每会话随机 nonce（128 位）。
 ///
 /// nonce 用十六进制表示，避免与 base64 字符集混淆，也便于在日志中比对。
+///
+/// **已知残余风险（V2，未能完全消除）**：nonce 是包装脚本内的 shell 变量，
+/// 而被 `eval` 的命令运行在同一个 shell 中，因此 Agent 下发的命令可以读到它
+/// （`echo "$mfperch_nonce"`）。这只是**防止误判**（命令输出恰好长得像标记），
+/// 不是对抗性安全边界。
+///
+/// 提高位宽可让"盲猜 nonce"不可行，但不能阻止主动读取。真正消除该风险需要
+/// 把协议标记改由独立通道传递，属于较大的协议变更，已记录为待评估项。
 pub fn new_nonce() -> String {
     use rand::Rng;
-    let mut bytes = [0u8; 8];
+    let mut bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -72,7 +84,7 @@ pub fn wrapper_script(nonce: &str, init_script: Option<&str>, sudo_enabled: bool
     // sudo 拦截函数：必须在循环之前定义并导出，
     // 这样循环里 eval 的每条命令（含 bash 子进程）都会命中该函数。
     let sudo_setup = if sudo_enabled {
-        let askpass = remote_askpass_path();
+        let askpass = remote_askpass_path(nonce);
         format!(
             "# sudo 透明拦截（Q33）：不依赖命令改写，语义级拦截\n{}",
             sudo_function_def(&askpass)
@@ -87,12 +99,13 @@ pub fn wrapper_script(nonce: &str, init_script: Option<&str>, sudo_enabled: bool
         r#"set +e
 mfperch_nonce='{nonce}'
 {init}{sudo_setup}printf '{ready}{nonce}__\n' >&2
-mfperch_seq=0
-while IFS= read -r -d '' mfperch_cmd; do
-  mfperch_seq=$((mfperch_seq + 1))
+while IFS= read -r -d '' mfperch_frame; do
+  # 帧格式：第一行是应用侧生成的 command_id，其余为命令正文（可能含换行）。
+  mfperch_id=${{mfperch_frame%%$'\n'*}}
+  mfperch_cmd=${{mfperch_frame#*$'\n'}}
   eval "$mfperch_cmd" < /dev/null
   mfperch_rc=$?
-  printf '\n{end}%s__%s__%s__\n' "$mfperch_nonce" "$mfperch_seq" "$mfperch_rc"
+  printf '\n{end}%s__%s__%s__\n' "$mfperch_nonce" "$mfperch_id" "$mfperch_rc"
 done
 "#,
         nonce = nonce,
@@ -107,8 +120,12 @@ done
 ///
 /// 用 `$HOME/...` 而非硬编码家目录：不同用户家目录不同，
 /// 且 `$HOME` 在包装脚本的 shell 中一定可用。
-pub fn remote_askpass_path() -> String {
-    format!("$HOME/{REMOTE_DIR}/{ASKPASS_NAME}")
+///
+/// **按会话唯一命名**（含 nonce）：askpass 脚本内容包含本会话的 FIFO 路径，
+/// 若多个会话共用同一个文件名，后建立的会话会覆盖先建立会话的脚本，
+/// 导致先建立的会话在 sudo 时读到**别的会话的 FIFO 路径**而失败或串扰。
+pub fn remote_askpass_path(nonce: &str) -> String {
+    format!("$HOME/{REMOTE_DIR}/{ASKPASS_NAME}.{nonce}")
 }
 
 /// 启动包装脚本时使用的 bash 参数。
@@ -172,16 +189,28 @@ pub fn session_setup_script(nonce: &str, enable_sudo: bool) -> String {
     let dir = format!("$HOME/{REMOTE_DIR}");
     // FIFO 按会话唯一命名，避免与其他会话互相踩踏（见 [`sudo_fifo_name`]）。
     let fifo = format!("{dir}/{}", sudo_fifo_name(nonce));
-    let askpass = format!("{dir}/{ASKPASS_NAME}");
+    let askpass = remote_askpass_path(nonce);
 
     let sudo_part = if enable_sudo {
         format!(
             r#"
-# sudo askpass 与 FIFO（Q33）：密码只在被索要时经内存传递，不落盘
+# sudo askpass 与 FIFO（Q33）：密码经 FIFO 在内存中传递，不落盘。
+#
+# 注意执行顺序：**先清理历史遗留、再创建本会话的 FIFO**。
+# 曾经在此处先 mkfifo、后执行 `rm -f "$dir"/{prefix}.*`，结果把刚创建的
+# FIFO 一并删除，使后续 `cat > fifo` 退化为"创建普通文件并写入"，
+# sudo 密码以明文落盘（该缺陷已由回归测试 askpass_fifo_survives_setup 覆盖）。
+# 这里只清理**普通文件**（-type f），既清掉上述缺陷的残留，又绝不触碰
+# 任何会话正在使用的 FIFO 节点。
+find "{dir}" -maxdepth 1 -type f -name '{prefix}.*' -delete 2>/dev/null || true
 rm -f "{fifo}"
-mkfifo "{fifo}" 2>/dev/null || true
+if ! mkfifo "{fifo}" 2>/dev/null; then
+  printf 'MFPERCH_SETUP_ERROR=fifo\n' >&2
+fi
 chmod 600 "{fifo}" 2>/dev/null || true
 "#,
+            dir = dir,
+            prefix = SUDO_FIFO_NAME,
             fifo = fifo,
         )
     } else {
@@ -193,12 +222,11 @@ chmod 600 "{fifo}" 2>/dev/null || true
         let script = askpass_script(nonce, &fifo);
         // 用带引号的 heredoc 写入 askpass 脚本：内容不做任何展开，
         // 因此脚本里可以安全地保留 $HOME（由 askpass 自己在运行时展开）。
+        // 写入后立即收紧权限；**不要**在此处做通配删除（见上）。
         format!(
-            "cat > \"{askpass}\" <<'MFPERCH_ASKPASS'\n{script}MFPERCH_ASKPASS\nchmod 700 \"{askpass}\"\nrm -f \"{dir}\"/{fifo_prefix}.* 2>/dev/null || true\n",
+            "umask 077; cat > \"{askpass}\" <<'MFPERCH_ASKPASS'\n{script}MFPERCH_ASKPASS\nchmod 700 \"{askpass}\"\n",
             askpass = askpass,
             script = script,
-            dir = dir,
-            fifo_prefix = SUDO_FIFO_NAME,
         )
     } else {
         String::new()
@@ -215,6 +243,21 @@ printf 'MFPERCH_BASH=%s\n' "$BASH_VERSION" >&2
         dir = dir,
         sudo_part = sudo_part,
         askpass_write = askpass_write,
+    )
+}
+
+/// 构造会话清理命令：删除本会话的 FIFO 与 askpass 脚本（含权限收紧）。
+///
+/// 会话结束时调用（归档 / 删除 / 断开），避免在远端留下残留节点。
+/// 只删除**本会话 nonce** 对应的文件，不影响其它并发会话。
+pub fn session_cleanup_script(nonce: &str) -> String {
+    let dir = format!("$HOME/{REMOTE_DIR}");
+    format!(
+        r#"rm -f "{dir}/{fifo}" "{dir}/{askpass}" 2>/dev/null || true
+"#,
+        dir = dir,
+        fifo = sudo_fifo_name(nonce),
+        askpass = format!("{ASKPASS_NAME}.{nonce}"),
     )
 }
 
@@ -260,17 +303,20 @@ pub fn parse_line(line: &str, nonce: &str) -> Option<SessionEvent> {
         return Some(SessionEvent::SudoRequest);
     }
 
-    // 结束标记：__MF_PERCH_END__<nonce>__<seq>__<rc>__
+    // 结束标记：__MF_PERCH_END__<nonce>__<command_id>__<rc>__
     if let Some(rest) = trimmed.strip_prefix(END_MARKER_PREFIX) {
         // 只有 nonce 匹配才算数——这是防误判的关键。
         if let Some(after_nonce) = rest.strip_prefix(&format!("{nonce}__")) {
             let parts: Vec<&str> = after_nonce.trim_end_matches('_').split("__").collect();
             if parts.len() == 2 {
-                if let (Ok(seq), Ok(rc)) = (parts[0].parse::<u64>(), parts[1].parse::<i32>()) {
-                    return Some(SessionEvent::CommandFinished {
-                        seq,
-                        exit_code: rc,
-                    });
+                if let Ok(rc) = parts[1].parse::<i32>() {
+                    let command_id = parts[0].to_string();
+                    if !command_id.is_empty() {
+                        return Some(SessionEvent::CommandFinished {
+                            command_id,
+                            exit_code: rc,
+                        });
+                    }
                 }
             }
         }
@@ -281,14 +327,30 @@ pub fn parse_line(line: &str, nonce: &str) -> Option<SessionEvent> {
     Some(SessionEvent::OutputLine(trimmed.to_string()))
 }
 
-/// 把命令编码为 NUL 结尾的帧。
-pub fn encode_frame(command: &str) -> Result<Vec<u8>> {
+/// 把一条命令编码为 NUL 结尾的帧（V5）。
+///
+/// 帧格式：`<command_id>\n<command>`。首行的 command_id 由应用生成，
+/// 远端原样回显在结束标记中，从而**按 id 精确配对**，不依赖两侧各自自增的序号。
+pub fn encode_frame(command_id: &str, command: &str) -> Result<Vec<u8>> {
+    if command_id.is_empty() {
+        return Err(AppError::InvalidArgument("command_id 不能为空".into()));
+    }
+    // id 是首行分隔符，自身不能含换行；NUL 会破坏分帧，两者都不允许。
+    if command_id.contains('\n') || command_id.as_bytes().contains(&0) {
+        return Err(AppError::InvalidArgument(
+            "command_id 不能包含换行或 NUL 字节".into(),
+        ));
+    }
     if command.as_bytes().contains(&0) {
         return Err(AppError::InvalidArgument(
             "命令不能包含 NUL 字节".into(),
         ));
     }
-    let mut frame = command.as_bytes().to_vec();
+
+    let mut frame = Vec::with_capacity(command_id.len() + command.len() + 2);
+    frame.extend_from_slice(command_id.as_bytes());
+    frame.push(b'\n');
+    frame.extend_from_slice(command.as_bytes());
     frame.push(0);
     Ok(frame)
 }
@@ -301,29 +363,38 @@ mod tests {
     fn nonce_is_hex_and_unique() {
         let a = new_nonce();
         let b = new_nonce();
-        assert_eq!(a.len(), 16, "16 个十六进制字符表示 8 字节");
+        assert_eq!(a.len(), 32, "32 个十六进制字符表示 16 字节（128 位）");
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b, "每次生成的 nonce 应不同");
     }
 
     #[test]
-    fn encode_frame_appends_nul() {
-        let f = encode_frame("ls -la").unwrap();
+    fn encode_frame_prefixes_command_id_then_nul() {
+        let f = encode_frame("c1", "ls -la").unwrap();
         assert_eq!(f.last(), Some(&0));
-        assert_eq!(&f[..f.len() - 1], b"ls -la");
+        // 帧 = <command_id>\n<command>\0
+        assert_eq!(&f[..f.len() - 1], b"c1\nls -la");
     }
 
     #[test]
     fn encode_frame_keeps_newlines_quotes_and_dollars() {
         // NUL 分帧的价值：这些字符无需任何转义。
         let cmd = "cd /tmp && echo \"a $HOME\" ; ls\npwd";
-        let f = encode_frame(cmd).unwrap();
-        assert_eq!(&f[..f.len() - 1], cmd.as_bytes());
+        let f = encode_frame("c9", cmd).unwrap();
+        let body = &f[..f.len() - 1];
+        let expected = format!("c9\n{cmd}");
+        assert_eq!(body, expected.as_bytes());
     }
 
     #[test]
     fn encode_frame_rejects_nul_in_command() {
-        assert!(encode_frame("echo \0 bad").is_err());
+        assert!(encode_frame("c1", "echo \0 bad").is_err());
+    }
+
+    #[test]
+    fn encode_frame_rejects_empty_or_multiline_command_id() {
+        assert!(encode_frame("", "ls").is_err());
+        assert!(encode_frame("a\nb", "ls").is_err());
     }
 
     #[test]
@@ -343,20 +414,20 @@ mod tests {
     #[test]
     fn parse_command_finished_marker() {
         let nonce = "deadbeef";
-        let line = format!("{END_MARKER_PREFIX}{nonce}__3__0__");
+        let line = format!("{END_MARKER_PREFIX}{nonce}__cmd3__0__");
         assert_eq!(
             parse_line(&line, nonce),
             Some(SessionEvent::CommandFinished {
-                seq: 3,
+                command_id: "cmd3".into(),
                 exit_code: 0
             })
         );
 
-        let fail = format!("{END_MARKER_PREFIX}{nonce}__7__1__");
+        let fail = format!("{END_MARKER_PREFIX}{nonce}__cmd7__1__");
         assert_eq!(
             parse_line(&fail, nonce),
             Some(SessionEvent::CommandFinished {
-                seq: 7,
+                command_id: "cmd7".into(),
                 exit_code: 1
             })
         );
@@ -366,11 +437,11 @@ mod tests {
     fn parse_negative_exit_code() {
         // 被信号终止的命令退出码可能为负。
         let nonce = "cafe";
-        let line = format!("{END_MARKER_PREFIX}{nonce}__1__-9__");
+        let line = format!("{END_MARKER_PREFIX}{nonce}__cmd1__-9__");
         assert_eq!(
             parse_line(&line, nonce),
             Some(SessionEvent::CommandFinished {
-                seq: 1,
+                command_id: "cmd1".into(),
                 exit_code: -9
             })
         );
@@ -380,7 +451,7 @@ mod tests {
     fn marker_with_wrong_nonce_is_treated_as_output() {
         // 关键防误判场景：命令输出恰好包含类似标记，但 nonce 不同。
         let nonce = "realnonce";
-        let spoofed = format!("{END_MARKER_PREFIX}othernonce__1__0__");
+        let spoofed = format!("{END_MARKER_PREFIX}othernonce__cmd1__0__");
         assert_eq!(
             parse_line(&spoofed, nonce),
             Some(SessionEvent::OutputLine(spoofed.clone())),
@@ -404,11 +475,11 @@ mod tests {
     #[test]
     fn crlf_is_normalized() {
         let nonce = "n2";
-        let line = format!("{END_MARKER_PREFIX}{nonce}__1__0__\r\n");
+        let line = format!("{END_MARKER_PREFIX}{nonce}__cmd1__0__\r\n");
         assert_eq!(
             parse_line(&line, nonce),
             Some(SessionEvent::CommandFinished {
-                seq: 1,
+                command_id: "cmd1".into(),
                 exit_code: 0
             })
         );
@@ -482,9 +553,19 @@ mod tests {
     #[test]
     fn askpass_path_uses_home_variable() {
         // 不能用硬编码家目录：不同用户名家目录不同。
-        let p = remote_askpass_path();
+        let p = remote_askpass_path("n1");
         assert!(p.starts_with("$HOME/"), "应基于 $HOME：{p}");
-        assert!(p.ends_with(ASKPASS_NAME));
+        assert!(p.contains(ASKPASS_NAME), "应指向 askpass 脚本：{p}");
+    }
+
+    #[test]
+    fn askpass_path_is_session_unique() {
+        // 共用同一文件名会让并发会话互相覆盖 askpass 脚本，
+        // 先建立的会话会读到别的会话的 FIFO 路径而失败。
+        let a = remote_askpass_path("nonce_a");
+        let b = remote_askpass_path("nonce_b");
+        assert_ne!(a, b, "不同会话的 askpass 路径必须不同");
+        assert!(a.ends_with("nonce_a"));
     }
 
     #[test]
@@ -550,6 +631,68 @@ mod tests {
     }
 
     #[test]
+    fn askpass_fifo_is_created_after_the_last_removal() {
+        // 严重缺陷回归（V1）：曾经 askpass 写入串末尾带 `rm -f "$dir"/sudopw.fifo.*`，
+        // 而 mkfifo 在其之前执行，于是刚创建的本会话 FIFO 被自己删掉。
+        // 之后 `cat > fifo` 退化为"创建普通文件并写入"，sudo 密码以明文落盘。
+        //
+        // 断言顺序不变式：任何删除操作都必须排在 mkfifo 之前，
+        // 使得 setup 结束时 FIFO 必然存在。
+        let s = session_setup_script("deadbeef", true);
+        // 注释里也会出现 "mkfifo" 等词，比较顺序前先剔除注释行。
+        let code = code_lines(&s);
+
+        let mkfifo_pos = code.find("mkfifo").expect("应创建 FIFO");
+        let last_delete = code
+            .rfind("-delete")
+            .expect("应有遗留清理动作（-type f -delete）");
+
+        assert!(
+            last_delete < mkfifo_pos,
+            "遗留清理必须早于 mkfifo，否则会删掉刚创建的 FIFO（明文落盘缺陷回归）：\n{s}"
+        );
+
+        // 覆盖原始缺陷的具体形态：不得出现"删除所有 fifo.* 文件"的通配 rm。
+        // 允许 `find ... -name 'sudopw.fifo.*' -type f -delete`（已限定普通文件）。
+        let bad_glob = format!("rm -f \"$HOME/{REMOTE_DIR}\"/{SUDO_FIFO_NAME}.*");
+        assert!(
+            !s.contains(&bad_glob),
+            "不得用通配 rm 删除会话 FIFO（这正是明文落盘缺陷的成因）：\n{s}"
+        );
+    }
+
+    /// 去掉以 `#` 开头的注释行，便于对脚本的**实际执行语句**做顺序断言。
+    fn code_lines(script: &str) -> String {
+        script
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn session_setup_only_cleans_regular_files_with_delete_flag() {
+        // 清理遗留必须限定为普通文件（-type f），
+        // 这样即便真有 FIFO 残留也不会误删其它会话正在使用的节点。
+        let s = session_setup_script("deadbeef", true);
+        let ix = s.find("-delete").expect("应清理历史遗留的普通文件");
+        let prefix = &s[..ix];
+        assert!(
+            prefix.contains("-type f"),
+            "遗留清理必须限定 -type f，避免误删 FIFO：\n{prefix}"
+        );
+    }
+
+    #[test]
+    fn cleanup_script_removes_only_this_session_files() {
+        let s = session_cleanup_script("nonce_x");
+        assert!(s.contains(&format!("{SUDO_FIFO_NAME}.nonce_x")), "{s}");
+        assert!(s.contains(&format!("{ASKPASS_NAME}.nonce_x")), "{s}");
+        // 不得误伤其它会话。
+        assert!(!s.contains('*'), "清理脚本不应使用通配符：{s}");
+    }
+
+    #[test]
     fn session_setup_paths_are_double_quoted_so_home_expands() {
         // 端到端实测发现的缺陷：单引号会阻止 $HOME 展开，
         // 导致创建出名为 "$HOME" 的字面量目录，
@@ -607,7 +750,7 @@ mod tests {
         // 因此 SUDO_ASKPASS 必须是通过变量赋值得来的绝对路径，
         // 不能把 '$HOME/...' 字面量直接塞给它，否则报
         // "Askpass program '$HOME/...' is not an absolute path"。
-        let d = sudo_function_def(&remote_askpass_path());
+        let d = sudo_function_def(&remote_askpass_path("nonce1"));
 
         // 赋值语句里出现 $HOME —— 这行由 bash 执行，会展开成绝对路径。
         assert!(

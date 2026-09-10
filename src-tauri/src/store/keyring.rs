@@ -193,21 +193,39 @@ pub fn init_master_password(conn: &Connection, password: &str) -> Result<[u8; KE
         s
     };
 
-    let mut key = derive_key(password, &salt)?;
+    let key = derive_key(password, &salt)?;
     let verifier = crypto::encrypt(&key, KDF_VERIFIER_PLAINTEXT)?;
 
+    // 三项设置放在同一事务里写入（V21 附带修复）：
+    // 分开写时若中途失败/进程崩溃，会留下"有 salt 无 provider"之类的
+    // 半初始化状态，下次引导会生成新 salt，导致既有凭据无法解密。
     let salt_b64 = B64.encode(salt);
-    db::set_setting(conn, SETTING_KDF_SALT, &salt_b64)?;
-    db::set_setting(conn, SETTING_KDF_VERIFIER, &verifier)?;
-    db::set_setting(
-        conn,
-        SETTING_KEY_PROVIDER,
-        KeyProvider::MasterPassword.as_str(),
-    )?;
 
-    let result = key;
-    key.zeroize();
-    Ok(result)
+    conn.execute_batch("BEGIN")?;
+    let write = (|| -> Result<()> {
+        db::set_setting(conn, SETTING_KDF_SALT, &salt_b64)?;
+        db::set_setting(conn, SETTING_KDF_VERIFIER, &verifier)?;
+        db::set_setting(
+            conn,
+            SETTING_KEY_PROVIDER,
+            KeyProvider::MasterPassword.as_str(),
+        )?;
+        Ok(())
+    })();
+
+    match write {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    }
+
+    // 注意：`[u8; KEY_LEN]` 是 Copy，对局部变量 zeroize 只是清理副本，
+    // 返回值仍持有明文；调用方负责在存入 MasterKey 后由 ZeroizeOnDrop 清理（V19）。
+    Ok(key)
 }
 
 /// 以 K2（主密码）加载密钥，并校验密码正确性。
@@ -299,23 +317,52 @@ pub fn load(conn: &Connection) -> Result<[u8; KEY_LEN]> {
 }
 
 /// 本地密钥文件路径（K3）。
+///
+/// **刻意放在数据库所在目录之外**（V6）：两处同目录时，用户按文档"整库备份/迁移"
+/// 或该目录被云盘同步、打包外带，会把密文与主密钥一起带走，
+/// 字段级加密对"数据目录被拿走"这一威胁完全失效。
+///
+/// 这里放到一个独立的同级目录 `mf-perch-keys/`，并在写入时收紧权限。
+/// 它不随数据库一起备份，需由用户单独迁移（K3 的已知使用代价，界面已提示风险）。
 fn local_key_path() -> Result<PathBuf> {
-    Ok(db::data_dir()?.join("master.key"))
+    let base = db::data_dir()?;
+    let parent = base
+        .parent()
+        .ok_or_else(|| AppError::Config("无法确定密钥文件所在目录".into()))?;
+    Ok(parent.join("mf-perch-keys").join("master.key"))
 }
 
 /// 写入本地密钥文件，并收紧权限。
+///
+/// 先建目录并**立即**收紧目录权限、再写文件，缩小"文件已存在但权限尚未收紧"
+/// 的窗口（V6 的附带加固）；Windows 上依赖用户目录继承的 ACL。
 fn write_local_key_file(path: &Path, key: &[u8; KEY_LEN]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
-    std::fs::write(path, crypto::encode_key(key))?;
 
-    // Unix 下收紧到 0600；Windows 依赖用户目录的 ACL。
+    // 以"仅创建者可读写"的方式创建文件，避免先以宽松权限落盘再 chmod。
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perm = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, perm)?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(crypto::encode_key(key).as_bytes())?;
+        f.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, crypto::encode_key(key))?;
     }
 
     Ok(())

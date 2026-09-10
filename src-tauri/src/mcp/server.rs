@@ -40,6 +40,13 @@ pub struct McpManager {
     state: Arc<AppState>,
     running: Mutex<Option<Arc<RunningEndpoint>>>,
     task: Mutex<Option<JoinHandle<()>>>,
+    /// 串行化 start / stop / 重启类操作（V10）。
+    ///
+    /// 若不加这把锁，`start()` 的"检查是否已运行"与"写入 running"之间跨越多次
+    /// `await`（读库、绑端口），两个并发 `start()` 会同时通过检查、各自绑定端口
+    /// 并启动一个 axum 服务；后写入的会覆盖前者，被覆盖的实例仍在运行却已失去
+    /// 引用，`stop()` 再也停不掉它，界面还会显示"已停止"。
+    lifecycle: Mutex<()>,
 }
 
 impl McpManager {
@@ -48,7 +55,14 @@ impl McpManager {
             state,
             running: Mutex::new(None),
             task: Mutex::new(None),
+            lifecycle: Mutex::new(()),
         }
+    }
+
+    /// 当前主密钥（未解锁时为 `None`，用于 Token 落盘的加密决策）。
+    async fn master_key(&self) -> Option<[u8; crate::store::crypto::KEY_LEN]> {
+        let guard = self.state.master_key.lock().await;
+        guard.get().ok().copied()
     }
 
     /// 查询当前状态（含持久化配置，便于界面展示）。
@@ -56,7 +70,8 @@ impl McpManager {
         let conn = self.state.db.lock().await;
         let allow_remote = endpoint::allow_remote(&conn)?;
         let auto = endpoint::auto_start(&conn)?;
-        let token = db::get_setting(&conn, endpoint::SETTING_TOKEN)?;
+        let key = self.master_key().await;
+        let token = endpoint::existing_token(&conn, key.as_ref())?;
 
         let running = self.running.lock().await;
         Ok(match running.as_ref() {
@@ -81,7 +96,16 @@ impl McpManager {
     }
 
     /// 启动 MCP 端点。
+    ///
+    /// 整个"检查—启动—登记"过程由 `lifecycle` 串行化，避免并发启动
+    /// 产生无法停止的第二个监听（V10）。
     pub async fn start(&self) -> Result<McpStatus> {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.start_inner().await
+    }
+
+    /// 启动逻辑；调用方必须已持有 `lifecycle` 锁。
+    async fn start_inner(&self) -> Result<McpStatus> {
         {
             let running = self.running.lock().await;
             if running.is_some() {
@@ -90,11 +114,14 @@ impl McpManager {
             }
         }
 
+        // 主密钥在取库锁之前拿好，避免锁顺序交叉（master_key 与 db 是两把锁）。
+        let key = self.master_key().await;
+
         // 第 1 步：在锁内只做同步的读取/写入，不跨越 await。
         let (allow_remote, token, preferred_port) = {
             let conn = self.state.db.lock().await;
             let allow_remote = endpoint::allow_remote(&conn)?;
-            let token = endpoint::ensure_token(&conn)?;
+            let token = endpoint::ensure_token(&conn, key.as_ref())?;
             let preferred = db::get_setting(&conn, endpoint::SETTING_PORT)?
                 .and_then(|p| p.parse::<u16>().ok());
             (allow_remote, token, preferred)
@@ -173,6 +200,12 @@ impl McpManager {
 
     /// 停止 MCP 端点。
     pub async fn stop(&self) -> Result<McpStatus> {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.stop_inner().await
+    }
+
+    /// 停止逻辑；调用方必须已持有 `lifecycle` 锁。
+    async fn stop_inner(&self) -> Result<McpStatus> {
         let ep = self.running.lock().await.take();
         if let Some(ep) = ep {
             ep.stop().await;
@@ -187,28 +220,34 @@ impl McpManager {
 
     /// 重新生成 Token（旧 Token 立即失效，需更新客户端配置）。
     pub async fn regenerate_token(&self) -> Result<String> {
+        // 持有生命周期锁，保证"停止 → 换 Token → 启动"不被并发启动插入。
+        let _lifecycle = self.lifecycle.lock().await;
+
         let was_running = self.running.lock().await.is_some();
         if was_running {
             // 先停服务，避免旧 Token 在重启前仍被接受。
-            self.stop().await?;
+            self.stop_inner().await?;
         }
 
+        let key = self.master_key().await;
         let token = {
             let conn = self.state.db.lock().await;
-            endpoint::regenerate_token(&conn)?
+            endpoint::regenerate_token(&conn, key.as_ref())?
         };
 
         if was_running {
-            self.start().await?;
+            self.start_inner().await?;
         }
         Ok(token)
     }
 
     /// 设置"允许远程连接"。若服务正在运行则重启以应用新的监听范围。
     pub async fn set_allow_remote(&self, allow: bool) -> Result<McpStatus> {
+        let _lifecycle = self.lifecycle.lock().await;
+
         let was_running = self.running.lock().await.is_some();
         if was_running {
-            self.stop().await?;
+            self.stop_inner().await?;
         }
 
         {
@@ -217,7 +256,7 @@ impl McpManager {
         }
 
         if was_running {
-            self.start().await?;
+            self.start_inner().await?;
         }
         self.status().await
     }

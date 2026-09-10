@@ -41,8 +41,15 @@ pub struct Credential {
     pub username: String,
     pub kind: CredentialKind,
     /// 密码，或私钥正文（OpenSSH / PEM 格式）。
+    ///
+    /// **刻意不参与序列化**（V17）：`Debug` 已脱敏，但若允许 `Serialize`，
+    /// 任何对 `Credential` 调用 `serde_json::to_string` 的地方都会绕过脱敏、
+    /// 把明文发往前端或写入日志。凭据只应在应用内部按需解密使用，
+    /// 需要的字段请用 [`CredentialSummary`] 这类显式脱敏结构对外输出。
+    #[serde(skip_serializing)]
     pub secret: String,
     /// 私钥口令（passphrase），仅 `kind == Key` 时可能非空（Q10）。
+    #[serde(skip_serializing)]
     pub passphrase: Option<String>,
     /// 公钥指纹（SHA256），供人类界面对比；私钥正文不回显（Q10）。
     pub fingerprint: Option<String>,

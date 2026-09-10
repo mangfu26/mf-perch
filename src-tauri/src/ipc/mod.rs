@@ -539,24 +539,13 @@ pub async fn history_stats(state: State<'_, Arc<AppState>>) -> Result<IpcResult<
 }
 
 // ==================== 设置 ====================
-
-/// 读取单个设置项。
-#[tauri::command]
-pub async fn get_setting(
-    key: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<IpcResult<Option<String>>, ()> {
-    let conn = state.db.lock().await;
-    wrap(crate::store::db::get_setting(&conn, &key))
-}
-
-/// 写入设置项。
-#[tauri::command]
-pub async fn set_setting(
-    key: String,
-    value: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<IpcResult<bool>, ()> {
-    let conn = state.db.lock().await;
-    wrap(crate::store::db::set_setting(&conn, &key, &value).map(|_| true))
-}
+//
+// 这里**刻意不提供**通用的 `get_setting` / `set_setting` 命令（V18）。
+//
+// 通用读写会绕过各设置项的语义校验，并且可以直接读出 `mcp_token`
+// （等价于拿到全部主机的命令执行权）、或改写 `key_provider` / `mcp_allow_remote`
+// 等安全相关项。此前这两个命令没有任何前端调用方，属"无人使用但敞开高危面"，
+// 因此直接移除；设置一律走类型化入口：
+// - 运行期限额：`ipc::settings::runtime_settings` / `set_runtime_setting`
+// - 更新源等：`ipc::update::*`
+// - MCP 配置：`ipc::mcp::*`

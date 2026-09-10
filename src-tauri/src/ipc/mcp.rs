@@ -96,8 +96,12 @@ pub async fn mcp_client_config(
     let token = match &status.token {
         Some(t) => t.clone(),
         None => {
+            let key = {
+                let guard = state.master_key.lock().await;
+                guard.get().ok().copied()
+            };
             let conn = state.db.lock().await;
-            match endpoint::ensure_token(&conn) {
+            match endpoint::ensure_token(&conn, key.as_ref()) {
                 Ok(t) => t,
                 Err(e) => return Ok(IpcResult::from(e)),
             }

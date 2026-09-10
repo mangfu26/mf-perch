@@ -134,7 +134,25 @@ pub fn source_url(conn: &Connection) -> Result<String> {
 }
 
 pub fn set_source_url(conn: &Connection, url: &str) -> Result<()> {
-    db::set_setting(conn, SETTING_SOURCE_URL, url.trim())
+    let url = url.trim();
+    // 只接受 http(s)，挡住 file://、javascript: 等其它协议（V16）。
+    // 空串表示"清除配置"，允许通过。
+    if !url.is_empty() {
+        validate_source_url(url)?;
+    }
+    db::set_setting(conn, SETTING_SOURCE_URL, url)
+}
+
+/// 校验更新源地址的协议（V16）。
+fn validate_source_url(url: &str) -> Result<()> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") {
+        Ok(())
+    } else {
+        Err(AppError::Config(format!(
+            "更新源地址必须以 http:// 或 https:// 开头：{url}"
+        )))
+    }
 }
 
 /// 是否启用启动时自动检查。
@@ -273,8 +291,14 @@ pub async fn fetch_manifest(url: &str) -> Result<UpdateManifest> {
         ));
     }
 
+    // URL 可能来自历史配置（设置时尚未校验协议），这里再挡一次（V16）。
+    validate_source_url(url)?;
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        // 不跟随重定向：避免被重定向到内网地址（SSRF 探测）或其它主机，
+        // 也让"清单来源"始终等于用户配置并确认过的那个地址（V16）。
+        .redirect(reqwest::redirect::Policy::none())
         // 明确使用 rustls，避免构建时依赖系统 TLS 库。
         .build()
         .map_err(|e| AppError::Config(format!("创建 HTTP 客户端失败：{e}")))?;
@@ -289,14 +313,43 @@ pub async fn fetch_manifest(url: &str) -> Result<UpdateManifest> {
         .map_err(|e| AppError::Config(format!("请求更新源失败：{e}")))?;
 
     if !resp.status().is_success() {
+        // 重定向已禁用，3xx 会走到这里并给出可读提示。
         return Err(AppError::Config(format!(
-            "更新源返回 HTTP {}",
+            "更新源返回 HTTP {}（若为 3xx，请填写该地址的最终跳转目标）",
             resp.status().as_u16()
         )));
     }
 
-    resp.json::<UpdateManifest>()
+    // 限制响应体大小（V15）：清单是几十行的 JSON，正常远小于此上限；
+    // 若不限制，恶意/被劫持的更新源可返回超大 body 撑爆内存。
+    // 用流式读取逐块累计，超限立即中止，不把整个 body 读进内存。
+    const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+
+    if let Some(len) = resp.content_length() {
+        if len > MAX_MANIFEST_BYTES as u64 {
+            return Err(AppError::Config(format!(
+                "更新源返回的内容过大（{len} 字节），已拒绝解析"
+            )));
+        }
+    }
+
+    let mut body: Vec<u8> = Vec::new();
+    let mut resp = resp;
+    while let Some(chunk) = resp
+        .chunk()
         .await
+        .map_err(|e| AppError::Config(format!("读取更新源内容失败：{e}")))?
+    {
+        if body.len() + chunk.len() > MAX_MANIFEST_BYTES {
+            return Err(AppError::Config(format!(
+                "更新源返回的内容超过 {} KiB 上限，已中止读取",
+                MAX_MANIFEST_BYTES / 1024
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice::<UpdateManifest>(&body)
         .map_err(|e| AppError::Config(format!("更新源返回的内容无法解析：{e}")))
 }
 
@@ -371,6 +424,39 @@ mod tests {
         assert!(parse_version("0.2.0").is_some());
         assert!(parse_version("not-a-version").is_none());
         assert!(parse_version("").is_none());
+    }
+
+    #[test]
+    fn source_url_rejects_non_http_schemes() {
+        // V16：挡住 file://、javascript: 等协议，避免本地文件读取等手段。
+        let conn = mem_conn();
+        for bad in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "ftp://example.com/m.json",
+            "data:text/plain,hi",
+        ] {
+            assert!(
+                set_source_url(&conn, bad).is_err(),
+                "{bad} 不应被接受为更新源"
+            );
+        }
+        // 空串表示清除配置，应允许。
+        assert!(set_source_url(&conn, "").is_ok());
+        // http/https 正常接受。
+        assert!(set_source_url(&conn, "https://example.com/m.json").is_ok());
+        assert!(set_source_url(&conn, "http://127.0.0.1:8000/m.json").is_ok());
+    }
+
+    #[test]
+    fn source_url_is_trimmed_before_storage() {
+        let conn = mem_conn();
+        set_source_url(&conn, "  https://example.com/m.json  ").unwrap();
+        assert_eq!(
+            source_url(&conn).unwrap(),
+            "https://example.com/m.json",
+            "首尾空白应被去除"
+        );
     }
 
     #[test]

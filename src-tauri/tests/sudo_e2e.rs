@@ -365,3 +365,107 @@ async fn ask_mode_does_not_prompt_for_non_sudo_commands() {
 
     state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
 }
+
+/// **V1 回归（严重）**：sudo 密码绝不能以普通文件形式落在远端。
+///
+/// 背景：曾经 setup 脚本先 `mkfifo`、后通配 `rm -f "$dir"/sudopw.fifo.*`，
+/// 把刚建好的 FIFO 自己删掉；随后 `cat > fifo` 退化为"创建普通文件并写入"，
+/// 密码明文落盘且同机可读。
+///
+/// 单纯断言"sudo 成功"**测不出**这个缺陷——普通文件同样支持写读。
+/// 因此这里直接检查远端文件类型与残留：这是唯一能区分"真 FIFO"与
+/// "普通文件"的判据。
+#[tokio::test]
+#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
+async fn sudo_password_never_lands_in_a_regular_file() {
+    let Some(t) = target() else {
+        return;
+    };
+
+    let (state, key) = test_state();
+    let host_id = seed_host(&state, &key, &t, SudoPolicy::Auto).await;
+
+    let terminal = state
+        .terminals
+        .open_terminal(&state.db, &key, &host_id, None)
+        .await
+        .expect("终端应能建立");
+
+    // 1) 会话建立后：存在的 sudopw.fifo.* 必须**全是 FIFO**，不能有普通文件。
+    //    用 `find -type f` 精确判定普通文件（`-p` 判 FIFO）。
+    let check_cmd = r#"find "$HOME/.mf-perch" -maxdepth 1 -name 'sudopw.fifo.*' -type f 2>/dev/null | wc -l"#;
+    let outcome = state
+        .terminals
+        .run_command(&state.db, &terminal.id, check_cmd, Some(Duration::from_secs(15)))
+        .await
+        .expect("命令应能下发");
+    let (out, code) = collect(&state.terminals, &state.db, &outcome.command_id).await;
+    assert_eq!(code, Some(0), "检查命令应成功：{out}");
+    assert_eq!(
+        out.trim(),
+        "0",
+        "setup 后不得存在普通文件形态的 sudopw.fifo.*（FIFO 被删会导致密码落盘）"
+    );
+
+    // 2) 真正触发一次密码注入。
+    let outcome = state
+        .terminals
+        .run_command(&state.db, &terminal.id, "sudo id -u", Some(Duration::from_secs(30)))
+        .await
+        .expect("命令应能下发");
+    let (out, code) = collect(&state.terminals, &state.db, &outcome.command_id).await;
+    assert_eq!(code, Some(0), "auto 模式应成功提权：{out}");
+
+    // 3) 注入后仍不得出现普通文件（密码只经 FIFO 内存传递）。
+    let outcome = state
+        .terminals
+        .run_command(&state.db, &terminal.id, check_cmd, Some(Duration::from_secs(15)))
+        .await
+        .expect("命令应能下发");
+    let (out, _) = collect(&state.terminals, &state.db, &outcome.command_id).await;
+    assert_eq!(
+        out.trim(),
+        "0",
+        "注入密码后不得留下普通文件（说明密码可能已明文落盘）"
+    );
+
+    // 4) 归档会话后，本会话的临时节点应被清理：
+    //    不变式是"一个会话只留下自己那一套"。归档 t1 再开 t2，
+    //    若 t1 的残留被清理，总数应与归档前相同（而不是累加）。
+    let count_cmd = r#"find "$HOME/.mf-perch" -maxdepth 1 \( -name 'sudopw.fifo.*' -o -name 'askpass.*' \) 2>/dev/null | wc -l"#;
+    let before = {
+        let outcome = state
+            .terminals
+            .run_command(&state.db, &terminal.id, count_cmd, Some(Duration::from_secs(15)))
+            .await
+            .expect("命令应能下发");
+        let (out, _) = collect(&state.terminals, &state.db, &outcome.command_id).await;
+        out.trim().to_string()
+    };
+
+    state
+        .terminals
+        .archive_terminal(&state.db, &terminal.id)
+        .await
+        .expect("归档应成功");
+
+    let t2 = state
+        .terminals
+        .open_terminal(&state.db, &key, &host_id, None)
+        .await
+        .expect("新终端应能建立");
+    let outcome = state
+        .terminals
+        .run_command(&state.db, &t2.id, count_cmd, Some(Duration::from_secs(15)))
+        .await
+        .expect("命令应能下发");
+    let (after, _) = collect(&state.terminals, &state.db, &outcome.command_id).await;
+    assert_eq!(
+        after.trim(),
+        before,
+        "归档后本会话临时节点应被清理；若残留则数量会增加（归档前 {before}，归档后 {}）",
+        after.trim()
+    );
+
+    state.terminals.delete_terminal(&state.db, &t2.id).await.ok();
+}

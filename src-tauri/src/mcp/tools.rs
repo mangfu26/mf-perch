@@ -443,10 +443,23 @@ impl McpService {
         &self,
         p: CommandStatusParams,
     ) -> Result<crate::domain::command::CommandStatusView, AppError> {
-        self.state
+        // 归档终端的命令对其不再可见（V3）：与 run_command 的归档拒绝保持一致，
+        // 否则 Agent 可在归档前记下 command_id，归档后继续读取该终端的输出。
+        let view = self
+            .state
             .terminals
             .command_status(&self.state.db, &p.command_id, p.tail_lines)
-            .await
+            .await?;
+
+        {
+            let conn = self.state.db.lock().await;
+            let t = terminals::get(&conn, &view.terminal_id)?;
+            if t.status == TerminalStatus::Archived {
+                return Err(AppError::TerminalArchived(view.terminal_id.clone()));
+            }
+        }
+
+        Ok(view)
     }
 
     async fn archive_terminal_impl(

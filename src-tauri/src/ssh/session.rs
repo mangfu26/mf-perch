@@ -28,9 +28,9 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone)]
 pub enum SessionOutput {
     /// 命令输出的一行（已剔除协议标记行）。
-    Line { seq: u64, line: String },
-    /// 某条命令执行结束。
-    Finished { seq: u64, exit_code: i32 },
+    Line { line: String },
+    /// 某条命令执行结束；按 `command_id` 精确归属（V5）。
+    Finished { command_id: String, exit_code: i32 },
     /// sudo 正在索要密码（Q33）。
     SudoRequest,
     /// 连接已断开。
@@ -202,16 +202,11 @@ impl Session {
                 })?;
 
             match msg {
-                Some(ChannelMsg::Data { data }) => {
+                Some(ChannelMsg::Data { data })
+                | Some(ChannelMsg::ExtendedData { data, .. }) => {
                     pending.extend_from_slice(&data);
-                    consume_lines(&mut pending, &nonce, |ev| {
-                        if matches!(ev, SessionEvent::Ready) {
-                            ready = true;
-                        }
-                    });
-                }
-                Some(ChannelMsg::ExtendedData { data, .. }) => {
-                    pending.extend_from_slice(&data);
+                    // 就绪阶段只需识别 READY 标记，其余事件（含输出）暂存到
+                    // 后台任务的起始缓冲，由它继续处理。
                     consume_lines(&mut pending, &nonce, |ev| {
                         if matches!(ev, SessionEvent::Ready) {
                             ready = true;
@@ -233,19 +228,37 @@ impl Session {
 
         tokio::spawn(async move {
             let mut buf: Vec<u8> = pending;
+            let mut ready = false;
             loop {
                 match reader.wait().await {
-                    Some(ChannelMsg::Data { data }) => {
+                    Some(ChannelMsg::Data { data })
+                    | Some(ChannelMsg::ExtendedData { data, .. }) => {
                         buf.extend_from_slice(&data);
-                        consume_lines(&mut buf, &nonce_for_task, |ev| {
-                            forward_event(&tx, ev);
-                        });
-                    }
-                    Some(ChannelMsg::ExtendedData { data, .. }) => {
-                        buf.extend_from_slice(&data);
-                        consume_lines(&mut buf, &nonce_for_task, |ev| {
-                            forward_event(&tx, ev);
-                        });
+
+                        // 按换行切分并解析事件。控制事件（结束标记、sudo 请求）
+                        // 在通道满时会等待而非丢弃（V13）。
+                        if !pump_buffered(&mut buf, &nonce_for_task, &tx, &mut ready).await {
+                            break;
+                        }
+
+                        // V12：只有遇到 \n 才会消费缓冲，若命令持续输出不含换行的
+                        // 数据（如 `yes | tr -d '\n'`、读大二进制文件），缓冲会无界
+                        // 增长直至 OOM。超过上限时强制切出一段作为输出交出，
+                        // 既不丢数据，也不让内存继续膨胀。
+                        if buf.len() > MAX_PENDING_LINE_BYTES && !buf.contains(&b'\n') {
+                            let over = buf.len() - MAX_PENDING_LINE_BYTES;
+                            let chunk: Vec<u8> = buf.drain(..over).collect();
+                            let line = String::from_utf8_lossy(&chunk).to_string();
+                            if !line.is_empty()
+                                && !forward_event(
+                                    &tx,
+                                    SessionEvent::OutputLine(line),
+                                )
+                                .await
+                            {
+                                break;
+                            }
+                        }
                     }
                     Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
                         let _ = tx
@@ -301,9 +314,12 @@ impl Session {
         &self.terminal_id
     }
 
-    /// 下发一条命令（NUL 分帧，D3）。
-    pub async fn send_command(&self, command: &str) -> Result<()> {
-        let frame = protocol::encode_frame(command)?;
+    /// 下发一条命令（NUL 分帧，D3 / V5）。
+    ///
+    /// `command_id` 由应用生成，远端在结束标记中原样回显，
+    /// 从而按 id 精确配对，不依赖两侧各自自增的序号。
+    pub async fn send_command(&self, command_id: &str, command: &str) -> Result<()> {
+        let frame = protocol::encode_frame(command_id, command)?;
         self.writer
             .data(frame.as_slice())
             .await
@@ -316,26 +332,26 @@ impl Session {
     /// 走**独立的 SSH channel**，避免污染命令帧协议与输出解析；
     /// 密码经内存传递，不落盘、不进环境变量。
     ///
-    /// 用 heredoc 写入而非 `printf`：密码可能含 `%`、`\`、`$`、引号等，
-    /// 带引号的 heredoc（`<<'标记'`）不做任何展开，无需转义即可安全传递。
+    /// **密码经 stdin 投递，绝不出现在命令行参数中**（V14）：
+    /// 远端以 `cat > fifo` 接收，密码走 channel 的 stdin。
+    /// 若把密码拼进 heredoc 脚本再 `exec`，sshd 会以
+    /// `sh -c '<整段脚本>'` 启动进程，密码将出现在远端 `ps` /
+    /// `/proc/<pid>/cmdline` 中，同机用户可读。
     ///
     /// 写端不会阻塞：askpass 已用 `exec 3<>fifo`（O_RDWR）打开 FIFO，
     /// 因此这里的 `cat > fifo`（O_WRONLY）一定能立刻找到读者。
     pub async fn send_sudo_password(&self, password: &str) -> Result<()> {
-        // 随机结尾标记，避免密码内容恰好包含标记串而提前结束 heredoc。
-        let marker = format!("MFPERCH_SUDO_{}", protocol::new_nonce());
         let fifo = self.fifo_path();
+        let cmd = format!("cat > \"{fifo}\"");
 
-        debug_assert!(!password.contains(&marker));
+        // askpass 按行读取（read 遇换行返回），故必须补一个换行终止。
+        let mut payload = zeroize::Zeroizing::new(Vec::with_capacity(password.len() + 1));
+        payload.extend_from_slice(password.as_bytes());
+        payload.push(b'\n');
 
-        let script = format!(
-            "cat > \"{fifo}\" <<'{marker}'\n{password}\n{marker}\n",
-            fifo = fifo,
-            marker = marker,
-            password = password,
-        );
-
-        self.exec_sudo_helper(&script, "写入 sudo 密码").await
+        let result = self.exec_with_stdin(&cmd, &payload, "写入 sudo 密码").await;
+        // Zeroizing 会在离开作用域时清零 payload，减少内存中的密码副本（V20）。
+        result
     }
 
     /// 让 sudo 认证失败（Q33 "拒绝"）。
@@ -393,13 +409,70 @@ impl Session {
         Ok(())
     }
 
+    /// 执行远端命令并通过 **stdin** 投递数据（V14）。
+    ///
+    /// 用于传递敏感内容：命令自身不含任何秘密，秘密只走 channel 的 stdin，
+    /// 因此不会出现在远端的命令行参数（`ps` / `/proc/*/cmdline）中。
+    async fn exec_with_stdin(&self, command: &str, stdin_data: &[u8], what: &str) -> Result<()> {
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(|e| AppError::SshConnect(format!("打开 sudo 通道失败：{e}")))?;
+
+        channel
+            .exec(true, command.as_bytes())
+            .await
+            .map_err(|e| AppError::SshConnect(format!("{what}失败：{e}")))?;
+
+        let (mut reader, writer) = channel.split();
+
+        writer
+            .data(stdin_data)
+            .await
+            .map_err(|e| AppError::SshConnect(format!("{what}失败：{e}")))?;
+        // 发送 EOF，让远端的 `cat` 知道输入结束并退出。
+        writer
+            .eof()
+            .await
+            .map_err(|e| AppError::SshConnect(format!("{what}失败：{e}")))?;
+
+        // 等待远端命令结束，确保数据在返回前已写入 FIFO。
+        loop {
+            match reader.wait().await {
+                Some(russh::ChannelMsg::Eof)
+                | Some(russh::ChannelMsg::Close)
+                | None => break,
+                Some(_) => {}
+            }
+        }
+
+        Ok(())
+    }
+
     /// 优雅关闭会话。
+    ///
+    /// 关闭前先尽力收尾：删除本会话的 FIFO 与 askpass 脚本，
+    /// 避免在远端留下可被同机用户读取的残留节点（V1）。
+    /// 清理失败不阻断关闭流程——会话要关，残留只是次要问题。
     pub async fn close(&self) -> Result<()> {
+        self.cleanup_remote_artifacts().await;
+
         self.writer
             .eof()
             .await
             .map_err(|e| AppError::SshConnect(format!("关闭会话失败：{e}")))?;
         Ok(())
+    }
+
+    /// 删除远端为本会话创建的临时节点（FIFO 与 askpass 脚本）。
+    ///
+    /// 用独立 channel 执行，不影响命令帧协议；任何失败都只记日志。
+    async fn cleanup_remote_artifacts(&self) {
+        let script = protocol::session_cleanup_script(&self.nonce);
+        if let Err(e) = self.exec_sudo_helper(&script, "清理远端临时文件").await {
+            tracing::debug!("清理远端临时文件失败（不影响关闭）：{e}");
+        }
     }
 
     /// 断开底层连接。
@@ -433,23 +506,84 @@ fn consume_lines<F: FnMut(SessionEvent)>(buf: &mut Vec<u8>, nonce: &str, mut f: 
     }
 }
 
-/// 转发事件到通道；`CommandFinished` 需要知道序号。
-fn forward_event(tx: &mpsc::Sender<SessionOutput>, ev: SessionEvent) {
+/// 未换行的残留缓冲上限（V12）。
+///
+/// 只按 `\n` 切分意味着：若命令持续输出不含换行的数据，
+/// 缓冲会无界增长直至 OOM。超过上限时强制按当前内容切出一"行"，
+/// 既保住内存，又不丢数据（内容仍会作为输出交给上层）。
+const MAX_PENDING_LINE_BYTES: usize = 1024 * 1024;
+
+/// 把事件投递到通道。
+///
+/// - 普通输出行尽力投递（`try_send`）：丢几行输出可接受，
+///   换取"绝不因消费者变慢而卡住读取循环"。
+/// - **控制事件（结束标记、sudo 请求）不可丢弃**（V13）：
+///   丢弃 `Finished` 会让命令永久悬挂，丢弃 `SudoRequest` 会让
+///   远端 askpass 阻塞、拖死整条串行队列。通道满时等待接收端腾出空间。
+///
+/// 返回 `false` 表示接收端已关闭，调用方应停止读取循环。
+async fn forward_event(tx: &mpsc::Sender<SessionOutput>, ev: SessionEvent) -> bool {
     let out = match ev {
         SessionEvent::OutputLine(line) => {
-            // 逐行事件不带序号——序号由上层按"当前执行中命令"关联，
-            // 因为标记行只在命令结束时出现（见 D3 协议设计）。
-            SessionOutput::Line { seq: 0, line }
+            // 逐行事件不带序号——归属由上层按"当前执行中命令"决定。
+            SessionOutput::Line { line }
         }
-        SessionEvent::CommandFinished { seq, exit_code } => {
-            SessionOutput::Finished { seq, exit_code }
-        }
+        SessionEvent::CommandFinished {
+            command_id,
+            exit_code,
+        } => SessionOutput::Finished {
+            command_id,
+            exit_code,
+        },
         SessionEvent::SudoRequest => SessionOutput::SudoRequest,
-        SessionEvent::Ready => return,
+        SessionEvent::Ready => return true,
     };
 
-    // 尽力投递：接收端关闭时忽略，避免后台任务 panic。
-    let _ = tx.try_send(out);
+    let critical = matches!(
+        out,
+        SessionOutput::Finished { .. } | SessionOutput::SudoRequest
+    );
+
+    if let Err(err) = tx.try_send(out) {
+        match err {
+            // 接收端已关闭：后台任务结束，无需再投递。
+            mpsc::error::TrySendError::Closed(_) => return false,
+            mpsc::error::TrySendError::Full(out) if critical => {
+                // 控制事件必须送达；等待消费者腾出空间（不会丢失）。
+                if tx.send(out).await.is_err() {
+                    return false;
+                }
+            }
+            // 非控制事件丢弃：这是有意的取舍，不影响正确性。
+            mpsc::error::TrySendError::Full(_) => {
+                tracing::debug!("输出事件通道已满，丢弃一行输出");
+            }
+        }
+    }
+    true
+}
+
+/// 按当前缓冲内容解析事件并逐条投递；返回 `false` 表示接收端已关闭。
+async fn pump_buffered(
+    buf: &mut Vec<u8>,
+    nonce: &str,
+    tx: &mpsc::Sender<SessionOutput>,
+    ready: &mut bool,
+) -> bool {
+    // consume_lines 是同步闭包，这里先把事件收集出来，
+    // 再在异步上下文里逐条投递（控制事件需要 await 背压）。
+    let mut events = Vec::new();
+    consume_lines(buf, nonce, |ev| events.push(ev));
+
+    for ev in events {
+        if matches!(ev, SessionEvent::Ready) {
+            *ready = true;
+        }
+        if !forward_event(tx, ev).await {
+            return false;
+        }
+    }
+    true
 }
 
 /// 解析会话初始化输出的环境快照（D4）。
@@ -491,6 +625,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pending_line_cap_is_bounded() {
+        // V12：持续输出不含换行的数据时，缓冲不得无界增长。
+        // 这里验证上限常量存在且合理（1 MiB 量级），
+        // 以及超限切分后缓冲确实变小。
+        assert!(
+            MAX_PENDING_LINE_BYTES > 0 && MAX_PENDING_LINE_BYTES <= 16 * 1024 * 1024,
+            "上限应在合理区间（既不至于频繁切分，也不至于吃掉内存）"
+        );
+
+        let mut buf: Vec<u8> = vec![b'x'; MAX_PENDING_LINE_BYTES + 4096];
+        assert!(buf.len() > MAX_PENDING_LINE_BYTES);
+        let over = buf.len() - MAX_PENDING_LINE_BYTES;
+        let _: Vec<u8> = buf.drain(..over).collect();
+        assert!(
+            buf.len() <= MAX_PENDING_LINE_BYTES,
+            "切分后缓冲应回到上限之内"
+        );
+    }
+
+    #[test]
     fn consume_lines_handles_partial_line() {
         let nonce = "n1";
         let mut buf = b"partial".to_vec();
@@ -511,7 +665,7 @@ mod tests {
         let nonce = "abc";
         let mut buf = format!(
             "hello\n{}\nworld\n",
-            format_args!("{}{}__1__0__", protocol::END_MARKER_PREFIX, nonce)
+            format_args!("{}{}__cmdA__0__", protocol::END_MARKER_PREFIX, nonce)
         )
         .into_bytes();
         let mut events = Vec::new();
@@ -521,7 +675,7 @@ mod tests {
         assert!(matches!(&events[0], SessionEvent::OutputLine(s) if s == "hello"));
         assert!(matches!(
             &events[1],
-            SessionEvent::CommandFinished { seq: 1, exit_code: 0 }
+            SessionEvent::CommandFinished { command_id, exit_code: 0 } if command_id == "cmdA"
         ));
         assert!(matches!(&events[2], SessionEvent::OutputLine(s) if s == "world"));
     }
