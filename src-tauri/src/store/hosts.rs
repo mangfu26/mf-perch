@@ -4,7 +4,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
-use crate::domain::credential::{CredentialKind, CredentialSummary};
+use crate::domain::credential::CredentialSummary;
 use crate::domain::host::{
     Host, HostPublicInfo, HostSummary, ShellEnvMode, SudoPasswordSource, SudoPolicy,
 };
@@ -285,6 +285,7 @@ pub fn make_host(address: &str, port: u16, credential_id: Option<String>) -> Hos
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::credential::CredentialKind;
 
     fn setup() -> (Connection, [u8; KEY_LEN]) {
         let conn = crate::store::db::open_in_memory().unwrap();
