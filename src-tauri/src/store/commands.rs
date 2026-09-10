@@ -412,7 +412,6 @@ pub fn stats(conn: &Connection) -> Result<HistoryStats> {
 mod tests {
     use super::*;
     use crate::domain::command::CommandRecord;
-    use crate::domain::terminal::Terminal;
 
     fn setup() -> Connection {
         let conn = crate::store::db::open_in_memory().unwrap();

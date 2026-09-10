@@ -16,10 +16,10 @@ name = "mf_perch_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
-default = []
-# MCP Server 实现（阶段二）单独置于特性开关下，
-# 便于阶段一聚焦 SSH 引擎与数据层的编译与测试。
-mcp = ["dep:rmcp", "dep:axum"]
+# MCP Server 是产品核心能力（D1），默认开启。
+# 保留特性开关是为了让纯 SSH 引擎的测试可在不编译 MCP 依赖时快速运行。
+default = ["mcp"]
+mcp = ["dep:rmcp", "dep:axum", "dep:schemars"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -29,6 +29,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-os = "2"
 tauri-plugin-store = "2"
@@ -39,6 +40,8 @@ serde_json = "1"
 
 # 异步运行时
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process"] }
+# CancellationToken：用于 MCP 端点的优雅停止
+tokio-util = "0.7"
 futures = "0.3"
 
 # SSH（D9：纯 Rust、异步、无 C 依赖）
@@ -53,6 +56,9 @@ russh = { version = "0.63", default-features = false, features = ["flate2", "rin
 # 设为可选：阶段一不编译 MCP 层，缩短构建时间；阶段二用 --features mcp 启用。
 rmcp = { version = "3", features = ["transport-streamable-http-server"], optional = true }
 axum = { version = "0.8", optional = true }
+# rmcp 的 #[derive(JsonSchema)] 生成的代码直接引用 `schemars::`，
+# 因此必须作为直接依赖，且版本需与 rmcp 内部使用的一致（1.x）。
+schemars = { version = "1", optional = true }
 
 # 数据库
 rusqlite = { version = "0.40", features = ["bundled", "serde_json"] }
@@ -80,6 +86,9 @@ dirs = "6"
 
 [dev-dependencies]
 tempfile = "3"
+# 集成测试通过真实 HTTP 调用 MCP 端点
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

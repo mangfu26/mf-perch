@@ -14,6 +14,7 @@ use russh::ChannelMsg;
 use tokio::sync::mpsc;
 
 use crate::domain::host::{Host, ShellEnvMode};
+use crate::domain::terminal::EnvSnapshot;
 use crate::error::{AppError, Result};
 use crate::ssh::auth::{AuthMethod, TofuHandler};
 use crate::ssh::protocol::{self, SessionEvent};
@@ -46,6 +47,10 @@ pub struct Session {
     nonce: String,
     /// 本会话的终端 ID（便于日志与事件归属）。
     terminal_id: String,
+    /// 首次连接时捕获的主机密钥（TOFU），供上层持久化（D10）。
+    captured_host_key: Option<(String, String)>,
+    /// 会话建立时捕获的环境快照（D4）。
+    env_snapshot: Option<EnvSnapshot>,
 }
 
 impl Session {
@@ -253,29 +258,36 @@ impl Session {
             }
         });
 
+        // 首次连接捕获的主机密钥（TOFU）：存入会话，由上层持久化（D10）。
+        let captured_host_key = captured.lock().ok().and_then(|mut g| g.take());
+        if let Some((_, fp)) = captured_host_key.as_ref() {
+            tracing::info!(
+                terminal_id = %terminal_id,
+                fingerprint = %fp,
+                "首次连接，记录主机密钥（TOFU）"
+            );
+        }
+
         let session = Self {
             handle,
             writer,
             nonce,
             terminal_id,
+            captured_host_key,
+            env_snapshot,
         };
 
-        // 记录首次连接捕获到的主机密钥（TOFU），由调用方持久化。
-        if let Some((key, fp)) = captured.lock().ok().and_then(|mut g| g.take()) {
-            tracing::info!(
-                terminal_id = %session.terminal_id,
-                fingerprint = %fp,
-                "首次连接，记录主机密钥（TOFU）"
-            );
-            // 通过环境变量式的旁路把结果带回：这里用参数返回更清晰，
-            // 但为保持签名简洁，改为记录日志并由上层从数据库读取。
-            let _ = key;
-        }
-
-        // env_snapshot 通过返回的会话状态由上层读取；此处保持连接建立的最小副作用。
-        let _ = env_snapshot;
-
         Ok((session, rx))
+    }
+
+    /// 取走首次连接捕获的主机密钥（TOFU），供上层写入数据库（D10）。
+    pub fn take_captured_host_key(&self) -> Option<(String, String)> {
+        self.captured_host_key.clone()
+    }
+
+    /// 会话建立时捕获的环境快照（D4）。
+    pub fn env_snapshot(&self) -> Option<&EnvSnapshot> {
+        self.env_snapshot.as_ref()
     }
 
     /// 会话随机串（测试与日志用）。

@@ -27,8 +27,9 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// 打开内存数据库，供单元测试使用。
-#[cfg(test)]
+/// 打开内存数据库。
+///
+/// 供单元测试与集成测试使用：完全隔离，不触碰用户真实数据目录。
 pub fn open_in_memory() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
     conn.pragma_update(None, "foreign_keys", "ON")?;

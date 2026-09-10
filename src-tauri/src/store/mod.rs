@@ -18,3 +18,16 @@ pub mod keyring;
 pub mod terminals;
 
 pub use db::{data_dir, default_db_path};
+
+use std::sync::Arc;
+
+/// 数据库句柄。
+///
+/// 用 `Arc<tokio::sync::Mutex<_>>` 而非裸 `Mutex`：
+/// - `rusqlite::Connection` 是 `Send` 但**不是** `Sync`，不能把 `&Connection`
+///   借用跨越 `.await`（那样 future 不再是 `Send`）
+/// - 用 `Arc` 是为了让后台任务（如异步命令的终态回写）也能持有句柄
+///
+/// 访问约定：**分阶段加锁**——读信息 → 释放 → 做网络操作 → 再短暂加锁写入，
+/// 避免在 SSH 连接（最长十余秒）期间把数据库锁住而拖住界面。
+pub type Db = Arc<tokio::sync::Mutex<rusqlite::Connection>>;

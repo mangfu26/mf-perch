@@ -8,6 +8,8 @@
     "core:window:allow-start-dragging",
     "opener:default",
     "dialog:default",
+    "fs:allow-read-text-file",
+    "fs:default",
     "notification:default",
     "os:default",
     "store:default"

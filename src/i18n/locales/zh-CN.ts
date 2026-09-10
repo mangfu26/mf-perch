@@ -192,6 +192,8 @@ export default {
     allowRemoteHint: "开启后监听 0.0.0.0，供其他主机的 Agent 接入",
     allowRemoteWarning:
       "远程连接会离开本机回环地址，仅靠令牌无法保证传输安全，请确认网络环境可信。",
+    autoStart: "随应用自动启动",
+    autoStartHint: "开启后，应用启动时自动运行 MCP Server",
     port: "端口",
     portHint: "端口被占用时会自动向后查找可用端口",
   },

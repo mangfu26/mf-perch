@@ -1,0 +1,530 @@
+//! MCP 工具实现（D1 / Q4 / Q11 / Q17）。
+//!
+//! 工具描述与返回内容**固定英文**（D18）——面向 AI Agent，
+//! 且 MCP 生态以英文为主，不随界面语言变化。
+//!
+//! 权限边界（AGENTS.md 0.1）：
+//! - Agent 只能看到主机的公开信息（地址/端口/是否可用），**拿不到任何凭据**
+//! - Agent 只能归档终端，不能删除；归档终端对它不可见
+//! - 人类侧的管理操作（增删改主机与凭据、删除终端）不通过 MCP 暴露
+
+use std::sync::Arc;
+
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo, ToolsCapability};
+use rmcp::{tool, tool_router, ErrorData as McpError, ServerHandler};
+use rmcp::schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::domain::terminal::TerminalStatus;
+use crate::error::AppError;
+use crate::state::AppState;
+use crate::store::{hosts, terminals};
+
+/// 默认同步等待秒数（Q4）。
+const DEFAULT_WAIT_SECS: u64 = crate::domain::DEFAULT_SYNC_WAIT_SECS;
+/// 同步等待上限，避免撞上 MCP 客户端自身超时（Q4）。
+const MAX_WAIT_SECS: u64 = crate::domain::MAX_SYNC_WAIT_SECS;
+
+// ============================ 工具入参 ============================
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EmptyParams {}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateTerminalParams {
+    /// Target host ID obtained from `list_hosts`.
+    pub host_id: String,
+    /// Optional human-readable name for this terminal.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TerminalIdParams {
+    /// Terminal ID returned by `create_terminal` or `list_terminals`.
+    pub terminal_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunCommandParams {
+    /// Terminal ID to run the command on.
+    pub terminal_id: String,
+    /// The shell command to execute.
+    pub command: String,
+    /// Seconds to wait synchronously before returning a handle.
+    /// Defaults to 30, maximum 50. Use `run_command_async` for long tasks.
+    #[serde(default)]
+    pub wait_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CommandStatusParams {
+    /// Command ID returned by `run_command` or `run_command_async`.
+    pub command_id: String,
+    /// Return only the last N lines of output. Omit to get everything.
+    #[serde(default)]
+    pub tail_lines: Option<usize>,
+}
+
+// ============================ 工具返回 ============================
+
+#[derive(Debug, Serialize)]
+struct ToolError {
+    error: String,
+    code: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HostList {
+    hosts: Vec<crate::domain::host::HostPublicInfo>,
+    /// Number of active (non-archived) terminals per host.
+    active_terminals: std::collections::HashMap<String, u32>,
+    /// Per-host terminal quota, so the agent knows when it must archive first.
+    quota_per_host: u32,
+    quota_global: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalCreated {
+    terminal_id: String,
+    host_id: String,
+    name: Option<String>,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalList {
+    terminals: Vec<TerminalSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalSummary {
+    terminal_id: String,
+    host_id: String,
+    host_name: Option<String>,
+    name: Option<String>,
+    status: String,
+    created_at: String,
+    last_command: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArchiveResult {
+    terminal_id: String,
+    status: String,
+    message: String,
+}
+
+// ============================ 服务实现 ============================
+
+/// MCP 服务：持有应用共享状态，工具方法据此操作终端。
+#[derive(Clone)]
+pub struct McpService {
+    state: Arc<AppState>,
+}
+
+#[tool_router]
+impl McpService {
+    pub fn new(state: Arc<AppState>) -> Self {
+        Self { state }
+    }
+
+    /// List all configured SSH hosts that the AI agent may use.
+    ///
+    /// Returns host ID, address, port and whether the host is ready
+    /// (i.e. a credential has been attached by the human user).
+    /// Credentials themselves are never exposed.
+    #[tool(
+        name = "list_hosts",
+        description = "List all configured SSH hosts available to the agent. \
+                       Returns host ID, address, port, and whether the host is ready \
+                       (credential configured). Credentials are never exposed.",
+        annotations(title = "List SSH hosts", read_only_hint = true)
+    )]
+    async fn list_hosts(
+        &self,
+        Parameters(_): Parameters<EmptyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.list_hosts_impl().await {
+            Ok(v) => json_result(&v),
+            Err(e) => Ok(error_result(&e)),
+        }
+    }
+
+    /// Create a new terminal on the given SSH host.
+    ///
+    /// A terminal is a persistent SSH session that keeps its working
+    /// directory and environment variables across commands. Only one
+    /// command runs at a time per terminal; create several terminals to
+    /// work in parallel.
+    #[tool(
+        name = "create_terminal",
+        description = "Create a new terminal on an SSH host. The terminal keeps its \
+                       working directory and environment between commands. Commands run \
+                       one at a time per terminal; create multiple terminals for parallel \
+                       work. Fails if the host has no credential or the terminal quota is reached.",
+        annotations(title = "Create terminal", read_only_hint = false)
+    )]
+    async fn create_terminal(
+        &self,
+        Parameters(p): Parameters<CreateTerminalParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.create_terminal_impl(p).await {
+            Ok(v) => json_result(&v),
+            Err(e) => Ok(error_result(&e)),
+        }
+    }
+
+    /// List terminals visible to the agent.
+    ///
+    /// Archived terminals are intentionally omitted; the human user can
+    /// still audit their command history in the desktop app.
+    #[tool(
+        name = "list_terminals",
+        description = "List terminals visible to the agent. Archived terminals are not \
+                       returned. Optionally filter by host_id. Shows terminal status and \
+                       the last command executed on each terminal.",
+        annotations(title = "List terminals", read_only_hint = true)
+    )]
+    async fn list_terminals(
+        &self,
+        Parameters(p): Parameters<OptionalHostIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.list_terminals_impl(p.host_id).await {
+            Ok(v) => json_result(&v),
+            Err(e) => Ok(error_result(&e)),
+        }
+    }
+
+    /// Run a command and wait for it to finish (synchronous mode).
+    ///
+    /// Waits up to `wait_seconds` (default 30, max 50). If the command
+    /// does not finish in time, this returns a `command_id` with status
+    /// `running` **without interrupting the command**; poll it with
+    /// `get_command_status`. Use `run_command_async` for clearly long tasks.
+    #[tool(
+        name = "run_command",
+        description = "Run a shell command on a terminal and wait for completion \
+                       (synchronous). Returns output, exit code and duration. If the command \
+                       is still running after wait_seconds (default 30, max 50) it returns a \
+                       command_id with status 'running' WITHOUT stopping the command; poll \
+                       with get_command_status. Commands on the same terminal run one at a time.",
+        annotations(title = "Run command (sync)", read_only_hint = false)
+    )]
+    async fn run_command(
+        &self,
+        Parameters(p): Parameters<RunCommandParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let wait = Some(std::time::Duration::from_secs(
+            p.wait_seconds.unwrap_or(DEFAULT_WAIT_SECS).min(MAX_WAIT_SECS),
+        ));
+        match self.run_command_impl(p, wait).await {
+            Ok(v) => json_result(&v),
+            Err(e) => Ok(error_result(&e)),
+        }
+    }
+
+    /// Run a long-running command and return immediately (asynchronous mode).
+    ///
+    /// Returns a `command_id` right away. Poll progress with
+    /// `get_command_status`. The command occupies its terminal until it
+    /// finishes, so use a separate terminal for each parallel task.
+    #[tool(
+        name = "run_command_async",
+        description = "Start a long-running shell command and return immediately with a \
+                       command_id (asynchronous). Poll progress with get_command_status. \
+                       The command occupies the terminal until it finishes; use separate \
+                       terminals for parallel tasks.",
+        annotations(title = "Run command (async)", read_only_hint = false)
+    )]
+    async fn run_command_async(
+        &self,
+        Parameters(p): Parameters<RunCommandParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.run_command_impl(p, None).await {
+            Ok(v) => json_result(&v),
+            Err(e) => Ok(error_result(&e)),
+        }
+    }
+
+    /// Get the current status of a command started earlier.
+    ///
+    /// Returns status (queued/running/completed/failed), exit code, duration
+    /// and accumulated output. Use `tail_lines` to limit output size.
+    #[tool(
+        name = "get_command_status",
+        description = "Get the current status of a command started by run_command or \
+                       run_command_async. Returns status (queued/running/completed/failed), \
+                       exit code, duration in milliseconds and accumulated output. Use \
+                       tail_lines to limit the amount of output returned.",
+        annotations(title = "Get command status", read_only_hint = true)
+    )]
+    async fn get_command_status(
+        &self,
+        Parameters(p): Parameters<CommandStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.get_command_status_impl(p).await {
+            Ok(v) => json_result(&v),
+            Err(e) => Ok(error_result(&e)),
+        }
+    }
+
+    /// Archive a terminal. The SSH session is closed, but its command
+    /// history is preserved for human auditing. Archived terminals are no
+    /// longer visible to the agent. Only the human user can delete a terminal.
+    #[tool(
+        name = "archive_terminal",
+        description = "Archive a terminal: closes the SSH session but preserves all command \
+                       history for human auditing. Archived terminals become invisible to the \
+                       agent. This is the correct way to release a terminal slot; the agent \
+                       cannot delete terminals.",
+        annotations(title = "Archive terminal", read_only_hint = false)
+    )]
+    async fn archive_terminal(
+        &self,
+        Parameters(p): Parameters<TerminalIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.archive_terminal_impl(p).await {
+            Ok(v) => json_result(&v),
+            Err(e) => Ok(error_result(&e)),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct OptionalHostIdParams {
+    /// Optional host ID to filter terminals by.
+    #[serde(default)]
+    pub host_id: Option<String>,
+}
+
+// ============================ 实现细节 ============================
+
+impl McpService {
+    async fn list_hosts_impl(&self) -> Result<HostList, AppError> {
+        let conn = self.state.db.lock().await;
+        let list = hosts::list_public(&conn)?;
+
+        let mut active = std::collections::HashMap::new();
+        for h in &list {
+            active.insert(
+                h.id.clone(),
+                terminals::count_active(&conn, Some(&h.id))?,
+            );
+        }
+
+        Ok(HostList {
+            hosts: list,
+            active_terminals: active,
+            quota_per_host: crate::domain::DEFAULT_TERMINAL_LIMIT_PER_HOST,
+            quota_global: crate::domain::DEFAULT_TERMINAL_LIMIT_GLOBAL,
+        })
+    }
+
+    async fn create_terminal_impl(
+        &self,
+        p: CreateTerminalParams,
+    ) -> Result<TerminalCreated, AppError> {
+        // 只克隆主密钥后立即释放锁：建立 SSH 会话耗时较长，
+        // 期间不应占用主密钥锁或数据库锁。
+        let key = {
+            let mk = self.state.master_key.lock().await;
+            *mk.get()?
+        };
+
+        let terminal = self
+            .state
+            .terminals
+            .open_terminal(&self.state.db, &key, &p.host_id, p.name.clone())
+            .await?;
+
+        Ok(TerminalCreated {
+            terminal_id: terminal.id,
+            host_id: terminal.host_id,
+            name: terminal.name,
+            status: terminal.status.as_str().to_string(),
+        })
+    }
+
+    async fn list_terminals_impl(&self, host_id: Option<String>) -> Result<TerminalList, AppError> {
+        let conn = self.state.db.lock().await;
+        let list = terminals::list_visible_to_agent(&conn, host_id.as_deref())?;
+
+        let mut out = Vec::new();
+        for t in list {
+            let host_name = hosts::get(&conn, &t.host_id).ok().and_then(|h| h.name);
+            let last = crate::store::commands::list_by_terminal(&conn, &t.id, 1, 0)?
+                .into_iter()
+                .next()
+                .map(|c| c.command);
+
+            out.push(TerminalSummary {
+                terminal_id: t.id,
+                host_id: t.host_id,
+                host_name,
+                name: t.name,
+                status: t.status.as_str().to_string(),
+                created_at: t.created_at,
+                last_command: last,
+            });
+        }
+
+        Ok(TerminalList { terminals: out })
+    }
+
+    async fn run_command_impl(
+        &self,
+        p: RunCommandParams,
+        wait: Option<std::time::Duration>,
+    ) -> Result<crate::terminal::RunOutcome, AppError> {
+        // 归档终端的命令必须被拒绝，且给出可区分的原因。
+        {
+            let conn = self.state.db.lock().await;
+            let t = terminals::get(&conn, &p.terminal_id)?;
+            if t.status == TerminalStatus::Archived {
+                return Err(AppError::TerminalArchived(p.terminal_id.clone()));
+            }
+        }
+
+        self.state
+            .terminals
+            .run_command(&self.state.db, &p.terminal_id, &p.command, wait)
+            .await
+    }
+
+    async fn get_command_status_impl(
+        &self,
+        p: CommandStatusParams,
+    ) -> Result<crate::domain::command::CommandStatusView, AppError> {
+        self.state
+            .terminals
+            .command_status(&self.state.db, &p.command_id, p.tail_lines)
+            .await
+    }
+
+    async fn archive_terminal_impl(
+        &self,
+        p: TerminalIdParams,
+    ) -> Result<ArchiveResult, AppError> {
+        let t = self
+            .state
+            .terminals
+            .archive_terminal(&self.state.db, &p.terminal_id)
+            .await?;
+        Ok(ArchiveResult {
+            terminal_id: t.id,
+            status: t.status.as_str().to_string(),
+            message: "Terminal archived. Its command history remains available to the human user."
+                .to_string(),
+        })
+    }
+}
+
+/// 把 `#[tool]` 标注的方法接入 MCP 的 `call_tool` / `list_tools` 分发。
+///
+/// 该宏自动生成路由方法；`get_info` 已手写（含 capabilities 与 instructions），
+/// 宏检测到后不会重复生成。
+#[rmcp::tool_handler]
+impl ServerHandler for McpService {
+    fn get_info(&self) -> ServerInfo {
+        // 这两个结构体标记了 non_exhaustive，只能用 Default 构造后改字段。
+        let mut capabilities = ServerCapabilities::default();
+        capabilities.tools = Some(ToolsCapability::default());
+
+        let mut info = ServerInfo::default();
+        info.capabilities = capabilities;
+        // 服务器标识：客户端会展示这个名字，必须能认出是 mf-perch。
+        info.server_info.name = "mf-perch".to_string();
+        info.server_info.version = env!("CARGO_PKG_VERSION").to_string();
+        info.instructions = Some(
+            "mf-perch exposes SSH terminals to AI agents. \
+             Typical flow: list_hosts -> create_terminal -> run_command. \
+             Use run_command_async plus get_command_status for long-running tasks. \
+             Always archive_terminal when finished to release the terminal slot. \
+             Hosts and credentials are managed by the human user; credentials are never exposed."
+                .to_string(),
+        );
+        info
+    }
+}
+
+// ============================ 结果封装 ============================
+
+/// 把成功结果序列化为 JSON 文本内容。
+fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
+    let text = serde_json::to_string_pretty(value).map_err(|e| {
+        McpError::internal_error(format!("failed to serialize tool result: {e}"), None)
+    })?;
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+}
+
+/// 把应用错误转为**结构化**的工具结果（Q4：错误要可判断、可恢复）。
+///
+/// 刻意不使用协议级错误：Agent 需要读到 `code` 才能区分
+/// "终端不存在"与"队列已满"等不同情况，并决定是否自行恢复。
+fn error_result(e: &AppError) -> CallToolResult {
+    let payload = ToolError {
+        error: e.to_string(),
+        code: e.code().to_string(),
+    };
+    let text = serde_json::to_string_pretty(&payload)
+        .unwrap_or_else(|_| format!(r#"{{"code":"internal_error","error":"{e}"}}"#));
+
+    CallToolResult::error(vec![ContentBlock::text(text)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_result_carries_machine_readable_code() {
+        let e = AppError::TerminalArchived("term_1".into());
+        let result = error_result(&e);
+        assert_eq!(result.is_error, Some(true));
+
+        let text = serde_json::to_string(&result.content).unwrap();
+        assert!(text.contains("terminal_archived"), "应包含错误码");
+        assert!(text.contains("term_1"), "应包含具体终端的上下文");
+    }
+
+    #[test]
+    fn quota_error_is_distinguishable_from_not_found() {
+        // Agent 需据此决定"归档后重试"还是"换个终端"，故错误码必须不同。
+        let quota = error_result(&AppError::TerminalQuotaExceeded { scope: "per_host" });
+        let missing = error_result(&AppError::TerminalNotFound("t".into()));
+
+        let q = serde_json::to_string(&quota.content).unwrap();
+        let m = serde_json::to_string(&missing.content).unwrap();
+        assert!(q.contains("terminal_quota_exceeded"));
+        assert!(m.contains("terminal_not_found"));
+        assert_ne!(q, m);
+    }
+
+    #[test]
+    fn json_result_is_not_an_error() {
+        let v = ArchiveResult {
+            terminal_id: "t1".into(),
+            status: "archived".into(),
+            message: "ok".into(),
+        };
+        let r = json_result(&v).unwrap();
+        assert_ne!(r.is_error, Some(true));
+        let text = serde_json::to_string(&r.content).unwrap();
+        assert!(text.contains("archived"));
+    }
+
+    #[test]
+    fn wait_seconds_is_clamped_to_maximum() {
+        // 上限存在的意义：避免同步等待超过 MCP 客户端自身超时（Q4）。
+        let requested = 999u64;
+        assert_eq!(requested.min(MAX_WAIT_SECS), MAX_WAIT_SECS);
+        assert_eq!(MAX_WAIT_SECS, 50);
+    }
+
+    #[test]
+    fn default_wait_seconds_matches_design() {
+        assert_eq!(DEFAULT_WAIT_SECS, 30);
+    }
+}

@@ -1,0 +1,111 @@
+/**
+ * 后端命令的类型化封装。
+ *
+ * 组件不直接拼命令名与参数，统一从这里调用，便于重构与检索。
+ */
+import { call } from "./ipc";
+import type {
+  CredentialInput,
+  CredentialSummary,
+  HistoryItem,
+  HistoryStats,
+  HostInput,
+  HostSummary,
+  KeyProvider,
+  KeyStatus,
+  McpStatus,
+  Terminal,
+  TerminalView,
+} from "./api";
+
+// ==================== 密钥状态与引导 ====================
+
+export const keyStatus = () => call<KeyStatus>("key_status");
+
+export const initKeyProvider = (provider: KeyProvider, password?: string) =>
+  call<KeyStatus>("init_key_provider", { provider, password: password ?? null });
+
+export const unlockWithPassword = (password: string) =>
+  call<boolean>("unlock_with_password", { password });
+
+// ==================== 主机 ====================
+
+export const listHosts = () => call<HostSummary[]>("list_hosts");
+
+export const saveHost = (input: HostInput) => call<string>("save_host", { input });
+
+export const deleteHost = (id: string) => call<boolean>("delete_host", { id });
+
+// ==================== 认证信息 ====================
+
+export const listCredentials = () =>
+  call<CredentialSummary[]>("list_credentials");
+
+export const saveCredential = (input: CredentialInput) =>
+  call<string>("save_credential", { input });
+
+export const deleteCredential = (id: string) =>
+  call<boolean>("delete_credential", { id });
+
+// ==================== 终端 ====================
+
+export const listTerminals = (hostId?: string) =>
+  call<TerminalView[]>("list_terminals", { hostId: hostId ?? null });
+
+export const archiveTerminal = (id: string) =>
+  call<Terminal>("archive_terminal", { id });
+
+export const restoreTerminal = (id: string) =>
+  call<Terminal>("restore_terminal", { id });
+
+export const deleteTerminal = (id: string) =>
+  call<boolean>("delete_terminal", { id });
+
+// ==================== 命令历史（审计） ====================
+
+export interface HistoryQuery {
+  terminalId?: string;
+  hostId?: string;
+  query?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export const searchHistory = (params: HistoryQuery = {}) =>
+  call<HistoryItem[]>("search_history", {
+    params: {
+      terminal_id: params.terminalId ?? null,
+      host_id: params.hostId ?? null,
+      query: params.query ?? null,
+      limit: params.limit ?? null,
+      offset: params.offset ?? null,
+    },
+  });
+
+export const historyStats = () => call<HistoryStats>("history_stats");
+
+// ==================== 设置 ====================
+
+export const getSetting = (key: string) =>
+  call<string | null>("get_setting", { key });
+
+export const setSetting = (key: string, value: string) =>
+  call<boolean>("set_setting", { key, value });
+
+// ==================== MCP 管理 ====================
+
+export const mcpStatus = () => call<McpStatus>("mcp_status");
+
+export const mcpStart = () => call<McpStatus>("mcp_start");
+
+export const mcpStop = () => call<McpStatus>("mcp_stop");
+
+export const mcpRegenerateToken = () => call<string>("mcp_regenerate_token");
+
+export const mcpSetAllowRemote = (allow: boolean) =>
+  call<McpStatus>("mcp_set_allow_remote", { allow });
+
+export const mcpSetAutoStart = (enabled: boolean) =>
+  call<boolean>("mcp_set_auto_start", { enabled });
+
+export const mcpClientConfig = () => call<string>("mcp_client_config");

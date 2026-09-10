@@ -94,6 +94,25 @@ impl AuthMethod {
             Self::Password { username, .. } | Self::Key { username, .. } => username,
         }
     }
+
+    /// 由已解密的领域凭据构造认证方式。
+    ///
+    /// 判定依据是凭据自身声明的 `kind`，而不是猜测内容——
+    /// 猜测私钥正文（如搜 "PRIVATE KEY"）会在 PEM 变体或含口令时出错。
+    pub fn from_credential(c: &crate::domain::credential::Credential) -> Self {
+        use crate::domain::credential::CredentialKind;
+        match c.kind {
+            CredentialKind::Password => Self::Password {
+                username: c.username.clone(),
+                password: c.secret.clone(),
+            },
+            CredentialKind::Key => Self::Key {
+                username: c.username.clone(),
+                private_key_pem: c.secret.clone(),
+                passphrase: c.passphrase.clone(),
+            },
+        }
+    }
 }
 
 /// 解析私钥（支持 OpenSSH 与 PEM；PPK 明确不支持，Q10）。
