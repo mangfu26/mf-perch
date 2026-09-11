@@ -37,7 +37,10 @@ pub enum SessionEvent {
     /// 两者在恢复终端等场景下必然错位，会导致命令永远等不到结束标记。
     CommandFinished { command_id: String, exit_code: i32 },
     /// 有 sudo 正在索要密码（Q33 `ask` / `auto` 模式据此决定是否注入）。
-    SudoRequest,
+    ///
+    /// `token` 是该次索要的远端 askpass PID，应用用 `(nonce, token)` 定位
+    /// 唯一的应答 FIFO——这是应答能精确投递给本次索要的前提（B2）。
+    SudoRequest { token: String },
     /// 普通输出行（命令产生的输出）。
     OutputLine(String),
 }
@@ -150,35 +153,82 @@ pub fn shell_invocation(env_mode: crate::domain::host::ShellEnvMode) -> (&'stati
 ///    因此在打印标记时，FIFO 已存在读者。若改成先打印标记、再由
 ///    应用去 `cat > fifo`（O_WRONLY），一旦读者尚未就绪，写端会
 ///    **永久阻塞**在 open 上，把命令串行队列彻底卡死。
-pub fn askpass_script(nonce: &str, fifo_path: &str) -> String {
+///
+/// 3. **每次索要用一条独立 FIFO，名字带本进程 PID**（B2）。
+///    共用一条 FIFO 时，FIFO 上会同时存在多个阻塞读者，而一次写入只会被
+///    **其中任意一个**读者取走（POSIX），于是"用户批准 A"的密码可能被
+///    B 的 askpass 读走——应答无法定向，approve 与拒绝都可能错配。
+///    按 PID 分道后，一条 FIFO 上永远只有一个读者，路由无歧义。
+///
+/// 4. **用后即删**：读走应答后立即 `rm -f`，本 FIFO 只服务这一次索要。
+///    这同时消除了 V1 一类"残留节点"的成因——FIFO 本身不留存任何数据。
+///
+/// 5. shebang 用 `bash` 而非 `sh`：兜底超时依赖 `read -t`，
+///    而 Debian/Ubuntu 的 `/bin/sh`（dash）不支持 `-t`，会直接报错使 sudo
+///    永远失败。远端本来就要求有 bash（见 [`wrapper_script`]）。
+pub fn askpass_script(nonce: &str) -> String {
     format!(
-        r#"#!/bin/sh
-# O_RDWR 打开 FIFO：永不阻塞，确保写端一定找得到读者
-exec 3<>"{fifo}"
-printf '{prefix}%s__\n' '{nonce}' >&2
-IFS= read -r mfperch_pw <&3
+        r#"#!/bin/bash
+# 每次索要一条独立 FIFO，名字带本进程 PID（B2）：一条 FIFO 只有一个读者，
+# 应用据此把应答精确投递给本次索要，不会被其它并发索要抢走。
+mfperch_dir="$HOME/{dir}"
+mfperch_fifo="$mfperch_dir/{fifo_prefix}.{nonce}.$$"
+umask 077
+rm -f "$mfperch_fifo" 2>/dev/null
+if ! mkfifo "$mfperch_fifo" 2>/dev/null; then
+  printf 'MFPERCH_SUDO_FIFO_ERROR\n' >&2
+  exit 1
+fi
+# O_RDWR 打开 FIFO：永不阻塞，确保应用侧写入时一定找得到读者
+exec 3<>"$mfperch_fifo"
+# 令牌 = 本进程 PID；应用据它算出该往哪条 FIFO 写。
+# 标记必须走 stderr：sudo 把 stdout 第一行当密码。
+printf '{prefix}{nonce}__%s__\n' "$$" >&2
+# 兜底超时（O4）：应用侧的确认超时是 60 秒，这里留一倍余量。
+# 正常路径永远由应用应答（注入或空密码拒绝）；只有应用侧异常
+# （会话中断、进程崩溃）才会走到超时，读超时得到空密码 → sudo 失败，
+# 命令照常结束，不会把串行队列永久挂死。
+IFS= read -r -t 120 mfperch_pw <&3
+rm -f "$mfperch_fifo" 2>/dev/null
 printf '%s\n' "$mfperch_pw"
 "#,
+        dir = REMOTE_DIR,
+        fifo_prefix = SUDO_FIFO_NAME,
         prefix = SUDO_REQUEST_PREFIX,
         nonce = nonce,
-        fifo = fifo_path,
     )
 }
 
-/// 某会话专属的 FIFO 文件名。
+/// 某次 sudo 索要专属的 FIFO 文件名。
 ///
-/// **按会话唯一命名**（而非固定的 `sudopw.fifo`）是端到端测试暴露的教训：
-/// 固定名称下，后续会话的 `rm -f` + `mkfifo` 会替换文件节点，
-/// 使已在阻塞的读写方落在**不同 inode** 上，各自永久挂起。
-/// 会话唯一名称从根本上消除这类互相踩踏。
-pub fn sudo_fifo_name(nonce: &str) -> String {
-    format!("{SUDO_FIFO_NAME}.{nonce}")
+/// **按会话 + 索要双重唯一命名**：
+///
+/// - 会话维度（`nonce`）：固定名称下，后续会话的 `rm -f` + `mkfifo` 会替换
+///   文件节点，使已在阻塞的读写方落在**不同 inode** 上，各自永久挂起（§7.4）；
+/// - 索要维度（`token` = 远端 askpass 的 PID）：同一会话内并发索要时，
+///   共用一条 FIFO 会让应答被任意一个读者取走，导致应答错配（B2）。
+pub fn sudo_fifo_name(nonce: &str, token: &str) -> String {
+    format!("{SUDO_FIFO_NAME}.{nonce}.{token}")
 }
 
-/// 构造会话初始化命令：建立工作目录、FIFO、askpass 脚本，并输出环境快照（D4）。
+/// 校验 sudo 索要令牌是否可信。
+///
+/// 令牌由远端 askpass 打印、经协议标记回传，随后会被应用**拼进下发的 shell
+/// 命令**（作为 FIFO 路径的一部分）。因此必须严格限制字符集：只接受
+/// 1–10 位 ASCII 数字。若放过 `;`、`$()`、空格、`/` 等字符，被 Agent 伪造的
+/// 标记就可能变成命令注入（V2 风险的延伸）。非法令牌一律当作普通输出丢弃。
+pub fn is_valid_sudo_token(token: &str) -> bool {
+    !token.is_empty() && token.len() <= 10 && token.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// 构造会话初始化命令：建立工作目录、askpass 脚本，并输出环境快照（D4）。
 ///
 /// `enable_sudo` 为 `false` 时（`deny` 模式）不创建 askpass——
 /// sudo 因拿不到密码而失败，这正是"禁止注入"的天然实现（fail-closed）。
+///
+/// 注意：**索要用的 FIFO 不在这里创建**，由 askpass 在 sudo 执行时按 PID
+/// 自行创建与删除（B2）。setup 阶段的删除动作全部限定 `-type f`，
+/// 绝不触碰任何会话正在使用的 FIFO。
 ///
 /// **路径必须用双引号包裹**：脚本里的 `$HOME` 需要由 shell 展开。
 /// 若用单引号（`'$HOME/...'`），shell 不做展开，会创建名为 `$HOME`
@@ -187,8 +237,6 @@ pub fn sudo_fifo_name(nonce: &str) -> String {
 /// （此为端到端测试实测发现的缺陷）。
 pub fn session_setup_script(nonce: &str, enable_sudo: bool) -> String {
     let dir = format!("$HOME/{REMOTE_DIR}");
-    // FIFO 按会话唯一命名，避免与其他会话互相踩踏（见 [`sudo_fifo_name`]）。
-    let fifo = format!("{dir}/{}", sudo_fifo_name(nonce));
     let askpass = remote_askpass_path(nonce);
 
     let sudo_part = if enable_sudo {
@@ -196,22 +244,26 @@ pub fn session_setup_script(nonce: &str, enable_sudo: bool) -> String {
             r#"
 # sudo askpass 与 FIFO（Q33）：密码经 FIFO 在内存中传递，不落盘。
 #
-# 注意执行顺序：**先清理历史遗留、再创建本会话的 FIFO**。
+# 注意执行顺序：**先清理历史遗留，再写入本会话的 askpass**。
 # 曾经在此处先 mkfifo、后执行 `rm -f "$dir"/{prefix}.*`，结果把刚创建的
 # FIFO 一并删除，使后续 `cat > fifo` 退化为"创建普通文件并写入"，
-# sudo 密码以明文落盘（该缺陷已由回归测试 askpass_fifo_survives_setup 覆盖）。
+# sudo 密码以明文落盘（该缺陷已由回归测试覆盖）。
 # 这里只清理**普通文件**（-type f），既清掉上述缺陷的残留，又绝不触碰
-# 任何会话正在使用的 FIFO 节点。
+# 任何会话正在使用的 FIFO 节点（FIFO 是 -type p）。
+#
+# 本会话的 FIFO **不再在 setup 阶段创建**：每次索要的 FIFO 由 askpass
+# 自己在 sudo 执行时按 PID 创建、读走应答后立即删除（B2）。
+# 因此这里没有 mkfifo，也就不会再发生"自己删掉自己的 FIFO"。
+#
+# askpass 脚本按会话唯一命名（askpass.<nonce>）。会话异常退出时
+# session_cleanup_script 来不及执行，若不在此处回收，远端会永久累积
+# 一批含各会话 nonce 的可执行脚本（同机用户可枚举）。
+find "{dir}" -maxdepth 1 -type f -name '{askpass_prefix}.*' -delete 2>/dev/null || true
 find "{dir}" -maxdepth 1 -type f -name '{prefix}.*' -delete 2>/dev/null || true
-rm -f "{fifo}"
-if ! mkfifo "{fifo}" 2>/dev/null; then
-  printf 'MFPERCH_SETUP_ERROR=fifo\n' >&2
-fi
-chmod 600 "{fifo}" 2>/dev/null || true
 "#,
             dir = dir,
             prefix = SUDO_FIFO_NAME,
-            fifo = fifo,
+            askpass_prefix = ASKPASS_NAME,
         )
     } else {
         // deny 模式：不设置 askpass，sudo 将因无密码而失败。
@@ -219,7 +271,7 @@ chmod 600 "{fifo}" 2>/dev/null || true
     };
 
     let askpass_write = if enable_sudo {
-        let script = askpass_script(nonce, &fifo);
+        let script = askpass_script(nonce);
         // 用带引号的 heredoc 写入 askpass 脚本：内容不做任何展开，
         // 因此脚本里可以安全地保留 $HOME（由 askpass 自己在运行时展开）。
         // 写入后立即收紧权限；**不要**在此处做通配删除（见上）。
@@ -246,18 +298,25 @@ printf 'MFPERCH_BASH=%s\n' "$BASH_VERSION" >&2
     )
 }
 
-/// 构造会话清理命令：删除本会话的 FIFO 与 askpass 脚本（含权限收紧）。
+/// 构造会话清理命令：删除本会话的 askpass 脚本与索要 FIFO。
 ///
 /// 会话结束时调用（归档 / 删除 / 断开），避免在远端留下残留节点。
-/// 只删除**本会话 nonce** 对应的文件，不影响其它并发会话。
+/// 只影响**本会话 nonce** 对应的节点，不触碰其它并发会话。
+///
+/// FIFO 按 PID 命名（B2），无法逐个枚举，因此按本会话 nonce 前缀清扫。
+/// 这里不存在 §7.4 那类"误删**别的**会话正在使用的节点"的风险：
+/// 前缀已把范围限定在本会话，而本会话此刻正在关闭。
 pub fn session_cleanup_script(nonce: &str) -> String {
     let dir = format!("$HOME/{REMOTE_DIR}");
+    let askpass = format!("{ASKPASS_NAME}.{nonce}");
     format!(
-        r#"rm -f "{dir}/{fifo}" "{dir}/{askpass}" 2>/dev/null || true
+        r#"rm -f "{dir}/{askpass}" 2>/dev/null || true
+find "{dir}" -maxdepth 1 -type p -name '{prefix}.{nonce}.*' -delete 2>/dev/null || true
 "#,
         dir = dir,
-        fifo = sudo_fifo_name(nonce),
-        askpass = format!("{ASKPASS_NAME}.{nonce}"),
+        askpass = askpass,
+        prefix = SUDO_FIFO_NAME,
+        nonce = nonce,
     )
 }
 
@@ -297,10 +356,19 @@ pub fn parse_line(line: &str, nonce: &str) -> Option<SessionEvent> {
         return Some(SessionEvent::Ready);
     }
 
-    // sudo 请求标记（来自 askpass 的 stderr）。
+    // sudo 请求标记（来自 askpass 的 stderr）：
+    // `__MF_SUDO_REQUEST__<nonce>__<token>__`（token = 远端 askpass 的 PID）。
     let sudo_req = format!("{SUDO_REQUEST_PREFIX}{nonce}__");
-    if trimmed == sudo_req {
-        return Some(SessionEvent::SudoRequest);
+    if let Some(rest) = trimmed.strip_prefix(&sudo_req) {
+        let token = rest.trim_end_matches('_');
+        // 令牌会被拼进应用下发的命令，必须严格校验（见 is_valid_sudo_token）。
+        if is_valid_sudo_token(token) {
+            return Some(SessionEvent::SudoRequest {
+                token: token.to_string(),
+            });
+        }
+        // 令牌非法或缺失：不可信，**不产生索要**，落到下面按普通输出处理，
+        // 让人在审计里能看到这行可疑文本。
     }
 
     // 结束标记：__MF_PERCH_END__<nonce>__<command_id>__<rc>__
@@ -407,8 +475,61 @@ mod tests {
     #[test]
     fn parse_sudo_request_marker() {
         let nonce = "abc123";
+        let line = format!("{SUDO_REQUEST_PREFIX}{nonce}__4242__");
+        assert_eq!(
+            parse_line(&line, nonce),
+            Some(SessionEvent::SudoRequest {
+                token: "4242".into()
+            })
+        );
+    }
+
+    #[test]
+    fn sudo_marker_without_token_is_not_accepted() {
+        // B2 之前的标记格式（无令牌）不再成立：没有令牌就无法定位应答 FIFO，
+        // 必须当作普通输出丢弃，而不是产生一次无法应答的索要。
+        let nonce = "abc123";
         let line = format!("{SUDO_REQUEST_PREFIX}{nonce}__");
-        assert_eq!(parse_line(&line, nonce), Some(SessionEvent::SudoRequest));
+        assert_eq!(
+            parse_line(&line, nonce),
+            Some(SessionEvent::OutputLine(line.clone())),
+            "缺令牌的索要标记不得被接受"
+        );
+    }
+
+    #[test]
+    fn sudo_marker_with_non_numeric_token_is_rejected() {
+        // 令牌会被拼进应用下发的命令（FIFO 路径），必须严格限制为数字。
+        // 被 Agent 伪造的标记若能把 `;`、`$()` 带进来就是命令注入（V2 延伸）。
+        let nonce = "abc123";
+        for bad in [
+            "1;rm -rf ~",
+            "$(id)",
+            "1 2",
+            "1/../2",
+            "abc",
+            "",
+            "12345678901", // 超过 10 位
+        ] {
+            let line = format!("{SUDO_REQUEST_PREFIX}{nonce}__{bad}__");
+            assert_eq!(
+                parse_line(&line, nonce),
+                Some(SessionEvent::OutputLine(line.clone())),
+                "非法令牌必须被拒绝：{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sudo_token_validation_rules() {
+        assert!(is_valid_sudo_token("1"));
+        assert!(is_valid_sudo_token("4242"));
+        assert!(is_valid_sudo_token("1234567890"));
+        assert!(!is_valid_sudo_token(""));
+        assert!(!is_valid_sudo_token("12345678901"));
+        assert!(!is_valid_sudo_token("12a"));
+        assert!(!is_valid_sudo_token("-1"));
+        assert!(!is_valid_sudo_token("1;2"));
     }
 
     #[test]
@@ -571,13 +692,21 @@ mod tests {
     #[test]
     fn askpass_script_writes_marker_to_stderr() {
         // 实测发现的缺陷修正：标记必须走 stderr，否则 sudo 会把标记当密码。
-        let script = askpass_script("nonce1", "/home/u/.mf-perch/sudopw.fifo.nonce1");
+        let script = askpass_script("nonce1");
         assert!(
             script.contains(">&2"),
             "请求标记必须写 stderr，否则 sudo 会把标记当密码"
         );
         assert!(script.contains(SUDO_REQUEST_PREFIX));
-        assert!(script.contains("/home/u/.mf-perch/sudopw.fifo.nonce1"));
+        assert!(
+            script.contains(&format!("{SUDO_FIFO_NAME}.nonce1.$$")),
+            "FIFO 路径应含会话 nonce 与本次索要 PID：{script}"
+        );
+        // 令牌（PID）必须随标记回传，应用才能定位应答 FIFO。
+        assert!(
+            script.contains("'$$'") || script.contains("\"$$\""),
+            "标记必须携带令牌：{script}"
+        );
         // 密码走 stdout。
         assert!(script.contains("printf '%s\\n' \"$mfperch_pw\""));
     }
@@ -586,7 +715,7 @@ mod tests {
     fn askpass_opens_fifo_readwrite_before_marking() {
         // 关键防死锁设计：先以 O_RDWR 打开 FIFO（永不阻塞），再打印标记。
         // 这样应用侧 `cat > fifo` 一定能找到读者，不会永久阻塞把队列拖死。
-        let script = askpass_script("n1", "/tmp/f");
+        let script = askpass_script("n1");
         let open_pos = script.find("exec 3<>").expect("应以 O_RDWR 打开 FIFO");
         let marker_pos = script.find(SUDO_REQUEST_PREFIX).expect("应打印标记");
         assert!(
@@ -595,29 +724,72 @@ mod tests {
         );
         // 密码从已打开的 fd 读取，而不是再次打开路径。
         assert!(
-            script.contains("read -r mfperch_pw <&3"),
-            "应从已打开的 fd 3 读取：{script}"
+            script.contains("read -r -t 120 mfperch_pw <&3"),
+            "应从已打开的 fd 3 读取，并带兜底超时：{script}"
         );
     }
 
     #[test]
-    fn sudo_fifo_name_is_session_unique() {
-        // 固定名称会让后续会话替换同名 FIFO 的 inode，
-        // 使已在阻塞的读写方落到不同 inode 上各自挂起。
-        let a = sudo_fifo_name("nonce_a");
-        let b = sudo_fifo_name("nonce_b");
-        assert_ne!(a, b, "不同会话的 FIFO 名必须不同");
-        assert!(a.starts_with(SUDO_FIFO_NAME));
-        assert!(a.contains("nonce_a"));
+    fn askpass_creates_and_removes_its_own_fifo() {
+        // B2 核心：每次索要一条独立 FIFO，由 askpass 自己创建、用后即删。
+        let script = askpass_script("n1");
+        let mkfifo_pos = script.find("mkfifo").expect("askpass 应自行创建 FIFO");
+        let open_pos = script.find("exec 3<>").expect("应以 O_RDWR 打开");
+        let marker_pos = script.find(SUDO_REQUEST_PREFIX).expect("应打印标记");
+        assert!(
+            mkfifo_pos < open_pos && open_pos < marker_pos,
+            "顺序必须是 mkfifo → 打开 → 打印标记：\n{script}"
+        );
+        // 用后即删：不留残留节点。
+        let read_pos = script.find("read -r -t 120").expect("应读取密码");
+        let rm_after_read = script[read_pos..]
+            .find("rm -f \"$mfperch_fifo\"")
+            .is_some();
+        assert!(rm_after_read, "读走应答后必须删除自己的 FIFO：\n{script}");
     }
 
     #[test]
-    fn session_setup_creates_fifo_only_when_sudo_enabled() {
+    fn askpass_uses_bash_for_read_timeout() {
+        // 兜底超时依赖 `read -t`，而 Debian/Ubuntu 的 /bin/sh（dash）不支持，
+        // 会直接报错使 sudo 永远失败。因此 shebang 必须是 bash。
+        let script = askpass_script("n1");
+        assert!(
+            script.starts_with("#!/bin/bash"),
+            "askpass 必须用 bash 解释（read -t）：{script}"
+        );
+    }
+
+    #[test]
+    fn sudo_fifo_name_is_session_and_request_unique() {
+        // 会话维度：固定名称会让后续会话替换同名 FIFO 的 inode，
+        // 使已在阻塞的读写方落到不同 inode 上各自挂起。
+        let a = sudo_fifo_name("nonce_a", "111");
+        let b = sudo_fifo_name("nonce_b", "111");
+        assert_ne!(a, b, "不同会话的 FIFO 名必须不同");
+        assert!(a.starts_with(SUDO_FIFO_NAME));
+        assert!(a.contains("nonce_a"));
+
+        // 索要维度（B2）：同一会话内两次索要必须落在不同 FIFO 上，
+        // 否则应答会被"任意一个"读者取走，导致密码/拒绝错配。
+        let c = sudo_fifo_name("nonce_a", "222");
+        assert_ne!(a, c, "同一会话内不同索要的 FIFO 名必须不同");
+        assert!(a.ends_with(".111"));
+        assert!(c.ends_with(".222"));
+    }
+
+    #[test]
+    fn session_setup_writes_askpass_only_when_sudo_enabled() {
         let enabled = session_setup_script("n", true);
-        assert!(enabled.contains("mkfifo"));
-        assert!(enabled.contains(SUDO_FIFO_NAME));
         assert!(enabled.contains("chmod 700"));
         assert!(enabled.contains(ASKPASS_NAME), "应写入 askpass 脚本");
+        // FIFO 改为运行时由 askpass 创建，setup 自身不再建 FIFO：
+        // 这样也就不存在"setup 删掉自己刚建的 FIFO"的形态。
+        // 注意：askpass 脚本体（heredoc 内容）里当然有 mkfifo，
+        // 这里只看 heredoc 之前的 setup 正文。
+        assert!(
+            !setup_preamble(&enabled).contains("mkfifo"),
+            "setup 正文不应创建 FIFO（改由 askpass 按需创建）：\n{enabled}"
+        );
 
         let disabled = session_setup_script("n", false);
         assert!(
@@ -630,34 +802,95 @@ mod tests {
         );
     }
 
-    #[test]
-    fn askpass_fifo_is_created_after_the_last_removal() {
-        // 严重缺陷回归（V1）：曾经 askpass 写入串末尾带 `rm -f "$dir"/sudopw.fifo.*`，
-        // 而 mkfifo 在其之前执行，于是刚创建的本会话 FIFO 被自己删掉。
-        // 之后 `cat > fifo` 退化为"创建普通文件并写入"，sudo 密码以明文落盘。
-        //
-        // 断言顺序不变式：任何删除操作都必须排在 mkfifo 之前，
-        // 使得 setup 结束时 FIFO 必然存在。
-        let s = session_setup_script("deadbeef", true);
-        // 注释里也会出现 "mkfifo" 等词，比较顺序前先剔除注释行。
-        let code = code_lines(&s);
+    /// setup 脚本中 askpass 写入（heredoc）之前的**执行语句**正文。
+    ///
+    /// 注释里也会出现 `mkfifo`、`cat > fifo` 等字样（V1 的说明），
+    /// 因此这里既按 heredoc 起点截断，也剔除注释行。
+    fn setup_preamble(script: &str) -> String {
+        let end = script
+            .find("<<'MFPERCH_ASKPASS'")
+            .unwrap_or(script.len());
+        code_lines(&script[..end])
+    }
 
-        let mkfifo_pos = code.find("mkfifo").expect("应创建 FIFO");
-        let last_delete = code
-            .rfind("-delete")
-            .expect("应有遗留清理动作（-type f -delete）");
+    #[test]
+    fn session_setup_deletes_leave_no_window_for_plaintext() {
+        // 严重缺陷回归（V1）：曾经 askpass 写入串末尾带通配删除，
+        // 把刚创建的 FIFO 删掉，随后 `cat > fifo` 退化为"创建普通文件并写入"，
+        // sudo 密码以明文落盘。
+        //
+        // 现设计下 setup 完全不创建 FIFO（由 askpass 运行时创建），
+        // 因此该形态在结构上不可能出现。需要守住两条不变式：
+        // ① 所有删除都限定普通文件，绝不触碰 FIFO（-type f）；
+        // ② 删除动作全部排在本会话 askpass 写入之前，不会自删。
+        let s = session_setup_script("deadbeef", true);
+        let preamble = setup_preamble(&s);
 
         assert!(
-            last_delete < mkfifo_pos,
-            "遗留清理必须早于 mkfifo，否则会删掉刚创建的 FIFO（明文落盘缺陷回归）：\n{s}"
+            !preamble.contains("mkfifo"),
+            "setup 正文不应创建 FIFO：\n{s}"
         );
 
-        // 覆盖原始缺陷的具体形态：不得出现"删除所有 fifo.* 文件"的通配 rm。
-        // 允许 `find ... -name 'sudopw.fifo.*' -type f -delete`（已限定普通文件）。
+        // 顺序断言针对完整脚本（含 heredoc，其结束标记在断言里用作定位点）。
+        let full = code_lines(&s);
+        let write_pos = full
+            .find("<<'MFPERCH_ASKPASS'")
+            .expect("应写入本会话 askpass");
+        let mut search_from = 0;
+        let mut deletes = 0;
+        while let Some(rel) = full[search_from..].find("-delete") {
+            let pos = search_from + rel;
+            let before = &full[..pos];
+            let stmt_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let stmt = &full[stmt_start..pos];
+            assert!(
+                stmt.contains("-type f"),
+                "删除必须限定 -type f，避免误删 FIFO：{stmt}"
+            );
+            assert!(pos < write_pos, "删除必须早于本会话 askpass 写入：\n{s}");
+            deletes += 1;
+            search_from = pos + 1;
+        }
+        assert!(deletes >= 2, "应有 askpass 与 FIFO 残留两类回收：\n{s}");
+
+        // 不得出现"删除所有 fifo.* 文件"的通配 rm（明文落盘缺陷的成因）。
         let bad_glob = format!("rm -f \"$HOME/{REMOTE_DIR}\"/{SUDO_FIFO_NAME}.*");
         assert!(
             !s.contains(&bad_glob),
-            "不得用通配 rm 删除会话 FIFO（这正是明文落盘缺陷的成因）：\n{s}"
+            "不得用通配 rm 删除会话 FIFO：\n{s}"
+        );
+    }
+
+    #[test]
+    fn session_setup_reclaims_stale_askpass_scripts() {
+        // 缺陷回归（B1）：askpass 脚本按会话唯一命名（askpass.<nonce>），
+        // 但遗留清理原先只回收 sudopw.fifo.*。会话异常退出时
+        // session_cleanup_script 不执行，于是远端永久累积一批含各会话
+        // nonce 与 FIFO 路径的可执行脚本，同机用户可枚举。
+        let s = session_setup_script("deadbeef", true);
+        let code = code_lines(&s);
+
+        assert!(
+            code.contains(&format!("-name '{ASKPASS_NAME}.*' -delete")),
+            "setup 必须回收历史遗留的 askpass 脚本：\n{s}"
+        );
+        // 与 FIFO 清理同样受 -type f 保护：不得删到任何会话正在使用的节点。
+        let ix = code
+            .find(&format!("-name '{ASKPASS_NAME}.*' -delete"))
+            .expect("应有 askpass 遗留清理");
+        let prefix = &code[..ix];
+        assert!(
+            prefix.contains("-type f"),
+            "askpass 清理必须限定普通文件（-type f）：\n{prefix}"
+        );
+        // 顺序不变式：askpass 遗留清理排在本会话 askpass 写入之前，
+        // 因此不会自删（setup 已不再创建 FIFO，故无需与 mkfifo 比时序）。
+        let write_pos = code
+            .find("MFPERCH_ASKPASS")
+            .expect("应写入本会话 askpass");
+        assert!(
+            ix < write_pos,
+            "askpass 遗留清理必须在写入本会话脚本之前，否则会删掉自己：\n{s}"
         );
     }
 
@@ -686,10 +919,21 @@ mod tests {
     #[test]
     fn cleanup_script_removes_only_this_session_files() {
         let s = session_cleanup_script("nonce_x");
-        assert!(s.contains(&format!("{SUDO_FIFO_NAME}.nonce_x")), "{s}");
         assert!(s.contains(&format!("{ASKPASS_NAME}.nonce_x")), "{s}");
-        // 不得误伤其它会话。
-        assert!(!s.contains('*'), "清理脚本不应使用通配符：{s}");
+        // FIFO 按 PID 命名，只能按"本会话 nonce"前缀清扫。
+        assert!(
+            s.contains(&format!("-name '{SUDO_FIFO_NAME}.nonce_x.*'")),
+            "FIFO 清扫必须限定在本会话 nonce 前缀内：{s}"
+        );
+        // 关键：不得用**不含 nonce 的通配**去删 FIFO。
+        // 那是 §7.4 的教训——会删掉别的会话正在使用的节点，使其永久挂起。
+        assert!(
+            !s.contains(&format!("\"{SUDO_FIFO_NAME}.*\"")),
+            "不得用不带 nonce 的通配删除 FIFO：{s}"
+        );
+        // FIFO 是管道，清扫必须限定 -type p，避免误删同名普通文件。
+        let ix = s.find("-delete").expect("应有 FIFO 清扫");
+        assert!(s[..ix].contains("-type p"), "FIFO 清扫应限定 -type p：{s}");
     }
 
     #[test]

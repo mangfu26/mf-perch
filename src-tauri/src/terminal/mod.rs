@@ -719,13 +719,16 @@ fn spawn_output_pump(entry: Arc<TerminalEntry>, mut rx: tokio::sync::mpsc::Recei
                     // 避免因标记错位而永久阻塞。
                     entry.finished.mark_finished();
                 }
-                SessionOutput::SudoRequest => {
+                SessionOutput::SudoRequest { token } => {
                     // Q33：按该主机的策略决定是否注入密码。
                     // 关键词：ask 模式会等待用户确认，因此这里必须
                     // **脱离输出泵的读取循环**去处理，否则会阻塞后续输出。
+                    //
+                    // 并发索要是安全的：每次索要各有自己的 FIFO（B2），
+                    // 应答按 (nonce, token) 精确投递，不会互相抢走。
                     let entry = entry.clone();
                     tokio::spawn(async move {
-                        handle_sudo_request(&entry).await;
+                        handle_sudo_request(&entry, &token).await;
                     });
                 }
                 SessionOutput::Disconnected { reason } => {
@@ -828,7 +831,11 @@ fn build_sudo_context(
 const SUDO_ASK_TIMEOUT: Duration = Duration::from_secs(crate::domain::SUDO_ASK_TIMEOUT_SECS);
 
 /// 处理一次 sudo 请求：按策略决定注入还是拒绝（Q33）。
-async fn handle_sudo_request(entry: &TerminalEntry) {
+/// 处理一次 sudo 请求：按策略决定注入还是拒绝（Q33）。
+///
+/// `token` 标识本次索要（远端 askpass PID），应答据此精确定向到该次索要的
+/// FIFO——这是并发索要不会互相错配的前提（B2）。
+async fn handle_sudo_request(entry: &TerminalEntry, token: &str) {
     let sudo = entry.sudo.clone();
     let has_password = sudo.password.is_some();
 
@@ -862,7 +869,7 @@ async fn handle_sudo_request(entry: &TerminalEntry) {
                 .map(|s| s.as_str())
                 .unwrap_or_default();
 
-            match entry.session.send_sudo_password(password).await {
+            match entry.session.send_sudo_password(token, password).await {
                 Ok(()) => tracing::info!(
                     host = %entry.host_label,
                     "已按策略注入 sudo 密码"
@@ -870,15 +877,17 @@ async fn handle_sudo_request(entry: &TerminalEntry) {
                 Err(e) => {
                     // 注入失败仍必须让 sudo 结束，否则命令会一直挂着。
                     tracing::error!("注入 sudo 密码失败：{e}");
-                    let _ = entry.session.deny_sudo().await;
+                    let _ = entry.session.deny_sudo(token).await;
                 }
             }
         }
         SudoAction::Deny => {
-            // 关键：必须主动关闭 FIFO 让 askpass 的 read 返回 EOF。
-            // 否则 askpass 永久阻塞，命令串行执行，整条队列都会被拖死。
-            if let Err(e) = entry.session.deny_sudo().await {
-                tracing::error!("关闭 sudo FIFO 失败：{e}");
+            // 关键：必须**回应**这次索要——向该次索要的 FIFO 写入空行，让 askpass
+            // 以空密码应答、sudo 随即认证失败。若什么都不做，askpass 会一直阻塞在
+            // read 上（直到 120 秒兜底超时），而命令串行执行，队列会被拖住
+            // （见 docs/design/sudo.md §7.3）。
+            if let Err(e) = entry.session.deny_sudo(token).await {
+                tracing::error!("回应 sudo 拒绝（写入空密码）失败：{e}");
             }
             tracing::info!(
                 host = %entry.host_label,
