@@ -295,9 +295,9 @@ async fn ask_mode_with_deny_fails_and_keeps_queue_alive() {
         "拒绝后不得提权。输出：{output}"
     );
 
-    // **关键回归**：拒绝必须让 askpass 的 read 得到 EOF 而结束。
-    // 若不主动关闭 FIFO，askpass 会永久阻塞，而命令串行执行，
-    // 后续命令会全部卡死——这里验证队列仍可用。
+    // **关键回归**：拒绝必须让 askpass 的 read 得到**应答**而结束。
+    // 若对该次索要不作任何回应，askpass 会一直阻塞在 read 上（直到 120 秒兜底
+    // 超时），而命令串行执行，后续命令会被长时间拖住——这里验证队列仍可用。
     let follow_up = state
         .terminals
         .run_command(
@@ -468,4 +468,116 @@ async fn sudo_password_never_lands_in_a_regular_file() {
     );
 
     state.terminals.delete_terminal(&state.db, &t2.id).await.ok();
+}
+
+/// **B2 回归（错配）**：并发的 sudo 索要必须各自收到自己的应答。
+///
+/// 背景：曾用**一条会话级 FIFO** 承载所有索要。FIFO 上一次写入只会被
+/// **其中任意一个**正在阻塞的读者取走，因此当两次索要同时在等，
+/// 应答就可能错配——表现是"用户点了允许的那次失败、点了拒绝的那次反而提权"。
+///
+/// 编排要点（都是为了让"旧实现必然错、新实现必然对"，而不是碰运气）：
+///
+/// 1. 第 1 条 sudo 先起，1.5 秒后再起第 2 条 —— 保证索要顺序确定：
+///    请求 #1 = 进程 A，请求 #2 = 进程 B；
+/// 2. 先批准 **#2**（后弹出的对话框），隔 300ms 再拒绝 **#1** ——
+///    于是"密码写入"发生在"空密码写入"之前。旧实现下密码会被
+///    **最先阻塞**的读者（A，已拒绝）取走 → A 越权成为 root、B 反而失败；
+/// 3. 之后到达的索要一律拒绝 —— sudo 在密码错误时可能重试 askpass，
+///    重试会产生新的令牌与新索要，必须同样应答，否则该次 sudo 会挂住。
+#[tokio::test]
+#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
+async fn concurrent_sudo_requests_do_not_cross_route() {
+    let Some(t) = target() else {
+        return;
+    };
+
+    let (state, key) = test_state();
+    let host_id = seed_host(&state, &key, &t, SudoPolicy::Ask).await;
+
+    // asker → 协调器：按**到达顺序**把应答通道交给协调器。
+    let (tx_req, mut rx_req) = tokio::sync::mpsc::unbounded_channel::<
+        tokio::sync::oneshot::Sender<SudoDecision>,
+    >();
+    let asker: mf_perch_lib::terminal::SudoAsker = Arc::new(move |_req: SudoRequest| {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = tx_req.send(tx);
+        rx
+    });
+    state.terminals.set_sudo_asker(asker).await;
+
+    // 协调器：收集请求并观察"总共有几次索要"（诊断重试行为）。
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen_for_task = seen.clone();
+    let coordinator = tokio::spawn(async move {
+        // #1 = 进程 A（先启动）。
+        let first = rx_req.recv().await.expect("应有第 1 次索要");
+        seen_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // #2 = 进程 B。
+        let second = rx_req.recv().await.expect("应有第 2 次索要");
+        seen_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        // 先批准 B（写入密码），让"密码写入"早于"空密码写入"。
+        let _ = second.send(SudoDecision::Allow);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // 再拒绝 A。
+        let _ = first.send(SudoDecision::Deny);
+
+        // 其余（sudo 重试产生的新索要）一律拒绝，避免有索要得不到应答而挂住。
+        while let Some(tx) = rx_req.recv().await {
+            seen_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = tx.send(SudoDecision::Deny);
+        }
+    });
+
+    let terminal = state
+        .terminals
+        .open_terminal(&state.db, &key, &host_id, None)
+        .await
+        .expect("终端应能建立");
+
+    // 注意：只重定向 stdout。askpass 的**协议标记走 stderr**，
+    // 若把子 shell 的 stderr 也重定向进文件，标记就到不了应用，索要不会被创建。
+    let cmd = r#"rm -f /tmp/mfperch-b2-a.out /tmp/mfperch-b2-b.out
+( sudo id -un > /tmp/mfperch-b2-a.out ) &
+sleep 1.5
+( sudo id -un > /tmp/mfperch-b2-b.out ) &
+wait
+printf 'A=%s\n' "$(cat /tmp/mfperch-b2-a.out)"
+printf 'B=%s\n' "$(cat /tmp/mfperch-b2-b.out)"
+"#;
+
+    // 异步模式下发：命令会一直挂着等我们应答，因此**不能**用同步等待
+    // （同步会阻塞到命令结束，而命令结束又依赖我们应答 → 自我死锁）。
+    let outcome = state
+        .terminals
+        .run_command(&state.db, &terminal.id, cmd, None)
+        .await
+        .expect("命令应能下发");
+
+    let (out, code) = collect(&state.terminals, &state.db, &outcome.command_id).await;
+    coordinator.abort();
+
+    eprintln!(
+        "[B2 诊断] 本次共产生 {} 次索要；命令输出：{out}",
+        seen.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    assert_eq!(code, Some(0), "命令本身应正常结束：{out}");
+
+    // 被拒绝的第 1 次索要：不得提权。旧实现下它会拿到本属于 B 的密码。
+    assert!(
+        !out.contains("A=root"),
+        "被拒绝的索要不得提权（应答错配会让它拿到别人的密码）：{out}"
+    );
+    // 被允许的第 2 次索要：必须提权成功。旧实现下它会拿到空密码而失败。
+    assert!(
+        out.contains("B=root"),
+        "被允许的索要必须提权成功（应答错配会让它拿到空密码）：{out}"
+    );
+
+    state
+        .terminals
+        .delete_terminal(&state.db, &terminal.id)
+        .await
+        .ok();
 }

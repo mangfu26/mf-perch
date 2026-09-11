@@ -19,9 +19,15 @@
 //!
 //! ## ask 模式的"拒绝"如何生效
 //!
-//! askpass 阻塞在 `read < fifo` 上。要让 sudo 失败，必须**让 read 返回 EOF**：
-//! 打开 FIFO 写入端后不写任何数据即关闭（`deny` 分支），read 随即得到 EOF。
-//! 若什么都不做，askpass 会永久阻塞，进而把整条串行命令队列拖死。
+//! askpass 阻塞在 `read <&3` 上等待密码。**必须给它一个回应**，否则它会永久
+//! 阻塞，而命令串行执行，整条队列都会被拖死。
+//!
+//! 做法是向 FIFO **写入一个空行**：askpass 读到空密码交给 sudo，认证随即失败，
+//! 命令正常结束并返回非零退出码。
+//!
+//! 为什么不用"关闭 FIFO 让 read 得到 EOF"（初版设计）：askpass 已用
+//! `exec 3<>fifo` 以 O_RDWR 同时持有读写端，EOF 不会因外部关闭写端而出现。
+//! 该结论由 WSL 端到端实测得出，详见 `docs/design/sudo.md` §7.3。
 
 use zeroize::Zeroizing;
 
@@ -113,7 +119,7 @@ pub struct SudoRequest {
 pub enum SudoAction {
     /// 向 FIFO 写入密码。
     Inject,
-    /// 关闭 FIFO 使 read 返回 EOF，让 sudo 失败。
+    /// 向 FIFO 写入空行，让 askpass 以空密码应答，从而使 sudo 认证失败。
     Deny,
 }
 

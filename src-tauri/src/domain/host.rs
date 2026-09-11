@@ -171,6 +171,18 @@ pub struct HostSummary {
     pub sudo_policy: SudoPolicy,
     pub active_terminals: u32,
     pub archived_terminals: u32,
+    // ── 以下字段供人类侧「编辑主机」表单**原样回填**（B5）──
+    //
+    // 表单提交时整体覆盖主机配置，因此摘要里必须带上这些可编辑字段；
+    // 否则用户"只改个名字"就会把它们静默清空（凭据绑定、跳板机、
+    // 环境加载方式、初始化脚本、sudo 密码来源）。
+    // 注意：它们只出现在**人类侧 IPC**，不进入 [`HostPublicInfo`]（Agent 可见），
+    // 权限边界（AGENTS.md 0.1）不受影响。
+    pub credential_id: Option<String>,
+    pub proxy_jump_host_id: Option<String>,
+    pub sudo_password_source: SudoPasswordSource,
+    pub shell_env_mode: ShellEnvMode,
+    pub init_script: Option<String>,
 }
 
 /// 供 AI Agent 列出主机时使用的最小信息集。

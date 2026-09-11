@@ -32,7 +32,9 @@ pub enum SessionOutput {
     /// 某条命令执行结束；按 `command_id` 精确归属（V5）。
     Finished { command_id: String, exit_code: i32 },
     /// sudo 正在索要密码（Q33）。
-    SudoRequest,
+    ///
+    /// `token` 为该次索要的远端 askpass PID，用于定位唯一的应答 FIFO（B2）。
+    SudoRequest { token: String },
     /// 连接已断开。
     Disconnected { reason: String },
 }
@@ -329,6 +331,9 @@ impl Session {
 
     /// 向 sudo FIFO 写入密码（Q33 模式二/三的"允许注入"）。
     ///
+    /// `token` 来自本次索要的协议标记（远端 askpass 的 PID），
+    /// 与会话 nonce 一起唯一定位该次索要的 FIFO（B2）。
+    ///
     /// 走**独立的 SSH channel**，避免污染命令帧协议与输出解析；
     /// 密码经内存传递，不落盘、不进环境变量。
     ///
@@ -340,9 +345,12 @@ impl Session {
     ///
     /// 写端不会阻塞：askpass 已用 `exec 3<>fifo`（O_RDWR）打开 FIFO，
     /// 因此这里的 `cat > fifo`（O_WRONLY）一定能立刻找到读者。
-    pub async fn send_sudo_password(&self, password: &str) -> Result<()> {
-        let fifo = self.fifo_path();
-        let cmd = format!("cat > \"{fifo}\"");
+    pub async fn send_sudo_password(&self, token: &str, password: &str) -> Result<()> {
+        let fifo = self.fifo_path(token)?;
+        // `test -p` 守卫（V1 回归防线）：目标必须是 FIFO。
+        // 若 FIFO 因任何原因不存在，`cat > path` 会**创建普通文件**并把密码
+        // 明文写入磁盘——这正是 V1。宁可直接失败（fail-closed）。
+        let cmd = format!("test -p \"{fifo}\" || exit 1; cat > \"{fifo}\"");
 
         // askpass 按行读取（read 遇换行返回），故必须补一个换行终止。
         let mut payload = zeroize::Zeroizing::new(Vec::with_capacity(password.len() + 1));
@@ -354,31 +362,37 @@ impl Session {
         result
     }
 
-    /// 让 sudo 认证失败（Q33 "拒绝"）。
+    /// 让本次 sudo 索要认证失败（Q33 "拒绝"）。
     ///
-    /// 写入一个**空行**：askpass 读到空密码交给 sudo，认证随即失败，
-    /// 命令正常结束并返回非零退出码。
+    /// 向该次索要专属的 FIFO 写入一个**空行**：askpass 读到空密码交给 sudo，
+    /// 认证随即失败，命令正常结束并返回非零退出码。
     ///
     /// 为什么不用"关闭 FIFO 让 read 得到 EOF"：askpass 以 O_RDWR 持有该
     /// FIFO，EOF 不会因外部关闭写端而出现。写入空值是更直接、更可靠的做法。
     ///
-    /// 这一步**必不可少**：若不响应，askpass 会一直阻塞在 `read` 上，
-    /// 而命令串行执行，后续排队命令会全部卡死。
-    pub async fn deny_sudo(&self) -> Result<()> {
-        let fifo = self.fifo_path();
-        let script = format!("printf '\\n' > \"{fifo}\"\n");
+    /// 这一步**必不可少**：收到索要却不回应，askpass 会一直阻塞在 read 上，
+    /// 而命令串行执行，后续排队命令会全部卡死（askpass 侧另有 120 秒兜底超时）。
+    pub async fn deny_sudo(&self, token: &str) -> Result<()> {
+        let fifo = self.fifo_path(token)?;
+        let script = format!("test -p \"{fifo}\" || exit 1; printf '\\n' > \"{fifo}\"\n");
         self.exec_sudo_helper(&script, "拒绝 sudo 注入").await
     }
 
-    /// 本会话专属的 sudo FIFO 路径。
+    /// 本会话中某次索要专属的 sudo FIFO 路径。
     ///
-    /// 按会话唯一（含 nonce），避免多个会话的 FIFO 互相替换文件节点。
-    fn fifo_path(&self) -> String {
-        format!(
+    /// 由会话 nonce + 索要 token 共同定位，一条 FIFO 上永远只有一个读者（B2）。
+    /// token 先经严格校验：它来自远端输出且会被拼进命令。
+    fn fifo_path(&self, token: &str) -> Result<String> {
+        if !protocol::is_valid_sudo_token(token) {
+            return Err(AppError::InvalidArgument(format!(
+                "sudo 索要令牌非法：{token:?}"
+            )));
+        }
+        Ok(format!(
             "$HOME/{}/{}",
             protocol::REMOTE_DIR,
-            protocol::sudo_fifo_name(&self.nonce)
-        )
+            protocol::sudo_fifo_name(&self.nonce, token)
+        ))
     }
 
     /// 在独立 channel 上执行一段 sudo 辅助脚本。
@@ -535,13 +549,13 @@ async fn forward_event(tx: &mpsc::Sender<SessionOutput>, ev: SessionEvent) -> bo
             command_id,
             exit_code,
         },
-        SessionEvent::SudoRequest => SessionOutput::SudoRequest,
+        SessionEvent::SudoRequest { token } => SessionOutput::SudoRequest { token },
         SessionEvent::Ready => return true,
     };
 
     let critical = matches!(
         out,
-        SessionOutput::Finished { .. } | SessionOutput::SudoRequest
+        SessionOutput::Finished { .. } | SessionOutput::SudoRequest { .. }
     );
 
     if let Err(err) = tx.try_send(out) {

@@ -23,6 +23,193 @@ use mf_perch_lib::mcp::McpManager;
 use mf_perch_lib::state::AppState;
 use mf_perch_lib::store::{credentials, hosts};
 
+/// 发起一次 MCP 调用但**不**断言成功，返回（状态码，响应体，会话 id）。
+///
+/// 用于验证会话被回收后的行为（期望拿到 404），因此不能用会断言成功的
+/// [`mcp_call`]。
+async fn mcp_call_raw(
+    client: &reqwest::Client,
+    url: &str,
+    session_id: Option<&str>,
+    body: serde_json::Value,
+) -> (reqwest::StatusCode, String, Option<String>) {
+    let mut req = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream");
+
+    if let Some(sid) = session_id {
+        req = req.header("mcp-session-id", sid);
+    }
+
+    let resp = req.json(&body).send().await.expect("HTTP 请求应成功");
+    let new_sid = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    (status, text, new_sid)
+}
+
+/// 用**指定的会话空闲超时**起一个裸 MCP 端点（不带鉴权），返回（地址，关闭句柄）。
+///
+/// 仅供测试：用于复现"空闲超时把会话回收掉"的行为。
+async fn spawn_raw_mcp_endpoint(
+    state: Arc<AppState>,
+    keep_alive: Option<std::time::Duration>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+    use rmcp::transport::streamable_http_server::tower::{
+        StreamableHttpServerConfig, StreamableHttpService,
+    };
+
+    let mut manager = LocalSessionManager::default();
+    manager.session_config.keep_alive = keep_alive;
+
+    let service = StreamableHttpService::new(
+        {
+            let state = state.clone();
+            move || Ok(mf_perch_lib::mcp::McpService::new(state.clone()))
+        },
+        Arc::new(manager),
+        StreamableHttpServerConfig::default(),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("绑定测试端口");
+    let addr = listener.local_addr().expect("读取测试地址");
+    let router = axum::Router::new().route("/mcp", axum::routing::any_service(service));
+
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    (format!("http://{addr}/mcp"), handle)
+}
+
+/// 完成一次 initialize 握手，返回会话 id。
+async fn initialize_session(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+) -> String {
+    let mut req = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream");
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    let resp = req
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "mf-perch-e2e", "version": "0.1.0" }
+            }
+        }))
+        .send()
+        .await
+        .expect("initialize 应能发出");
+    assert!(resp.status().is_success(), "initialize 应成功");
+    resp.headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("initialize 应返回 mcp-session-id")
+        .to_string()
+}
+
+/// **机制复现（红例）**：会话空闲超时一旦到期，客户端再带原会话 id 请求
+/// 就会被判定为"会话不存在"（404），这正是用户用 MCP Inspector 实测到的现象。
+///
+/// 这里把空闲超时压到 1 秒，以便几秒内复现 rmcp 的默认行为
+/// （默认值为 5 分钟，见 `mcp::server` 的单测）。
+#[tokio::test]
+async fn expired_session_is_reported_as_not_found() {
+    let (state, _key) = test_state();
+    let (url, handle) = spawn_raw_mcp_endpoint(state, Some(std::time::Duration::from_secs(1))).await;
+    let client = reqwest::Client::new();
+
+    let sid = initialize_session(&client, &url, None).await;
+
+    // 空闲超过 1 秒 → 会话 worker 退出、会话被移除。
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+    let (status, body, _) = mcp_call_raw(
+        &client,
+        &url,
+        Some(&sid),
+        serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "空闲超时后应报会话不存在，实际 {status}：{body}"
+    );
+    assert!(
+        body.contains("Session not found") || body.contains("session not found"),
+        "响应应说明会话不存在（用户看到的即此错误）：{body}"
+    );
+
+    handle.abort();
+}
+
+/// **修复验证**：使用**生产配置**（`McpManager::start`）时，会话必须能挺过
+/// 远长于 rmcp 默认 5 分钟的空闲，之后仍能正常调用工具。
+///
+/// 空闲时长默认 310 秒（刚好越过 5 分钟默认值），可用
+/// `MFPERCH_TEST_IDLE_SECS` 调整；不依赖 SSH，无需 MFPERCH_TEST_HOST。
+#[tokio::test]
+#[ignore = "耗时较长（默认空闲 310 秒）；用 --ignored 运行"]
+async fn mcp_session_survives_idle_longer_than_rmcp_default() {
+    let idle = std::env::var("MFPERCH_TEST_IDLE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(310);
+
+    let (state, _key) = test_state();
+    let manager = McpManager::new(state.clone());
+    let status = manager.start().await.expect("MCP 端点应能启动");
+    let port = status.port.expect("应有端口");
+    let token = status.token.expect("应有 Token");
+    let url = format!("http://127.0.0.1:{port}/mcp");
+
+    let client = reqwest::Client::new();
+    let sid = initialize_session(&client, &url, Some(&token)).await;
+
+    eprintln!("[MCP 空闲测试] 保持 {idle} 秒不发任何请求……");
+    tokio::time::sleep(std::time::Duration::from_secs(idle)).await;
+
+    // 同一个会话 id 继续用：修复前这里会拿到 404 Session not found。
+    let (resp, _) = mcp_call(
+        &client,
+        &url,
+        &token,
+        Some(&sid),
+        serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+    )
+    .await;
+
+    let names: Vec<String> = resp["result"]["tools"]
+        .as_array()
+        .expect("空闲后仍应返回工具列表")
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
+        .collect();
+    assert!(
+        names.contains(&"run_command".to_string()),
+        "空闲 {idle} 秒后会话应仍然可用，实际工具：{names:?}"
+    );
+
+    manager.stop().await.ok();
+}
+
 /// 构造一个使用内存数据库、且已注入主密钥的应用状态。
 ///
 /// 刻意不走 `AppState::initialize()`：那会读写用户真实数据目录，

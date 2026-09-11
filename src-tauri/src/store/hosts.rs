@@ -219,6 +219,7 @@ pub fn set_host_key(
 pub fn list_summaries(conn: &Connection) -> Result<Vec<HostSummary>> {
     let mut stmt = conn.prepare(
         "SELECT h.id, h.name, h.address, h.port, h.credential_id, h.sudo_policy,
+                h.proxy_jump_host_id, h.sudo_password_source, h.shell_env_mode, h.init_script,
                 COALESCE(SUM(CASE WHEN t.status != 'archived' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN t.status = 'archived' THEN 1 ELSE 0 END), 0)
          FROM hosts h
@@ -229,6 +230,8 @@ pub fn list_summaries(conn: &Connection) -> Result<Vec<HostSummary>> {
 
     let rows = stmt.query_map([], |r| {
         let policy_raw: String = r.get(5)?;
+        let source_raw: String = r.get(7)?;
+        let env_raw: String = r.get(8)?;
         Ok(HostSummary {
             id: r.get(0)?,
             name: r.get(1)?,
@@ -236,8 +239,13 @@ pub fn list_summaries(conn: &Connection) -> Result<Vec<HostSummary>> {
             port: port_from_db(r.get::<_, i64>(3)?)?,
             has_credential: r.get::<_, Option<String>>(4)?.is_some(),
             sudo_policy: SudoPolicy::parse(&policy_raw).unwrap_or_default(),
-            active_terminals: count_from_db(r.get::<_, i64>(6)?),
-            archived_terminals: count_from_db(r.get::<_, i64>(7)?),
+            active_terminals: count_from_db(r.get::<_, i64>(10)?),
+            archived_terminals: count_from_db(r.get::<_, i64>(11)?),
+            credential_id: r.get(4)?,
+            proxy_jump_host_id: r.get(6)?,
+            sudo_password_source: SudoPasswordSource::parse(&source_raw).unwrap_or_default(),
+            shell_env_mode: ShellEnvMode::parse(&env_raw).unwrap_or_default(),
+            init_script: r.get(9)?,
         })
     })?;
 

@@ -159,6 +159,10 @@
   2. **sudo 提权采纳三模式设计并在一期全部实现**：`deny`（默认）/ `ask` / `auto`，每主机可配。
   3. 实现机制：包装脚本定义并 `export -f` 一个 `sudo` 函数，转发到 `command sudo -A`；密码经 askpass 脚本从远端 FIFO 读取，应用通过独立 SSH channel 写入；不落盘、不进环境变量。
   4. `ask` 模式通过系统通知征求同意，拒绝或 60 秒超时关闭 FIFO 使 sudo 失败。
+     > **该点第后半句已被实现修正**：实测发现 askpass 以 O_RDWR 持有 FIFO，
+     > 关闭写端不产生 EOF；现改为**向 FIFO 写入空行**使认证失败。
+     > 行为等价（sudo 失败），详见 [`docs/design/sudo.md`](design/sudo.md) §7.3。
+     > 原始决策保留不改，以便追溯当时的判断依据。
   5. fail-closed：未被拦截的 sudo 调用一律失败。
 - **背景**：客户提出由用户选择 sudo 密码处理方式；架构师评估后给出透明拦截 + FIFO 投递方案并说明技术难点，客户理解后决定一期全部实现。
 - **影响**：
@@ -529,3 +533,79 @@
   - 新增设置项时**必须**提供类型化命令，不得恢复通用读写。
   - CSP 需兼顾 Tauri 自身注入的脚本（Tauri 会自动计算其哈希并加入策略）；
     生产构建已验证界面正常渲染。
+
+---
+
+## D37 — sudo 应答按索要配对（每次索要一条 FIFO）
+
+- **日期**：2026-09-11
+- **决策**（修复 B2）：
+  1. **每次 sudo 索要使用一条独立 FIFO**：`sudopw.fifo.<会话 nonce>.<askpass PID>`。
+     askpass 在 sudo 执行时自建、读走应答后自删；会话建立时**不再预建** FIFO。
+  2. 请求标记改为 `__MF_SUDO_REQUEST__<nonce>__<token>__`，`token` 即 askpass 的 PID；
+     应用按 `(nonce, token)` 把应答精确写入对应 FIFO。
+  3. 令牌**只接受 1–10 位 ASCII 数字**——它会被拼进应用下发的命令（FIFO 路径），
+     非法令牌按普通输出丢弃，不产生索要。
+  4. 应用侧写入前加 `test -p` 守卫：目标不是 FIFO 时直接失败（fail-closed），
+     而不是让 `cat > path` 创建普通文件把密码写到磁盘。
+  5. askpass 增加 `read -t 120` 兜底读超时，shebang 因此改为 `#!/bin/bash`
+     （dash 不支持 `read -t`）。
+- **背景**：
+  - 原设计共用一条**会话级** FIFO。FIFO 上一次写入只会被**其中任意一个**正在
+    阻塞的读者取走（POSIX 未规定是哪一个），因此同一会话内两次并发索要时，
+    应答会按"用户点击顺序 vs 读者阻塞顺序"错配：用户批准的那次可能拿到空密码
+    而失败，**被拒绝的那次可能拿到密码而越权**。
+  - 曾评估更小的方案"同一终端只允许一个待决索要"，结论是**不成立**：askpass
+    在打印标记前就已持有 FIFO 读端，第二个索要的读者必然先于应用判断存在，
+    "拒绝第二个请求"的写入同样会被合法请求偷走。
+  - 副产物：setup 不再创建 FIFO，V1（setup 的通配删除把刚建的 FIFO 删掉，
+    导致 `cat > fifo` 退化为普通文件、密码明文落盘）的成因在结构上消失。
+- **取代关系**：
+  - 取代 **D11 第 3 点**中"sudopw.fifo 单条会话级 FIFO"的表述（投递机制改为按索要配对）；
+  - 取代 **D11 第 4 点**中"关闭 FIFO 使 sudo 失败"的表述（实际做法是向 FIFO 写空行，
+    见 [`docs/design/sudo.md`](design/sudo.md) §7.3）；旧条目保留原文以便追溯。
+- **影响**：
+  - `ssh::protocol`：`askpass_script`、`sudo_fifo_name(nonce, token)`、
+    `is_valid_sudo_token`、`session_setup_script`、`session_cleanup_script`；
+    `SessionEvent::SudoRequest` 携带 `token`。
+  - `ssh::session`：`send_sudo_password(token, ..)` / `deny_sudo(token)`。
+  - 会话清理按 nonce 前缀清扫 FIFO（`-type p`），不影响其它会话。
+  - 新增 e2e 回归 `concurrent_sudo_requests_do_not_cross_route`。已验证其在
+    "临时降级回共用 FIFO"时**失败**、恢复后通过——满足 P3 对能区分对错实现的要求。
+- **相关**：D11（sudo 三模式）、D33（协议标记按 id 配对，同一思路）。
+- **已知待办**：sudo 密码错误会重试（默认 3 次），`ask` 模式下用户可能看到多次
+  确认；合并为一次询问属体验优化，尚未实施。
+
+---
+
+## D38 — MCP 会话空闲超时改为 24 小时，不沿用 rmcp 的 5 分钟默认值
+
+- **日期**：2026-09-11
+- **决策**：`McpManager` 显式构造 `LocalSessionManager` 并设置
+  `session_config.keep_alive = Some(24h)`（常量 `SESSION_IDLE_TIMEOUT`，
+  集中在一处便于调整）。
+- **背景**（客户实测反馈）：
+  - 客户用官方 **MCP Inspector** 手动测试，空闲约 10 分钟后工具调用报
+    `Error POSTing to endpoint: Not Found: Session not found`。
+  - 根因在 rmcp：`SessionConfig::default().keep_alive` 为 **300 秒**，
+    会话 worker 空闲到点后以 `IdleTimeout` 退出、会话被从会话表中移除；
+    客户端再带原 `mcp-session-id` 请求即得 `404 Session not found`。
+    我们此前直接使用 `LocalSessionManager::default()`，等于接受了这个默认值。
+  - 对"人 + Agent 交互使用"的桌面应用，5 分钟太短：用户去开会、Agent 停下来
+    思考，回来连接就"断了"。而 MCP Inspector **不会**按规范在收到 404 后自动
+    重新 initialize，于是表现为一条刺眼的报错。
+- **为什么不设为 `None`（永不过期）**：rmcp 文档提醒，HTTP 连接被静默断开
+  （如 HTTP/2 `RST_STREAM`）时无超时会留下僵尸会话。24 小时既覆盖任何
+  人机交互间隔，又保留有界兜底。若客户希望彻底不过期，改这一个常量即可。
+- **影响**：
+  - `src-tauri/src/mcp/server.rs`：新增 `SESSION_IDLE_TIMEOUT` 与
+    `session_manager()`；`StreamableHttpService` 不再用 `default()`。
+  - 新增单测：rmcp 默认值是 300 秒（记录被绕开的坑）、我们的管理器不继承该默认值、
+    超时不得短于 1 小时。
+  - 新增 e2e：`expired_session_is_reported_as_not_found`（把超时压到 1 秒，
+    秒级复现"会话不存在"，即客户看到的现象）；
+    `mcp_session_survives_idle_longer_than_rmcp_default`（生产配置下空闲
+    310 秒后同一会话仍可用，`--ignored` 运行）。
+- **相关**：D1（rmcp）、D2（端点与鉴权）。
+- **说明**：会话过期本身符合 MCP 规范（客户端应据此重新 initialize），
+  因此这属于**服务端体验取舍**，不是规范违背。

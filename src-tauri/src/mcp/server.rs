@@ -49,6 +49,34 @@ pub struct McpManager {
     lifecycle: Mutex<()>,
 }
 
+/// MCP 会话的空闲超时（D38）。
+///
+/// **不能沿用 rmcp 的默认值**：`SessionConfig::default().keep_alive` 是
+/// **5 分钟**，会话 worker 在闲置 5 分钟后自行退出、会话被从表中移除，
+/// 之后客户端再带着原 `mcp-session-id` 请求就会收到
+/// `404 Not Found: Session not found`。
+///
+/// 对一个"人 + Agent 交互使用"的桌面应用来说这个默认值太短：
+/// 用户去开个会、Agent 停下来思考，回来连接就"断了"，而且
+/// MCP Inspector 这类客户端不会自动重新 initialize，界面上就是一条
+/// 报错（实测复现见 `mcp_e2e` 的相关用例）。
+///
+/// 取值 24 小时的考虑：
+/// - 远大于任何人机交互的空闲间隔（含整夜挂着）；
+/// - 仍保留一个**有界**的兜底，避免客户端异常断开（未发 DELETE）时
+///   会话无限累积——这是 rmcp 文档提醒不要直接设为 `None` 的原因。
+const SESSION_IDLE_TIMEOUT: Option<std::time::Duration> =
+    Some(std::time::Duration::from_secs(24 * 60 * 60));
+
+/// 构造会话管理器（统一在此处设定空闲超时，见 [`SESSION_IDLE_TIMEOUT`]）。
+fn session_manager() -> LocalSessionManager {
+    // `LocalSessionManager` / `SessionConfig` 都是 `#[non_exhaustive]`，
+    // 无法用结构体字面量构造，故取默认值后改写单个字段。
+    let mut manager = LocalSessionManager::default();
+    manager.session_config.keep_alive = SESSION_IDLE_TIMEOUT;
+    manager
+}
+
 impl McpManager {
     pub fn new(state: Arc<AppState>) -> Self {
         Self {
@@ -149,7 +177,7 @@ impl McpManager {
                     let state = self.state.clone();
                     move || Ok(McpService::new(state.clone()))
                 },
-                Arc::new(LocalSessionManager::default()),
+                Arc::new(session_manager()),
                 {
                     // 默认仅接受回环 Host，防止 DNS rebinding；
                     // 允许远程时放开，由 Token 与网络环境共同保护。
@@ -319,6 +347,42 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::transport::streamable_http_server::session::local::SessionConfig;
+
+    #[test]
+    fn rmcp_default_idle_timeout_is_the_five_minute_trap() {
+        // 记录被我们绕开的坑：rmcp 默认 5 分钟不用就回收会话。
+        // 若上游改了这个默认值，本用例会失败，提示重新评估 D38 的取值。
+        assert_eq!(
+            SessionConfig::default().keep_alive,
+            Some(std::time::Duration::from_secs(300)),
+            "rmcp 的默认会话空闲超时变了，需重新评估 D38"
+        );
+    }
+
+    #[test]
+    fn session_manager_does_not_inherit_rmcp_default_idle_timeout() {
+        // 回归：曾经直接使用 `LocalSessionManager::default()`，
+        // 于是 MCP 客户端空闲 5 分钟就被判"会话不存在"（用户实测反馈）。
+        let manager = session_manager();
+        assert_ne!(
+            manager.session_config.keep_alive,
+            Some(std::time::Duration::from_secs(300)),
+            "不得沿用 rmcp 的 5 分钟默认空闲超时"
+        );
+    }
+
+    #[test]
+    fn session_idle_timeout_is_long_enough_for_human_pauses() {
+        match SESSION_IDLE_TIMEOUT {
+            // 允许显式关闭（None），但不允许短于 1 小时。
+            None => {}
+            Some(d) => assert!(
+                d >= std::time::Duration::from_secs(60 * 60),
+                "空闲超时必须远大于人机交互的停顿，当前：{d:?}"
+            ),
+        }
+    }
 
     #[test]
     fn constant_time_eq_accepts_identical() {
