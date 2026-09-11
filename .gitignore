@@ -11,6 +11,8 @@ build/
 # Tauri 构建产物
 src-tauri/target/
 src-tauri/gen/
+# 备用/隔离的 cargo target 目录（例如 app 正在运行、二进制被占用时的验证构建）
+src-tauri/target-*/
 
 # 编辑器
 .vscode/*

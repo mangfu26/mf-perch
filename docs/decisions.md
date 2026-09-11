@@ -575,3 +575,37 @@
 - **相关**：D11（sudo 三模式）、D33（协议标记按 id 配对，同一思路）。
 - **已知待办**：sudo 密码错误会重试（默认 3 次），`ask` 模式下用户可能看到多次
   确认；合并为一次询问属体验优化，尚未实施。
+
+---
+
+## D38 — MCP 会话空闲超时改为 24 小时，不沿用 rmcp 的 5 分钟默认值
+
+- **日期**：2026-09-11
+- **决策**：`McpManager` 显式构造 `LocalSessionManager` 并设置
+  `session_config.keep_alive = Some(24h)`（常量 `SESSION_IDLE_TIMEOUT`，
+  集中在一处便于调整）。
+- **背景**（客户实测反馈）：
+  - 客户用官方 **MCP Inspector** 手动测试，空闲约 10 分钟后工具调用报
+    `Error POSTing to endpoint: Not Found: Session not found`。
+  - 根因在 rmcp：`SessionConfig::default().keep_alive` 为 **300 秒**，
+    会话 worker 空闲到点后以 `IdleTimeout` 退出、会话被从会话表中移除；
+    客户端再带原 `mcp-session-id` 请求即得 `404 Session not found`。
+    我们此前直接使用 `LocalSessionManager::default()`，等于接受了这个默认值。
+  - 对"人 + Agent 交互使用"的桌面应用，5 分钟太短：用户去开会、Agent 停下来
+    思考，回来连接就"断了"。而 MCP Inspector **不会**按规范在收到 404 后自动
+    重新 initialize，于是表现为一条刺眼的报错。
+- **为什么不设为 `None`（永不过期）**：rmcp 文档提醒，HTTP 连接被静默断开
+  （如 HTTP/2 `RST_STREAM`）时无超时会留下僵尸会话。24 小时既覆盖任何
+  人机交互间隔，又保留有界兜底。若客户希望彻底不过期，改这一个常量即可。
+- **影响**：
+  - `src-tauri/src/mcp/server.rs`：新增 `SESSION_IDLE_TIMEOUT` 与
+    `session_manager()`；`StreamableHttpService` 不再用 `default()`。
+  - 新增单测：rmcp 默认值是 300 秒（记录被绕开的坑）、我们的管理器不继承该默认值、
+    超时不得短于 1 小时。
+  - 新增 e2e：`expired_session_is_reported_as_not_found`（把超时压到 1 秒，
+    秒级复现"会话不存在"，即客户看到的现象）；
+    `mcp_session_survives_idle_longer_than_rmcp_default`（生产配置下空闲
+    310 秒后同一会话仍可用，`--ignored` 运行）。
+- **相关**：D1（rmcp）、D2（端点与鉴权）。
+- **说明**：会话过期本身符合 MCP 规范（客户端应据此重新 initialize），
+  因此这属于**服务端体验取舍**，不是规范违背。
