@@ -98,9 +98,16 @@ impl FinishNotifier {
     }
 
     /// 当前信号值（供测试与诊断使用）。
-    #[cfg_attr(not(test), allow(dead_code))]
     fn current(&self) -> FinishSignal {
         *self.tx.borrow()
+    }
+
+    /// 会话是否已经断开（D39）。
+    ///
+    /// `Disconnected` 是终态（`mark_finished` 不会覆盖它），因此这里读到
+    /// `Disconnected` 就意味着该条目持有的会话不可再用，必须重建。
+    fn is_disconnected(&self) -> bool {
+        matches!(self.current(), FinishSignal::Disconnected)
     }
 
     /// 通知"当前命令已结束"。用单调递增计数作为值：
@@ -141,6 +148,12 @@ struct TerminalEntry {
     host_label: String,
     /// ask 模式下的用户确认回调。
     asker: SudoAsker,
+    /// 待写入命令输出的审计备注（D39）。
+    ///
+    /// 会话被自动重建后置位，由**下一条真正开始执行的命令**取出并写在输出开头，
+    /// 这样人类在命令历史里能看到"这次重连发生过"，
+    /// 而 Agent 在自己的输出里也能读到同样的一行。
+    pending_note: Mutex<Option<String>>,
 }
 
 /// 终端运行时。
@@ -165,6 +178,14 @@ pub struct RunOutcome {
     pub truncated: bool,
     /// 命令仍在执行时为 true，Agent 应改用 `get_command_status` 轮询。
     pub still_running: bool,
+    /// 本次执行前是否**重建了已断开的 SSH 会话**（D39）。
+    ///
+    /// 为 true 时意味着 shell 是全新的：工作目录、环境变量、后台进程
+    /// 都已丢失（D3 的"状态保留"不再成立），Agent 需要重新 `cd` / `export`。
+    /// 由上层（工具层）在调用 [`TerminalRuntime::run_command`] 前经
+    /// `AppState::ensure_terminal_session` 得知并回填。
+    #[serde(default)]
+    pub session_reconnected: bool,
 }
 
 impl TerminalRuntime {
@@ -301,6 +322,7 @@ impl TerminalRuntime {
             sudo: Arc::new(sudo),
             host_label,
             asker,
+            pending_note: Mutex::new(None),
         });
 
         spawn_output_pump(entry.clone(), rx);
@@ -346,7 +368,7 @@ impl TerminalRuntime {
         terminal_id: &str,
     ) -> Result<Terminal> {
         // --- 阶段 1：校验并取所需信息 ---
-        let (terminal, host, credential, sudo_ctx) = {
+        let (terminal, host, auth, sudo_ctx) = {
             let conn = db.lock().await;
 
             let terminal = terminals::get(&conn, terminal_id)?;
@@ -357,6 +379,8 @@ impl TerminalRuntime {
             }
 
             // 恢复前重新校验配额——期间可能已被其他终端占满（Q11）。
+            // 归档终端不占配额，因此这里的校验不会被它自己干扰
+            // （broken 的重连路径则相反，见 [`Self::reconnect_terminal`]）。
             let settings = crate::settings::load(&conn)?;
             terminals::check_quota(
                 &conn,
@@ -365,21 +389,12 @@ impl TerminalRuntime {
                 settings.quota_global,
             )?;
 
-            let host = hosts::get(&conn, &terminal.host_id)?;
-            let credential_id = host
-                .credential_id
-                .clone()
-                .ok_or_else(|| AppError::CredentialNotFound("该主机尚未绑定认证信息".into()))?;
-            let credential = credentials::get(&conn, &credential_id, key)?;
-
-            // 恢复时同样按当前主机配置重建 sudo 上下文（Q33）。
-            let sudo_ctx = build_sudo_context(&conn, &host, &credential, key)?;
-
-            (terminal, host, credential, sudo_ctx)
+            drop(conn);
+            let (host, auth, sudo_ctx) = load_connection_context(db, key, &terminal).await?;
+            (terminal, host, auth, sudo_ctx)
         };
 
         let sudo_enabled = sudo_ctx.needs_askpass();
-        let auth = AuthMethod::from_credential(&credential);
 
         // --- 阶段 2：重建会话 ---
         let (session, rx) = Session::connect(&terminal.id, &host, auth, sudo_enabled).await?;
@@ -392,6 +407,74 @@ impl TerminalRuntime {
         let conn = db.lock().await;
         terminals::update(&conn, &t)?;
         Ok(t)
+    }
+
+    /// 该终端当前是否持有**可用**的会话（D39）。
+    ///
+    /// 注意区分两种"不可用"：条目不存在（应用重启后必然如此）与
+    /// 条目在但会话已断开（运行中断线，条目会残留）。
+    pub async fn has_live_session(&self, terminal_id: &str) -> bool {
+        match self.entries.lock().await.get(terminal_id) {
+            Some(entry) => !entry.finished.is_disconnected(),
+            None => false,
+        }
+    }
+
+    /// 重建**已断开**的终端会话，沿用原 ID 与命令历史（D39）。
+    ///
+    /// 与 [`Self::restore_terminal`]（人类恢复归档终端）的区别：
+    ///
+    /// - 适用状态不同：这里针对 `broken`（或状态尚未同步、但会话已丢）；
+    /// - **不做配额校验**：`broken` 终端本来就算在配额里（`count_active` 只
+    ///   排除 `archived`），再校验一次会把它自己数进去，在"刚好占满"时
+    ///   误报配额超限，反而让自动重连失败；
+    /// - 重建后会留下一条审计备注，由下一条命令写入输出。
+    ///
+    /// 返回 `(终端记录, 审计备注)`。
+    pub async fn reconnect_terminal(
+        &self,
+        db: &Db,
+        key: &[u8; KEY_LEN],
+        terminal_id: &str,
+    ) -> Result<(Terminal, String)> {
+        let terminal = {
+            let conn = db.lock().await;
+            terminals::get(&conn, terminal_id)?
+        };
+
+        if terminal.status == TerminalStatus::Archived {
+            // 归档终端对 Agent 不可见，不得经重连路径复活（D20）。
+            return Err(AppError::TerminalArchived(terminal_id.to_string()));
+        }
+
+        // 旧条目若还在（断线未清理），先注销并关闭，避免留下死会话。
+        self.unregister(terminal_id).await;
+
+        let (host, auth, sudo_ctx) = load_connection_context(db, key, &terminal).await?;
+        let sudo_enabled = sudo_ctx.needs_askpass();
+
+        let (session, rx) = Session::connect(&terminal.id, &host, auth, sudo_enabled).await?;
+        let note = format!(
+            "原 SSH 会话已断开，已自动重建（主机 {}）；\
+             shell 状态已重置：工作目录、环境变量、后台进程均不再保留",
+            host_label(&host)
+        );
+        self.register(&terminal.id, session, rx, sudo_ctx, host_label(&host))
+            .await;
+        // 备注在注册后写入，确保落在新条目上。
+        if let Some(entry) = self.entries.lock().await.get(terminal_id) {
+            *entry.pending_note.lock().await = Some(note.clone());
+        }
+
+        let mut t = terminal;
+        t.restore();
+        {
+            let conn = db.lock().await;
+            terminals::update(&conn, &t)?;
+        }
+
+        tracing::info!(terminal = %terminal_id, "会话已断开，已按需重建（D39）");
+        Ok((t, note))
     }
 
     /// 删除终端（历史一并删除，D21）。
@@ -473,6 +556,15 @@ impl TerminalRuntime {
                     exit_code: None,
                     started,
                 });
+
+                // 会话重建的审计备注（D39）：写在**这条**命令的输出开头。
+                // 放在这里而不是重连时，是因为队列里可能还排着别的命令——
+                // 备注应当跟着"第一条真正在新会话上执行的命令"走，
+                // 这样人类在命令历史里看到的上下文才是对的。
+                let note = entry_for_task.pending_note.lock().await.take();
+                if let (Some(note), Some(a)) = (note, active.as_mut()) {
+                    a.output.push_line(&format!("[mf-perch] {note}"));
+                }
             }
             // 订阅"结束信号"必须在发送命令之前完成，
             // 否则可能错过命令结束的通知（V4）。
@@ -587,6 +679,8 @@ impl TerminalRuntime {
                 output,
                 truncated,
                 still_running: false,
+                // 由工具层在确认"本次执行前重建过会话"后回填（D39）。
+                session_reconnected: false,
             }
         });
 
@@ -604,6 +698,7 @@ impl TerminalRuntime {
                 output: String::new(),
                 truncated: false,
                 still_running: true,
+                session_reconnected: false,
             });
         };
 
@@ -632,6 +727,7 @@ impl TerminalRuntime {
                     output: partial,
                     truncated,
                     still_running: true,
+                    session_reconnected: false,
                 })
             }
         }
@@ -827,6 +923,63 @@ fn build_sudo_context(
     Ok(ctx)
 }
 
+/// 取出建立/重建会话所需的全部上下文：主机、认证方式、sudo 配置。
+///
+/// 由 [`TerminalRuntime::restore_terminal`]（恢复归档）与
+/// [`TerminalRuntime::reconnect_terminal`]（重连 broken）共用，
+/// 避免两条路径各写一遍解密与校验逻辑而出现行为漂移。
+async fn load_connection_context(
+    db: &Db,
+    key: &[u8; KEY_LEN],
+    terminal: &Terminal,
+) -> Result<(crate::domain::host::Host, AuthMethod, SudoContext)> {
+    let conn = db.lock().await;
+
+    let host = hosts::get(&conn, &terminal.host_id)?;
+    let credential_id = host
+        .credential_id
+        .clone()
+        .ok_or_else(|| AppError::CredentialNotFound("该主机尚未绑定认证信息".into()))?;
+    let credential = credentials::get(&conn, &credential_id, key)?;
+
+    // 每次都按**当前**主机配置重建 sudo 上下文（Q33）。
+    let sudo_ctx = build_sudo_context(&conn, &host, &credential, key)?;
+    let auth = AuthMethod::from_credential(&credential);
+
+    Ok((host, auth, sudo_ctx))
+}
+
+/// 面对一次"要在这个终端上执行命令"的请求，应当怎么做（D39）。
+///
+/// 抽成纯函数以便覆盖全部分支——这里的分支直接决定 Agent 是被拒绝
+/// 还是被自动恢复，必须逐条可测。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionAction {
+    /// 已有可用会话，直接执行。
+    UseExisting,
+    /// 会话已丢失（broken，或状态未同步但会话已断）：按需重建。
+    Reconnect,
+    /// 归档终端：命令必须被拒绝（Agent 不可见，D20）。
+    RejectArchived,
+}
+
+pub(crate) fn decide_session_action(
+    has_live_session: bool,
+    status: TerminalStatus,
+) -> SessionAction {
+    // 归档优先：即使内存里还挂着会话，也不能让 Agent 继续用（D20 / V3）。
+    if status == TerminalStatus::Archived {
+        return SessionAction::RejectArchived;
+    }
+    if has_live_session {
+        SessionAction::UseExisting
+    } else {
+        // broken 与"状态还是 active 但会话已断"都要重建：
+        // 后者是运行中断线、状态尚未落库的情形，对 Agent 而言同样是"连不上"。
+        SessionAction::Reconnect
+    }
+}
+
 /// 等待用户对 sudo 请求的响应超时（Q33：拒绝或超时都让 sudo 失败）。
 const SUDO_ASK_TIMEOUT: Duration = Duration::from_secs(crate::domain::SUDO_ASK_TIMEOUT_SECS);
 
@@ -928,6 +1081,45 @@ async fn push_audit_note(entry: &TerminalEntry, note: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_session_is_used_as_is() {
+        assert_eq!(
+            decide_session_action(true, TerminalStatus::Active),
+            SessionAction::UseExisting
+        );
+    }
+
+    #[test]
+    fn broken_terminal_is_reconnected() {
+        // D39 的核心：应用重启后终端被标记 broken，下一次命令必须自动重建，
+        // 而不是把 Agent 拒之门外（此前只能另建新终端，还会撞配额）。
+        assert_eq!(
+            decide_session_action(false, TerminalStatus::Broken),
+            SessionAction::Reconnect
+        );
+    }
+
+    #[test]
+    fn active_but_session_lost_is_reconnected() {
+        // 运行中断线、状态尚未落库的情形：对 Agent 而言同样是"连不上"。
+        assert_eq!(
+            decide_session_action(false, TerminalStatus::Active),
+            SessionAction::Reconnect
+        );
+    }
+
+    #[test]
+    fn archived_terminal_is_never_reconnected() {
+        // 归档终端对 Agent 不可见，自动重连不得成为绕过归档的后门（D20）。
+        for live in [true, false] {
+            assert_eq!(
+                decide_session_action(live, TerminalStatus::Archived),
+                SessionAction::RejectArchived,
+                "归档优先于会话状态（has_live={live}）"
+            );
+        }
+    }
 
     #[test]
     fn tail_returns_last_lines() {

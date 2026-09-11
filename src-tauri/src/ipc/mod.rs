@@ -526,6 +526,23 @@ pub async fn delete_terminal(
     )
 }
 
+/// 重连已断开的终端（人类侧手动触发，D39）。
+///
+/// 与 Agent 侧"执行命令时自动重连"走同一条路（[`AppState::ensure_terminal_session`]），
+/// 因此行为一致：沿用原终端 ID 与历史，但 shell 状态会重置。
+#[tauri::command]
+pub async fn reconnect_terminal(
+    id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<IpcResult<bool>, ()> {
+    wrap(
+        state
+            .ensure_terminal_session(&id)
+            .await
+            .map(|_| true),
+    )
+}
+
 // ==================== 命令历史（审计，Q17） ====================
 
 #[derive(Debug, serde::Deserialize)]

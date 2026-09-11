@@ -221,11 +221,17 @@ impl McpService {
     ///
     /// Archived terminals are intentionally omitted; the human user can
     /// still audit their command history in the desktop app.
+    ///
+    /// `broken` means the SSH session was lost (usually because the desktop
+    /// app restarted). Such a terminal is still usable: it is reconnected
+    /// automatically by the next `run_command` (D39).
     #[tool(
         name = "list_terminals",
         description = "List terminals visible to the agent. Archived terminals are not \
                        returned. Optionally filter by host_id. Shows terminal status and \
-                       the last command executed on each terminal.",
+                       the last command executed on each terminal. Status 'broken' means the \
+                       SSH session was lost (e.g. the desktop app restarted); the terminal is \
+                       still usable and is reconnected automatically by the next run_command.",
         annotations(title = "List terminals", read_only_hint = true)
     )]
     async fn list_terminals(
@@ -244,13 +250,22 @@ impl McpService {
     /// does not finish in time, this returns a `command_id` with status
     /// `running` **without interrupting the command**; poll it with
     /// `get_command_status`. Use `run_command_async` for clearly long tasks.
+    ///
+    /// A terminal whose SSH session was lost (for example after the desktop
+    /// app restarted) is reconnected automatically before the command runs;
+    /// the result then carries `session_reconnected: true`, which means the
+    /// shell is brand new and its state (working directory, environment
+    /// variables, background jobs) was reset — re-issue any `cd` / `export`.
     #[tool(
         name = "run_command",
         description = "Run a shell command on a terminal and wait for completion \
                        (synchronous). Returns output, exit code and duration. If the command \
                        is still running after wait_seconds (default 30, max 50) it returns a \
                        command_id with status 'running' WITHOUT stopping the command; poll \
-                       with get_command_status. Commands on the same terminal run one at a time.",
+                       with get_command_status. Commands on the same terminal run one at a time. \
+                       If the terminal's SSH session was lost it is reconnected automatically; \
+                       `session_reconnected: true` in the result means the shell state \
+                       (working directory, environment variables) was reset.",
         annotations(title = "Run command (sync)", read_only_hint = false)
     )]
     async fn run_command(
@@ -433,10 +448,22 @@ impl McpService {
             }
         }
 
-        self.state
+        // 会话已断开（应用重启、网络中断）时**按需重建**（D39）：
+        // 断开的成因是人类重启或网络，不该让 Agent 先去发现再处理。
+        let reconnected = self
+            .state
+            .ensure_terminal_session(&p.terminal_id)
+            .await?;
+
+        let mut outcome = self
+            .state
             .terminals
             .run_command(&self.state.db, &p.terminal_id, &p.command, wait)
-            .await
+            .await?;
+
+        // 明确告知 Agent：这条命令跑在**全新**的 shell 上，状态已重置。
+        outcome.session_reconnected = reconnected.is_some();
+        Ok(outcome)
     }
 
     async fn get_command_status_impl(

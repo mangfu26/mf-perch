@@ -160,6 +160,186 @@ async fn expired_session_is_reported_as_not_found() {
     handle.abort();
 }
 
+/// **D39 回归（客户实测反馈）**：应用重启后，旧终端的 SSH 会话已不存在
+/// （启动时被标记为 `broken`），此时 Agent 继续用原 `terminal_id` 执行命令，
+/// 必须**自动重连**并成功执行，而不是报"终端连接已断开，请重建终端"
+/// ——后者 Agent 根本没有手段完成（工具列表里没有重连工具，
+/// 只能另建新终端，而且 broken 占配额，几次重启就会撞满配额）。
+///
+/// 编排刻意贴近真实：
+/// 1. 用**同一份数据库文件**开两个 `AppState`，模拟"应用重启"——
+///    第二个实例的终端运行时里没有任何会话，且启动时把 active 标成 broken；
+/// 2. 把每主机配额压到 **1**：重连**不得**重新校验配额
+///    （broken 本来就算在配额里，再校验会把它自己数进去而误报超限）；
+/// 3. 走真实 MCP HTTP 调用（与客户用 Inspector 测的路径一致）。
+#[tokio::test]
+#[ignore = "需要真实 SSH 服务器与 MCP 端点；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
+async fn run_command_auto_reconnects_broken_terminal_after_restart() {
+    if test_target().is_none() {
+        eprintln!("跳过：未设置 MFPERCH_TEST_HOST / PORT / USER / KEY");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("临时目录");
+    let db_path = dir.path().join("mf-perch-reconnect.sqlite");
+    let key = mf_perch_lib::store::crypto::generate_master_key();
+
+    // ---- 第一段生命周期：建立终端并成功执行一条命令 ----
+    let state1 = Arc::new(AppState::new_for_test(
+        mf_perch_lib::store::db::open(&db_path).expect("打开测试库"),
+        key,
+    ));
+    let host_id = seed_host(&state1, &key).await;
+
+    // 配额压到 1：让"重连时若误做配额校验"必然失败（该终端自己就占了 1 个名额）。
+    {
+        let conn = state1.db.lock().await;
+        mf_perch_lib::store::db::set_setting(
+            &conn,
+            mf_perch_lib::settings::SETTING_QUOTA_PER_HOST,
+            "1",
+        )
+        .expect("设置每主机配额");
+    }
+
+    let manager1 = McpManager::new(state1.clone());
+    let status = manager1.start().await.expect("MCP 端点应能启动");
+    let port = status.port.expect("应有端口");
+    let token = status.token.expect("应有 Token");
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let client = reqwest::Client::new();
+    let sid = initialize_session(&client, &url, Some(&token)).await;
+
+    let (created, _) = mcp_call(
+        &client,
+        &url,
+        &token,
+        Some(&sid),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "create_terminal",
+                "arguments": { "host_id": host_id, "name": "reconnect e2e" } }
+        }),
+    )
+    .await;
+    let terminal_id = tool_payload(&created)["terminal_id"]
+        .as_str()
+        .expect("create_terminal 应返回 terminal_id")
+        .to_string();
+
+    let (first, _) = mcp_call(
+        &client,
+        &url,
+        &token,
+        Some(&sid),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "run_command",
+                "arguments": { "terminal_id": terminal_id, "command": "echo before-restart" } }
+        }),
+    )
+    .await;
+    let before = tool_payload(&first);
+    assert_eq!(before["exit_code"], 0, "重启前命令应成功：{before}");
+    assert_eq!(
+        before["session_reconnected"], false,
+        "首次执行不应报告重连：{before}"
+    );
+
+    manager1.stop().await.ok();
+
+    // ---- 模拟应用重启：同一份库、全新的终端运行时 ----
+    let state2 = Arc::new(AppState::new_for_test(
+        mf_perch_lib::store::db::open(&db_path).expect("重新打开测试库"),
+        key,
+    ));
+    {
+        let conn = state2.db.lock().await;
+        let n = mf_perch_lib::store::terminals::mark_all_broken_on_startup(&conn)
+            .expect("模拟启动时标记 broken");
+        assert_eq!(n, 1, "重启后应把原 active 终端标记为 broken");
+    }
+
+    let manager2 = McpManager::new(state2.clone());
+    let status2 = manager2.start().await.expect("重启后的 MCP 端点应能启动");
+    let port2 = status2.port.expect("应有端口");
+    let token2 = status2.token.expect("应有 Token");
+    let url2 = format!("http://127.0.0.1:{port2}/mcp");
+    let sid2 = initialize_session(&client, &url2, Some(&token2)).await;
+
+    // Agent 看到的是 broken 状态（与客户截图一致）。
+    let (listed, _) = mcp_call(
+        &client,
+        &url2,
+        &token2,
+        Some(&sid2),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": { "name": "list_terminals", "arguments": { "host_id": host_id } }
+        }),
+    )
+    .await;
+    let listed = tool_payload(&listed);
+    let status_field = listed["terminals"][0]["status"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(status_field, "broken", "重启后终端应为 broken：{listed}");
+
+    // 关键：用**同一个 terminal_id** 继续执行命令。
+    let (after, _) = mcp_call(
+        &client,
+        &url2,
+        &token2,
+        Some(&sid2),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": { "name": "run_command",
+                "arguments": { "terminal_id": terminal_id, "command": "echo after-restart" } }
+        }),
+    )
+    .await;
+    let after = tool_payload(&after);
+
+    assert_eq!(
+        after["exit_code"], 0,
+        "broken 终端上的命令应自动重连后成功执行：{after}"
+    );
+    assert_eq!(
+        after["session_reconnected"], true,
+        "必须明确告知 Agent：会话已重建、shell 状态已重置：{after}"
+    );
+    let output = after["output"].as_str().unwrap_or_default();
+    assert!(
+        output.contains("after-restart"),
+        "命令本身应正常执行：{output}"
+    );
+    assert!(
+        output.contains("[mf-perch]") && output.contains("重建"),
+        "命令历史里应留有可审计的重连说明：{output}"
+    );
+
+    // 终端应已回到 active，且不因配额（=1）而失败。
+    let (listed2, _) = mcp_call(
+        &client,
+        &url2,
+        &token2,
+        Some(&sid2),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+            "params": { "name": "list_terminals", "arguments": { "host_id": host_id } }
+        }),
+    )
+    .await;
+    let listed2 = tool_payload(&listed2);
+    assert_eq!(
+        listed2["terminals"][0]["status"], "active",
+        "重连后状态应回到 active，且不受配额上限（1）影响：{listed2}"
+    );
+
+    manager2.stop().await.ok();
+}
+
 /// **修复验证**：使用**生产配置**（`McpManager::start`）时，会话必须能挺过
 /// 远长于 rmcp 默认 5 分钟的空闲，之后仍能正常调用工具。
 ///

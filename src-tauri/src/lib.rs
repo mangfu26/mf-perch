@@ -94,6 +94,7 @@ pub fn run() {
             ipc::list_terminals,
             ipc::archive_terminal,
             ipc::restore_terminal,
+            ipc::reconnect_terminal,
             ipc::delete_terminal,
             // 审计
             ipc::search_history,

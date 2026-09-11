@@ -288,9 +288,30 @@ mod tests {
         assert!(!auto_start(&conn).unwrap());
     }
 
+    /// 断言测试端口当前**可用**；被占用时给出可操作的失败提示。
+    ///
+    /// 最常见的占用者是**开发时正在运行的应用本体**——它监听的正是
+    /// [`PORT_RANGE_START`]。
+    ///
+    /// 这里刻意**失败并说明该怎么办**，而不是静默跳过：
+    /// 静默跳过会让"端口被占"这种环境问题伪装成绿色通过，
+    /// 掩盖真实回归（团队约定：环境不具备时应提示人去处理，而不是让测试装作没事）。
+    async fn require_port_free(port: u16) {
+        match TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => drop(listener),
+            Err(e) => panic!(
+                "端口 {port} 被占用（{e}）。两种常见成因：\n\
+                 ① 有**正在运行的 mf-perch 应用实例**（它监听的就是这个端口段）——请先退出该实例；\n\
+                 ② 有**并发的测试**正在跑（e2e 也会启动 MCP 端点）——请等它结束后再跑本测试。\n\
+                 若两者都不成立，请检查是否有残留的 mf-perch / 测试进程。"
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn select_port_prefers_persisted_port() {
         let _guard = PORT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        require_port_free(PORT_RANGE_START).await;
 
         let (listener, port) = select_port_with_preference(Some(PORT_RANGE_START), false)
             .await
@@ -303,11 +324,12 @@ mod tests {
     #[tokio::test]
     async fn select_port_rescans_when_persisted_is_taken() {
         let _guard = PORT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        require_port_free(PORT_RANGE_START).await;
 
         // 占用起始端口，模拟"持久化端口被占用"。
-        let Ok(blocker) = TcpListener::bind(("127.0.0.1", PORT_RANGE_START)).await else {
-            return;
-        };
+        let blocker = TcpListener::bind(("127.0.0.1", PORT_RANGE_START))
+            .await
+            .expect("刚校验过端口可用，这里应能占用成功");
 
         let (listener, port) = select_port_with_preference(Some(PORT_RANGE_START), false)
             .await
@@ -322,6 +344,8 @@ mod tests {
     #[tokio::test]
     async fn select_port_without_preference_scans_from_start() {
         let _guard = PORT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        require_port_free(PORT_RANGE_START).await;
+
         let (listener, port) = select_port_with_preference(None, false).await.unwrap();
         assert_eq!(port, PORT_RANGE_START, "无持久化端口时应从起始端口开始");
         drop(listener);
