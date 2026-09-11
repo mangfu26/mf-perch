@@ -30,6 +30,7 @@ use crate::domain::host::{Host, HostSummary, ShellEnvMode, SudoPasswordSource, S
 use crate::domain::terminal::Terminal;
 use crate::error::AppError;
 use crate::state::AppState;
+use crate::terminal::validate_for_policy;
 use crate::store::crypto::KEY_LEN;
 use crate::store::keyring::KeyProvider;
 use crate::store::{commands as cmd_store, credentials, hosts, terminals};
@@ -186,6 +187,26 @@ pub async fn list_hosts(state: State<'_, Arc<AppState>>) -> Result<IpcResult<Vec
     wrap(hosts::list_summaries(&conn))
 }
 
+/// 该主机要复用的登录凭据是否为密码方式（Q33 / O1）。
+///
+/// "复用 SSH 登录密码"只在登录认证为密码时成立：密钥登录没有密码可复用。
+/// 返回 `false` 时调用方会经 [`validate_for_policy`] 报出可操作的错误，
+/// 而不是等到建终端时才神秘失败（P1：明确报错）。
+fn credential_is_password(
+    conn: &rusqlite::Connection,
+    input: &HostInput,
+    key: &[u8; KEY_LEN],
+) -> Result<bool, AppError> {
+    let Some(cid) = input.credential_id.as_deref() else {
+        return Ok(false);
+    };
+    if !credentials::exists(conn, cid)? {
+        return Err(AppError::CredentialNotFound(cid.to_string()));
+    }
+    let cred = credentials::get(conn, cid, key)?;
+    Ok(cred.kind == CredentialKind::Password)
+}
+
 async fn save_host_inner(state: &AppState, input: HostInput) -> Result<String, AppError> {
     let key = master_key(state).await?;
 
@@ -217,6 +238,22 @@ async fn save_host_inner(state: &AppState, input: HostInput) -> Result<String, A
             host.sudo_password_source = source;
             host.shell_env_mode = env_mode;
             host.init_script = input.init_script.clone();
+
+            // 保存前就校验配置自洽（O1）：策略要密码却没有可用密码时，
+            // 应当在**保存这一刻**告诉用户，而不是等他建终端才失败。
+            // 已存的 sudo 密码算数（编辑时留空表示保留原值）。
+            let has_password = match source {
+                SudoPasswordSource::Own => {
+                    input
+                        .sudo_password
+                        .as_deref()
+                        .is_some_and(|s| !s.is_empty())
+                        || hosts::get_sudo_password(&conn, id, &key)?.is_some()
+                }
+                SudoPasswordSource::ReuseLogin => credential_is_password(&conn, &input, &key)?,
+            };
+            validate_for_policy(policy, has_password)?;
+
             hosts::update(&conn, &host)?;
 
             // 只有显式提供了新密码才覆盖；留空表示保留原值
@@ -227,6 +264,16 @@ async fn save_host_inner(state: &AppState, input: HostInput) -> Result<String, A
             Ok(id.clone())
         }
         None => {
+            // 新建时同样先校验自洽（O1）：此刻密码只可能来自本次输入。
+            let has_password = match source {
+                SudoPasswordSource::Own => input
+                    .sudo_password
+                    .as_deref()
+                    .is_some_and(|s| !s.is_empty()),
+                SudoPasswordSource::ReuseLogin => credential_is_password(&conn, &input, &key)?,
+            };
+            validate_for_policy(policy, has_password)?;
+
             let host = Host {
                 id: crate::domain::new_id("host"),
                 name: input.name.clone(),

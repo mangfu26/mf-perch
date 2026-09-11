@@ -533,3 +533,45 @@
   - 新增设置项时**必须**提供类型化命令，不得恢复通用读写。
   - CSP 需兼顾 Tauri 自身注入的脚本（Tauri 会自动计算其哈希并加入策略）；
     生产构建已验证界面正常渲染。
+
+---
+
+## D37 — sudo 应答按索要配对（每次索要一条 FIFO）
+
+- **日期**：2026-09-11
+- **决策**（修复 B2）：
+  1. **每次 sudo 索要使用一条独立 FIFO**：`sudopw.fifo.<会话 nonce>.<askpass PID>`。
+     askpass 在 sudo 执行时自建、读走应答后自删；会话建立时**不再预建** FIFO。
+  2. 请求标记改为 `__MF_SUDO_REQUEST__<nonce>__<token>__`，`token` 即 askpass 的 PID；
+     应用按 `(nonce, token)` 把应答精确写入对应 FIFO。
+  3. 令牌**只接受 1–10 位 ASCII 数字**——它会被拼进应用下发的命令（FIFO 路径），
+     非法令牌按普通输出丢弃，不产生索要。
+  4. 应用侧写入前加 `test -p` 守卫：目标不是 FIFO 时直接失败（fail-closed），
+     而不是让 `cat > path` 创建普通文件把密码写到磁盘。
+  5. askpass 增加 `read -t 120` 兜底读超时，shebang 因此改为 `#!/bin/bash`
+     （dash 不支持 `read -t`）。
+- **背景**：
+  - 原设计共用一条**会话级** FIFO。FIFO 上一次写入只会被**其中任意一个**正在
+    阻塞的读者取走（POSIX 未规定是哪一个），因此同一会话内两次并发索要时，
+    应答会按"用户点击顺序 vs 读者阻塞顺序"错配：用户批准的那次可能拿到空密码
+    而失败，**被拒绝的那次可能拿到密码而越权**。
+  - 曾评估更小的方案"同一终端只允许一个待决索要"，结论是**不成立**：askpass
+    在打印标记前就已持有 FIFO 读端，第二个索要的读者必然先于应用判断存在，
+    "拒绝第二个请求"的写入同样会被合法请求偷走。
+  - 副产物：setup 不再创建 FIFO，V1（setup 的通配删除把刚建的 FIFO 删掉，
+    导致 `cat > fifo` 退化为普通文件、密码明文落盘）的成因在结构上消失。
+- **取代关系**：
+  - 取代 **D11 第 3 点**中"sudopw.fifo 单条会话级 FIFO"的表述（投递机制改为按索要配对）；
+  - 取代 **D11 第 4 点**中"关闭 FIFO 使 sudo 失败"的表述（实际做法是向 FIFO 写空行，
+    见 [`docs/design/sudo.md`](design/sudo.md) §7.3）；旧条目保留原文以便追溯。
+- **影响**：
+  - `ssh::protocol`：`askpass_script`、`sudo_fifo_name(nonce, token)`、
+    `is_valid_sudo_token`、`session_setup_script`、`session_cleanup_script`；
+    `SessionEvent::SudoRequest` 携带 `token`。
+  - `ssh::session`：`send_sudo_password(token, ..)` / `deny_sudo(token)`。
+  - 会话清理按 nonce 前缀清扫 FIFO（`-type p`），不影响其它会话。
+  - 新增 e2e 回归 `concurrent_sudo_requests_do_not_cross_route`。已验证其在
+    "临时降级回共用 FIFO"时**失败**、恢复后通过——满足 P3 对能区分对错实现的要求。
+- **相关**：D11（sudo 三模式）、D33（协议标记按 id 配对，同一思路）。
+- **已知待办**：sudo 密码错误会重试（默认 3 次），`ask` 模式下用户可能看到多次
+  确认；合并为一次询问属体验优化，尚未实施。

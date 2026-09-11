@@ -96,6 +96,8 @@ async fn save_host_update_preserves_sudo_password_when_blank() {
 
     let mut create = host_input("10.0.0.2", None);
     create.sudo_policy = "auto".into();
+    // 用独立配置的 sudo 密码（O1 起会校验策略与来源是否自洽）。
+    create.sudo_password_source = "own".into();
     create.sudo_password = Some("s3cret".into());
     let id = save_host_inner(&state, create).await.unwrap();
 
@@ -104,6 +106,7 @@ async fn save_host_update_preserves_sudo_password_when_blank() {
     update.id = Some(id.clone());
     update.name = Some("renamed".into());
     update.sudo_policy = "auto".into();
+    update.sudo_password_source = "own".into();
     update.sudo_password = None;
     save_host_inner(&state, update).await.unwrap();
 
@@ -125,18 +128,103 @@ async fn save_host_update_can_replace_sudo_password() {
 
     let mut create = host_input("10.0.0.3", None);
     create.sudo_policy = "ask".into();
+    create.sudo_password_source = "own".into();
     create.sudo_password = Some("old".into());
     let id = save_host_inner(&state, create).await.unwrap();
 
     let mut update = host_input("10.0.0.3", None);
     update.id = Some(id.clone());
     update.sudo_policy = "ask".into();
+    update.sudo_password_source = "own".into();
     update.sudo_password = Some("new".into());
     save_host_inner(&state, update).await.unwrap();
 
     let conn = state.db.lock().await;
     let pw = hosts::get_sudo_password(&conn, &id, &key).unwrap();
     assert_eq!(pw.as_deref(), Some("new"));
+}
+
+#[tokio::test]
+async fn save_host_rejects_ask_policy_without_usable_password() {
+    // O1：策略与密码来源不自洽时必须在**保存这一刻**报错，
+    // 否则用户以为设置已生效，直到 Agent 建终端才失败（P1：明确报错）。
+    let (state, _key) = test_state();
+
+    let mut input = host_input("10.0.0.9", None);
+    input.sudo_policy = "ask".into();
+    input.sudo_password_source = "own".into();
+    input.sudo_password = None;
+
+    let err = save_host_inner(&state, input).await.unwrap_err();
+    assert!(
+        err.to_string().contains("sudo 密码"),
+        "应提示缺少 sudo 密码，实际：{err}"
+    );
+}
+
+#[tokio::test]
+async fn save_host_rejects_reuse_login_with_key_credential() {
+    // 密钥登录没有密码可复用，"复用登录密码"必然落空。
+    let (state, _key) = test_state();
+    let cred_id = save_credential_inner(&state, credential_input("root", Some("pw")))
+        .await
+        .unwrap();
+    // 把该凭据改成密钥类（否则它是密码类，复用是成立的）。
+    {
+        let conn = state.db.lock().await;
+        conn.execute("UPDATE credentials SET kind = 'key' WHERE id = ?1", [&cred_id])
+            .unwrap();
+    }
+
+    let mut input = host_input("10.0.0.10", Some(cred_id));
+    input.sudo_policy = "auto".into();
+    input.sudo_password_source = "reuse_login".into();
+
+    let err = save_host_inner(&state, input).await.unwrap_err();
+    assert!(
+        err.to_string().contains("sudo 密码"),
+        "密钥凭据无法复用登录密码，应报错，实际：{err}"
+    );
+}
+
+#[tokio::test]
+async fn save_host_accepts_reuse_login_with_password_credential() {
+    let (state, _key) = test_state();
+    let cred_id = save_credential_inner(&state, credential_input("root", Some("pw")))
+        .await
+        .unwrap();
+
+    let mut input = host_input("10.0.0.11", Some(cred_id));
+    input.sudo_policy = "auto".into();
+    input.sudo_password_source = "reuse_login".into();
+
+    save_host_inner(&state, input)
+        .await
+        .expect("密码类凭据 + 复用登录密码是自洽配置");
+}
+
+#[tokio::test]
+async fn save_host_update_keeps_valid_when_password_blank() {
+    // 编辑时留空表示保留原密码，因此校验必须把**已存的密码**算进去，
+    // 否则用户改个名字就会被误判为"缺少密码"而无法保存。
+    let (state, _key) = test_state();
+
+    let mut create = host_input("10.0.0.12", None);
+    create.sudo_policy = "auto".into();
+    create.sudo_password_source = "own".into();
+    create.sudo_password = Some("pw".into());
+    let id = save_host_inner(&state, create).await.unwrap();
+
+    let mut update = host_input("10.0.0.12", None);
+    update.id = Some(id);
+    update.name = Some("only-rename".into());
+    update.sudo_policy = "auto".into();
+    update.sudo_password_source = "own".into();
+    update.sudo_password = None;
+
+    save_host_inner(&state, update)
+        .await
+        .expect("已存密码应被视为可用，改名字不应被拦下");
 }
 
 #[tokio::test]

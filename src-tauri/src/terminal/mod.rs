@@ -861,6 +861,16 @@ async fn handle_sudo_request(entry: &TerminalEntry, token: &str) {
         None
     };
 
+    // 人类侧审计（O3）：提权决策必须留在命令历史里，可被事后核对。
+    // 只记决策与策略，绝不记录密码本身。
+    let audit_note = match (sudo.policy, decision) {
+        (SudoPolicy::Ask, Some(SudoDecision::Allow)) => Some("sudo 提权请求：用户已允许".to_string()),
+        (SudoPolicy::Ask, Some(SudoDecision::Deny)) => Some("sudo 提权请求：用户已拒绝".to_string()),
+        (SudoPolicy::Ask, None) => Some("sudo 提权请求：等待确认超时，已按拒绝处理".to_string()),
+        (SudoPolicy::Auto, _) => Some("sudo 提权请求：按主机策略自动注入密码".to_string()),
+        (SudoPolicy::Deny, _) => Some("sudo 提权请求：该主机已禁用提权注入".to_string()),
+    };
+
     match resolve_action(sudo.policy, has_password, decision) {
         SudoAction::Inject => {
             let password = sudo
@@ -878,6 +888,8 @@ async fn handle_sudo_request(entry: &TerminalEntry, token: &str) {
                     // 注入失败仍必须让 sudo 结束，否则命令会一直挂着。
                     tracing::error!("注入 sudo 密码失败：{e}");
                     let _ = entry.session.deny_sudo(token).await;
+                    push_audit_note(entry, "sudo 提权：密码注入失败，本次提权已失败").await;
+                    return;
                 }
             }
         }
@@ -895,6 +907,21 @@ async fn handle_sudo_request(entry: &TerminalEntry, token: &str) {
                 "已拒绝 sudo 密码注入"
             );
         }
+    }
+
+    if let Some(note) = audit_note {
+        push_audit_note(entry, &note).await;
+    }
+}
+
+/// 把一条审计备注写进当前命令的输出（O3）。
+///
+/// 人类侧的终端审计视图按命令展示输出，因此提权决策写在这里就能被看到，
+/// 无需新增存储结构。当前没有执行中的命令时静默跳过。
+async fn push_audit_note(entry: &TerminalEntry, note: &str) {
+    let mut active = entry.active.lock().await;
+    if let Some(a) = active.as_mut() {
+        a.output.push_line(&format!("[mf-perch] {note}"));
     }
 }
 

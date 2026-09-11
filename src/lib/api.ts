@@ -23,6 +23,13 @@ export interface HostSummary {
   sudo_policy: SudoPolicy;
   active_terminals: number;
   archived_terminals: number;
+  // 供「编辑主机」表单原样回填（B5）：表单提交会整体覆盖主机配置，
+  // 若摘要里没有这些字段，只改个名字就会把它们清空。
+  credential_id: string | null;
+  proxy_jump_host_id: string | null;
+  sudo_password_source: SudoPasswordSource;
+  shell_env_mode: ShellEnvMode;
+  init_script: string | null;
 }
 
 export interface HostInput {

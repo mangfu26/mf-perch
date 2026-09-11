@@ -36,6 +36,7 @@ const name = ref("");
 const address = ref("");
 const port = ref<number>(22);
 const credentialId = ref<string>("");
+const proxyJumpHostId = ref<string | null>(null);
 const sudoPolicy = ref<SudoPolicy>("deny");
 const sudoPasswordSource = ref<SudoPasswordSource>("reuse_login");
 const sudoPassword = ref("");
@@ -55,11 +56,15 @@ watch(
     name.value = h?.name ?? "";
     address.value = h?.address ?? "";
     port.value = h?.port ?? 22;
-    credentialId.value = "";
+    // 编辑时必须回填**全部可编辑字段**（B5）：提交会整体覆盖主机配置，
+    // 少回填一个字段，用户"只改个名字"就会把该字段静默清空。
+    // sudo 密码本身不回显（后端不返回），留空表示保留原值。
+    credentialId.value = h?.credential_id ?? "";
+    proxyJumpHostId.value = h?.proxy_jump_host_id ?? null;
     sudoPolicy.value = h?.sudo_policy ?? "deny";
-    sudoPasswordSource.value = "reuse_login";
-    shellEnvMode.value = "login";
-    initScript.value = "";
+    sudoPasswordSource.value = h?.sudo_password_source ?? "reuse_login";
+    shellEnvMode.value = h?.shell_env_mode ?? "login";
+    initScript.value = h?.init_script ?? "";
   },
   { immediate: true },
 );
@@ -97,7 +102,8 @@ function submit() {
     address: address.value.trim(),
     port: port.value,
     credential_id: credentialId.value || null,
-    proxy_jump_host_id: null,
+    // 保留原有的跳板机配置（当前界面无控件，但不得因编辑而丢失）。
+    proxy_jump_host_id: proxyJumpHostId.value,
     sudo_policy: sudoPolicy.value,
     sudo_password_source: sudoPasswordSource.value,
     // 留空表示不修改已有密码（编辑场景）。
