@@ -34,8 +34,10 @@ use crate::ssh::{Session, SessionOutput};
 use crate::store::crypto::KEY_LEN;
 use crate::store::{commands as cmd_store, credentials, hosts, terminals};
 
+pub mod events;
 pub mod sudo;
 
+pub use events::{event_channel, EventSink, TerminalEvent, EVENT_TERMINAL};
 pub use sudo::{
     resolve_action, policy_description, validate_for_policy, SudoAction, SudoContext,
     SudoDecision, SudoRequest,
@@ -154,6 +156,21 @@ struct TerminalEntry {
     /// 这样人类在命令历史里能看到"这次重连发生过"，
     /// 而 Agent 在自己的输出里也能读到同样的一行。
     pending_note: Mutex<Option<String>>,
+    /// 事件出口（D22）：与运行时**共享同一个槽位**，因此外壳层注入后，
+    /// 已经在跑的条目（尤其是输出泵）也能发出事件。
+    events: Arc<std::sync::Mutex<Option<EventSink>>>,
+}
+
+impl TerminalEntry {
+    /// 发布一条属于本条目的事件（尽力而为，语义见 [`TerminalRuntime::emit`]）。
+    fn emit_event(&self, event: TerminalEvent) {
+        let Ok(slot) = self.events.lock() else {
+            return;
+        };
+        if let Some(sink) = slot.as_ref() {
+            let _ = sink.send(event);
+        }
+    }
 }
 
 /// 终端运行时。
@@ -165,6 +182,12 @@ pub struct TerminalRuntime {
     entries: Mutex<HashMap<String, Arc<TerminalEntry>>>,
     /// ask 模式的确认回调；未设置时 ask 模式一律按拒绝处理（fail-closed）。
     asker: Mutex<Option<SudoAsker>>,
+    /// 事件出口（D22）：由外壳层注入并转发为前端可见的 Tauri 事件。
+    ///
+    /// 用标准库锁而非 tokio 锁：发送到无界通道不阻塞，
+    /// 且事件会在不少同步位置发出（与 `sudo_bridge` 的待决表同理）。
+    /// 与每个 [`TerminalEntry`] **共享同一个 `Arc`**，因此注入后条目也能发事件。
+    events: Arc<std::sync::Mutex<Option<EventSink>>>,
 }
 
 /// 执行命令的结果（对应 Q4 的同步/异步两种返回）。
@@ -193,6 +216,7 @@ impl TerminalRuntime {
         Self {
             entries: Mutex::new(HashMap::new()),
             asker: Mutex::new(None),
+            events: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -202,6 +226,26 @@ impl TerminalRuntime {
     /// 也不能在无人确认的情况下悄悄注入密码（Q33 / P2）。
     pub async fn set_sudo_asker(&self, asker: SudoAsker) {
         *self.asker.lock().await = Some(asker);
+    }
+
+    /// 注入事件出口（由外壳层在启动时调用，D22）。
+    pub fn set_event_sink(&self, sink: EventSink) {
+        if let Ok(mut slot) = self.events.lock() {
+            *slot = Some(sink);
+        }
+    }
+
+    /// 发布一条事件。
+    ///
+    /// **尽力而为**：没有注入出口（测试）或接收端已关闭（应用退出）时静默跳过。
+    /// 事件只影响界面新鲜度，真实状态以数据库为准，因此这里不需要回压或重试。
+    fn emit(&self, event: TerminalEvent) {
+        let Ok(slot) = self.events.lock() else {
+            return;
+        };
+        if let Some(sink) = slot.as_ref() {
+            let _ = sink.send(event);
+        }
     }
 
     /// 该终端是否已建立连接。
@@ -280,8 +324,13 @@ impl TerminalRuntime {
                     terminal.env_snapshot = Some(snapshot);
                 }
 
-                self.register(&terminal.id, session, rx, sudo_ctx, host_label(&host))
+                self.register(db, &terminal.id, session, rx, sudo_ctx, host_label(&host))
                     .await;
+                // 通知界面：新终端已就绪（D22）。
+                self.emit(TerminalEvent::TerminalCreated {
+                    terminal_id: terminal.id.clone(),
+                    host_id: terminal.host_id.clone(),
+                });
                 Ok(terminal)
             }
             Err(e) => {
@@ -290,6 +339,12 @@ impl TerminalRuntime {
                 failed.mark_broken();
                 let conn = db.lock().await;
                 terminals::update(&conn, &failed)?;
+                drop(conn);
+                self.emit(TerminalEvent::SessionChanged {
+                    terminal_id: failed.id.clone(),
+                    status: events::STATUS_BROKEN.to_string(),
+                    reason: format!("终端建立失败：{e}"),
+                });
                 Err(e)
             }
         }
@@ -298,6 +353,7 @@ impl TerminalRuntime {
     /// 注册一个已建立的会话并启动输出泵。
     async fn register(
         &self,
+        db: &Db,
         terminal_id: &str,
         session: Session,
         rx: tokio::sync::mpsc::Receiver<SessionOutput>,
@@ -323,9 +379,10 @@ impl TerminalRuntime {
             host_label,
             asker,
             pending_note: Mutex::new(None),
+            events: self.events.clone(),
         });
 
-        spawn_output_pump(entry.clone(), rx);
+        spawn_output_pump(db.clone(), entry.clone(), rx);
         self.entries
             .lock()
             .await
@@ -357,6 +414,13 @@ impl TerminalRuntime {
 
         terminal.archive();
         terminals::update(&conn, &terminal)?;
+        drop(conn);
+        // 通知界面：已归档（Agent 不可见，人类视图需更新状态）。
+        self.emit(TerminalEvent::SessionChanged {
+            terminal_id: terminal.id.clone(),
+            status: events::STATUS_ARCHIVED.to_string(),
+            reason: "终端已归档".into(),
+        });
         Ok(terminal)
     }
 
@@ -398,14 +462,22 @@ impl TerminalRuntime {
 
         // --- 阶段 2：重建会话 ---
         let (session, rx) = Session::connect(&terminal.id, &host, auth, sudo_enabled).await?;
-        self.register(&terminal.id, session, rx, sudo_ctx, host_label(&host))
+        self.register(db, &terminal.id, session, rx, sudo_ctx, host_label(&host))
             .await;
 
         // --- 阶段 3：更新状态 ---
         let mut t = terminal;
         t.restore();
-        let conn = db.lock().await;
-        terminals::update(&conn, &t)?;
+        {
+            let conn = db.lock().await;
+            terminals::update(&conn, &t)?;
+        }
+        // 通知界面：已恢复（人类视图需把状态改回 active）。
+        self.emit(TerminalEvent::SessionChanged {
+            terminal_id: t.id.clone(),
+            status: events::STATUS_ACTIVE.to_string(),
+            reason: "终端已恢复".into(),
+        });
         Ok(t)
     }
 
@@ -459,7 +531,7 @@ impl TerminalRuntime {
              shell 状态已重置：工作目录、环境变量、后台进程均不再保留",
             host_label(&host)
         );
-        self.register(&terminal.id, session, rx, sudo_ctx, host_label(&host))
+        self.register(db, &terminal.id, session, rx, sudo_ctx, host_label(&host))
             .await;
         // 备注在注册后写入，确保落在新条目上。
         if let Some(entry) = self.entries.lock().await.get(terminal_id) {
@@ -474,14 +546,28 @@ impl TerminalRuntime {
         }
 
         tracing::info!(terminal = %terminal_id, "会话已断开，已按需重建（D39）");
+        // 通知界面：会话已重建（D22）——否则界面会一直停在"连接已断开"，
+        // 审核者会误判终端仍不可用。
+        self.emit(TerminalEvent::SessionChanged {
+            terminal_id: t.id.clone(),
+            status: events::STATUS_ACTIVE.to_string(),
+            reason: "会话已自动重建（shell 状态已重置）".into(),
+        });
         Ok((t, note))
     }
 
     /// 删除终端（历史一并删除，D21）。
     pub async fn delete_terminal(&self, db: &Db, terminal_id: &str) -> Result<()> {
         self.unregister(terminal_id).await;
-        let conn = db.lock().await;
-        terminals::delete(&conn, terminal_id)
+        {
+            let conn = db.lock().await;
+            terminals::delete(&conn, terminal_id)?;
+        }
+        // 通知界面：该终端已从列表中消失（D22）。
+        self.emit(TerminalEvent::TerminalRemoved {
+            terminal_id: terminal_id.to_string(),
+        });
+        Ok(())
     }
 
     /// 执行命令（Q4 双模式）。
@@ -569,6 +655,13 @@ impl TerminalRuntime {
             // 订阅"结束信号"必须在发送命令之前完成，
             // 否则可能错过命令结束的通知（V4）。
             let mut finished_rx = entry_for_task.finished.subscribe();
+
+            // 通知界面：命令开始执行（D22，界面显示"执行中"）。
+            entry_for_task.emit_event(TerminalEvent::CommandStarted {
+                terminal_id: entry_for_task.session.terminal_id().to_string(),
+                command_id: command_id_for_task.clone(),
+                command: command_owned.clone(),
+            });
 
             // 标记为 running 并落库（此前为 queued）。
             {
@@ -670,6 +763,15 @@ impl TerminalRuntime {
             }
 
             entry_for_task.inflight.fetch_sub(1, Ordering::SeqCst);
+
+            // 通知界面：命令结束（D22）。放在落库之后，界面若立刻回查也能读到终态。
+            entry_for_task.emit_event(TerminalEvent::CommandFinished {
+                terminal_id: entry_for_task.session.terminal_id().to_string(),
+                command_id: command_id_for_task.clone(),
+                status: CommandStatus::Completed.as_str().to_string(),
+                exit_code,
+                duration_ms: Some(duration),
+            });
 
             RunOutcome {
                 command_id: command_id_for_task,
@@ -780,7 +882,11 @@ impl TerminalRuntime {
 }
 
 /// 输出泵：消费会话事件，归属到"当前命令"，并在结束时置位退出码。
-fn spawn_output_pump(entry: Arc<TerminalEntry>, mut rx: tokio::sync::mpsc::Receiver<SessionOutput>) {
+fn spawn_output_pump(
+    db: Db,
+    entry: Arc<TerminalEntry>,
+    mut rx: tokio::sync::mpsc::Receiver<SessionOutput>,
+) {
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             match event {
@@ -840,6 +946,32 @@ fn spawn_output_pump(entry: Arc<TerminalEntry>, mut rx: tokio::sync::mpsc::Recei
                     }
                     drop(active);
                     entry.finished.mark_disconnected();
+
+                    // 把状态**落库**为 broken（D39 待办 / V-类问题）：
+                    // 此前只有"应用重启"才会落 broken，运行中断线时数据库仍是
+                    // active，界面会长期显示得偏乐观。
+                    // 只覆盖 active：并发发生的归档/删除不应被这里改回去。
+                    {
+                        let conn = db.lock().await;
+                        let tid = entry.session.terminal_id();
+                        match terminals::get(&conn, tid) {
+                            Ok(mut t) if t.status == TerminalStatus::Active => {
+                                t.mark_broken();
+                                if let Err(e) = terminals::update(&conn, &t) {
+                                    tracing::warn!("落库 broken 状态失败：{e}");
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::debug!("读取终端状态失败（不影响断开处理）：{e}"),
+                        }
+                    }
+
+                    // 通知界面：会话已断开（人类界面据此显示 broken）。
+                    entry.emit_event(TerminalEvent::SessionChanged {
+                        terminal_id: entry.session.terminal_id().to_string(),
+                        status: events::STATUS_BROKEN.to_string(),
+                        reason: format!("连接已断开：{reason}"),
+                    });
                     break;
                 }
             }
@@ -1165,6 +1297,65 @@ mod tests {
         notifier.mark_finished();
         let second = tokio::time::timeout(Duration::from_millis(200), rx.changed()).await;
         assert!(second.is_ok(), "第二次结束也应触发变更");
+    }
+
+    #[tokio::test]
+    async fn archive_and_delete_emit_terminal_events() {
+        // D22：人类界面的实时性依赖这些事件。归档/删除是最容易漏发的两处
+        // （它们不经过命令路径），且漏发会让界面长期显示陈旧状态。
+        let conn = crate::store::db::open_in_memory().unwrap();
+        conn.execute(
+            "INSERT INTO hosts (id, address, port, created_at, updated_at) \
+             VALUES ('host_evt', '10.0.0.1', 22, 'now', 'now')",
+            [],
+        )
+        .unwrap();
+        let terminal = Terminal::new("host_evt", None);
+        crate::store::terminals::insert(&conn, &terminal).unwrap();
+        let db: Db = std::sync::Arc::new(Mutex::new(conn));
+
+        let runtime = TerminalRuntime::new();
+        let (tx, mut rx) = events::event_channel();
+        runtime.set_event_sink(tx);
+
+        runtime.archive_terminal(&db, &terminal.id).await.unwrap();
+        match rx.try_recv().expect("归档应发出事件") {
+            TerminalEvent::SessionChanged {
+                terminal_id,
+                status,
+                ..
+            } => {
+                assert_eq!(terminal_id, terminal.id);
+                assert_eq!(status, events::STATUS_ARCHIVED);
+            }
+            other => panic!("期望 SessionChanged，实际 {other:?}"),
+        }
+
+        runtime.delete_terminal(&db, &terminal.id).await.unwrap();
+        match rx.try_recv().expect("删除应发出事件") {
+            TerminalEvent::TerminalRemoved { terminal_id } => {
+                assert_eq!(terminal_id, terminal.id);
+            }
+            other => panic!("期望 TerminalRemoved，实际 {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn events_are_optional_for_the_runtime() {
+        // 没有注入出口（单元测试、无界面环境）时不得 panic——事件只影响界面新鲜度。
+        let conn = crate::store::db::open_in_memory().unwrap();
+        conn.execute(
+            "INSERT INTO hosts (id, address, port, created_at, updated_at) \
+             VALUES ('host_noevt', '10.0.0.1', 22, 'now', 'now')",
+            [],
+        )
+        .unwrap();
+        let terminal = Terminal::new("host_noevt", None);
+        crate::store::terminals::insert(&conn, &terminal).unwrap();
+        let db: Db = std::sync::Arc::new(Mutex::new(conn));
+
+        let runtime = TerminalRuntime::new();
+        runtime.archive_terminal(&db, &terminal.id).await.unwrap();
     }
 
     #[tokio::test]

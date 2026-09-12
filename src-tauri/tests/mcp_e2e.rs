@@ -267,6 +267,10 @@ async fn run_command_auto_reconnects_broken_terminal_after_restart() {
     let url2 = format!("http://127.0.0.1:{port2}/mcp");
     let sid2 = initialize_session(&client, &url2, Some(&token2)).await;
 
+    // 订阅终端事件（D22）：界面能自动更新、不再停在"连接已断开"，靠的就是它们。
+    let (tx_events, mut rx_events) = mf_perch_lib::terminal::event_channel();
+    state2.terminals.set_event_sink(tx_events);
+
     // Agent 看到的是 broken 状态（与客户截图一致）。
     let (listed, _) = mcp_call(
         &client,
@@ -335,6 +339,35 @@ async fn run_command_auto_reconnects_broken_terminal_after_restart() {
     assert_eq!(
         listed2["terminals"][0]["status"], "active",
         "重连后状态应回到 active，且不受配额上限（1）影响：{listed2}"
+    );
+
+    // ---- 事件断言（D22）：界面靠这些事件自动更新，不能只靠人工刷新 ----
+    let mut kinds: Vec<String> = Vec::new();
+    let mut session_reasons: Vec<String> = Vec::new();
+    while let Ok(ev) = rx_events.try_recv() {
+        let json = serde_json::to_value(&ev).unwrap();
+        let kind = json["kind"].as_str().unwrap_or_default().to_string();
+        if kind == "session_changed" {
+            session_reasons.push(json["reason"].as_str().unwrap_or_default().to_string());
+        }
+        kinds.push(kind);
+    }
+
+    assert!(
+        kinds.iter().any(|k| k == "session_changed"),
+        "自动重连必须发出 session_changed，否则界面会一直停在\"连接已断开\"：{kinds:?}"
+    );
+    assert!(
+        session_reasons.iter().any(|r| r.contains("重建")),
+        "会话事件应说明是自动重建（人类可核对）：{session_reasons:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| k == "command_started"),
+        "命令开始应发出事件，界面才能显示\"执行中\"：{kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| k == "command_finished"),
+        "命令结束应发出事件，界面才能自动更新结果：{kinds:?}"
     );
 
     manager2.stop().await.ok();
