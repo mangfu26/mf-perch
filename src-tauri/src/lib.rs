@@ -32,7 +32,7 @@ pub use error::{AppError, Result};
 
 use std::sync::Arc;
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 use state::AppState;
 
@@ -142,6 +142,28 @@ pub fn run() {
                 let asker = sudo_bridge.as_asker(app.handle().clone());
                 tauri::async_runtime::spawn(async move {
                     runtime.set_sudo_asker(asker).await;
+                });
+            }
+
+            // 把终端运行时的领域事件转发为前端可见的 Tauri 事件（D22）。
+            // 人类界面此前是纯拉取，Agent 执行命令/会话自动重连后要人工点刷新
+            // 才对得上，甚至会把"已重连"显示成"连接已断开"。
+            {
+                let runtime = {
+                    let state = app.state::<Arc<state::AppState>>().inner().clone();
+                    state.terminals.clone()
+                };
+                let handle = app.handle().clone();
+                let (tx, mut rx) = terminal::event_channel();
+                runtime.set_event_sink(tx);
+                tauri::async_runtime::spawn(async move {
+                    while let Some(event) = rx.recv().await {
+                        if let Err(e) = handle.emit(terminal::EVENT_TERMINAL, &event) {
+                            // 界面没收到只是"晚一拍"，真实状态始终以数据库为准，
+                            // 因此这里只记日志，不做重试或回压。
+                            tracing::debug!("转发终端事件失败（界面可能晚一拍）：{e}");
+                        }
+                    }
                 });
             }
 

@@ -13,11 +13,26 @@ import SudoConfirmDialog from "@/components/sudo/SudoConfirmDialog.vue";
 import { useAppStore } from "@/stores/app";
 import { useMcpStore } from "@/stores/mcp";
 import { useSudoStore } from "@/stores/sudo";
+import { useTerminalsStore } from "@/stores/terminals";
 
 const app = useAppStore();
 const mcp = useMcpStore();
 const sudo = useSudoStore();
+const terminals = useTerminalsStore();
 const { t } = useI18n();
+
+/**
+ * 窗口重新可见/获得焦点时校准一次（D22）。
+ *
+ * 事件推送是"尽力而为"：窗口隐藏到托盘期间的事件可能没被消费，
+ * 因此回到前台时主动拉一次，保证界面与数据库一致。
+ */
+function resyncOnFocus() {
+  if (document.visibilityState === "visible") {
+    void terminals.refresh();
+    void terminals.refreshHistory();
+  }
+}
 
 onMounted(async () => {
   // 启动时同步密钥状态与 MCP 状态，使界面反映后端真实情况。
@@ -26,9 +41,18 @@ onMounted(async () => {
   await mcp.loadClientConfig();
   // 监听 sudo 提权请求（Q33 ask 模式）。
   await sudo.startListening();
+  // 监听终端事件：命令开始/结束、会话断开与自动重连、终端新建/删除（D22）。
+  await terminals.startListening();
+  window.addEventListener("focus", resyncOnFocus);
+  document.addEventListener("visibilitychange", resyncOnFocus);
 });
 
-onUnmounted(() => sudo.stopListening());
+onUnmounted(() => {
+  sudo.stopListening();
+  terminals.stopListening();
+  window.removeEventListener("focus", resyncOnFocus);
+  document.removeEventListener("visibilitychange", resyncOnFocus);
+});
 </script>
 
 <template>
