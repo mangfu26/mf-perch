@@ -609,3 +609,63 @@
 - **相关**：D1（rmcp）、D2（端点与鉴权）。
 - **说明**：会话过期本身符合 MCP 规范（客户端应据此重新 initialize），
   因此这属于**服务端体验取舍**，不是规范违背。
+
+---
+
+## D39 — 断开的终端在执行命令时按需自动重连
+
+- **日期**：2026-09-11
+- **决策**：
+  1. **执行命令前按需重建会话**：`run_command` 发现该终端没有可用会话时，
+     若状态为 `broken`（或状态仍是 `active` 但会话已丢），**自动重建** SSH 会话，
+     沿用原终端 ID 与命令历史，然后照常执行这条命令。归档终端仍然一律拒绝。
+  2. **重建必须显式告知**：结果里带 `session_reconnected: true`，并在该命令输出
+     开头写入一条 `[mf-perch]` 审计行——重建后是全新 shell，
+     **工作目录、环境变量、后台进程都不再保留**（D3 的"状态保留"不再成立），
+     Agent 必须知道要重新 `cd` / `export`，人类也要能审计到。
+  3. **不新增 MCP 工具**：没有引入"重连工具"，工具面保持 7 个。
+  4. **人类侧同时开放重连**：新增 `reconnect_terminal` IPC 与界面按钮，
+     与 Agent 侧走同一条路径（`AppState::ensure_terminal_session`）。
+  5. **重连不做配额校验**（与"恢复归档"不同）：`broken` 终端本就算在配额里
+     （`count_active` 只排除 `archived`），再校验会把它自己数进去，
+     在"刚好占满"时误报配额超限。
+- **背景**（客户实测反馈）：
+  - 客户重启应用后用 MCP Inspector 测试：`list_terminals` 显示终端 `broken`，
+    `run_command` 返回 `terminal_broken`，提示"请重建终端"。
+  - 但**重建的手段并不存在**：MCP 工具里没有重连/激活工具，人类界面也没有
+    （恢复按钮只在 `archived` 时出现，见 `TerminalDetailView.vue` 的 `canRestore`）；
+    Agent 只能 `create_terminal` 另建一个新终端，旧终端则一直占着配额。
+    配额统计"未归档即计数"，因此**反复重启几次就会撞满每主机配额**，
+    此后连新建都会失败——Agent 会被彻底卡死。
+  - 触发条件是**常规路径**而非边缘情况：应用每次启动都会把所有未归档终端
+    标记为 `broken`（`state.rs`），即"人类重启一次，Agent 手上终端全部失效"。
+  - 评估过"给 Agent 一个显式重连工具"的方案：断开多由**人类重启**或网络引起，
+    不是 Agent 的意图；让它先探测状态再决定重连，等于把连接管理泄漏进它的推理，
+    而且它手上只有 `terminal_id` 这一个句柄。终端软件（Termius 等）的惯例也是
+    自动重连并在面板提示，而不是让你删掉标签页重开。
+- **影响**：
+  - `terminal/mod.rs`：新增 `has_live_session`、`reconnect_terminal`、
+    纯函数 `decide_session_action`（分支可测）、共享的
+    `load_connection_context`；`RunOutcome` 增加 `session_reconnected`；
+    条目新增 `pending_note`，由重建后的**第一条真正执行的命令**写入输出。
+  - `state.rs`：新增 `AppState::ensure_terminal_session`（取密钥 → 判定 → 重建）。
+  - `mcp/tools.rs`：`run_command_impl` 先确保会话，再回填 `session_reconnected`；
+    更新 `run_command` / `list_terminals` 的工具描述（英文）。
+  - `ipc/mod.rs` + `lib.rs`：新增 `reconnect_terminal` 命令；
+    前端新增 `reconnectTerminal`、store 的 `reconnect`、
+    详情页与列表页的「重连」入口，并修正 broken 提示文案。
+  - 新增单测 3 项（活跃会话直接用 / broken 重建 / 归档永不重建）；
+    新增 e2e `run_command_auto_reconnects_broken_terminal_after_restart`
+    （同一数据库文件开两个 AppState 模拟重启、配额压到 1、走真实 MCP HTTP）。
+  - 顺带修正：端口相关单测在端口被占用时**失败并提示如何处置**
+    （退出应用 / 等待并发测试结束），不再静默跳过——静默跳过会把
+    环境问题伪装成绿色通过。
+- **取代/扩展**：扩展 D20（归档恢复）的"沿用原 ID 与历史"语义到 `broken` 场景；
+  取代 [`docs/design/terminal-session.md`](design/terminal-session.md) §5 中
+  "Agent 需重建"的表述（原文没有可用的重建手段，属能力缺口）。
+- **已知待办**：
+  - 运行中断线（非重启）目前**不会**把数据库状态落为 `broken`——
+    终端看似 `active` 但实际无会话，直到下一次命令触发重连才恢复。
+    人类界面在此期间可能显示得偏乐观，后续可让输出泵在断开时落库。
+  - 若主机本身不可达，重连会失败并报 `ssh_connect_failed`，状态保持 `broken`，
+    Agent 应据错误原因判断而不是反复重试。

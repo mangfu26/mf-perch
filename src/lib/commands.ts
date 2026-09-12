@@ -58,6 +58,10 @@ export const archiveTerminal = (id: string) =>
 export const restoreTerminal = (id: string) =>
   call<Terminal>("restore_terminal", { id });
 
+/** 重连已断开（broken）的终端：沿用原 ID 与历史，但 shell 状态会重置（D39）。 */
+export const reconnectTerminal = (id: string) =>
+  call<boolean>("reconnect_terminal", { id });
+
 export const deleteTerminal = (id: string) =>
   call<boolean>("delete_terminal", { id });
 

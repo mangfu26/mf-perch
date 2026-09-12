@@ -132,13 +132,17 @@ export default {
     archiveWarning: "归档后 AI Agent 将无法看到该终端，但历史保留供审计。",
     restore: "恢复",
     restoreHint: "恢复后沿用原终端 ID 与历史，AI Agent 可重新使用",
+    reconnect: "重连",
+    reconnectHint:
+      "重连后沿用原终端 ID 与历史；但 shell 状态会重置——工作目录、环境变量、后台进程都不再保留。AI Agent 下次执行命令时也会自动重连。",
     deleteConfirm: "确定删除该终端吗？",
     deleteWarning:
       "该终端的全部命令历史会被一并删除，且不可恢复。此操作也用于释放磁盘空间。",
     empty: "还没有任何终端",
     emptyHint: "终端由 AI Agent 通过 MCP 创建",
     archivedNote: "该终端已归档，AI Agent 不可见",
-    brokenNote: "连接已断开，需由 AI Agent 重建终端",
+    brokenNote:
+      "连接已断开。AI Agent 下次执行命令时会自动重连（shell 状态会重置），你也可以点右上角「重连」。",
     quota: "终端配额",
     quotaPerHost: "每主机",
     quotaGlobal: "全局",

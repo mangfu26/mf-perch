@@ -86,6 +86,18 @@ export const useTerminalsStore = defineStore("terminals", () => {
     }
   }
 
+  /** 重连已断开的终端（D39）：沿用原 ID 与历史，但 shell 状态会重置。 */
+  async function reconnect(id: string) {
+    try {
+      await api.reconnectTerminal(id);
+      await refresh();
+      app.notify("终端已重连（shell 状态已重置：工作目录、环境变量不再保留）");
+    } catch (e) {
+      app.fail(e);
+      throw e;
+    }
+  }
+
   async function remove(id: string) {
     try {
       await api.deleteTerminal(id);
@@ -113,6 +125,7 @@ export const useTerminalsStore = defineStore("terminals", () => {
     search,
     archive,
     restore,
+    reconnect,
     remove,
     findById,
   };

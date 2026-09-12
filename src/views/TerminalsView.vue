@@ -44,7 +44,7 @@ const showArchived = ref(true);
 
 const confirmOpen = ref(false);
 const target = ref<TerminalView | null>(null);
-const action = ref<"delete" | "archive" | "restore">("delete");
+const action = ref<"delete" | "archive" | "restore" | "reconnect">("delete");
 const working = ref(false);
 
 onMounted(async () => {
@@ -112,6 +112,7 @@ async function confirm() {
   try {
     if (action.value === "archive") await store.archive(target.value.id);
     else if (action.value === "restore") await store.restore(target.value.id);
+    else if (action.value === "reconnect") await store.reconnect(target.value.id);
     else await store.remove(target.value.id);
     confirmOpen.value = false;
   } catch {
@@ -124,12 +125,14 @@ async function confirm() {
 const confirmTitle = computed(() => {
   if (action.value === "archive") return t("terminal.archiveConfirm");
   if (action.value === "restore") return t("terminal.restore");
+  if (action.value === "reconnect") return t("terminal.reconnect");
   return t("terminal.deleteConfirm");
 });
 
 const confirmWarning = computed(() => {
   if (action.value === "archive") return t("terminal.archiveWarning");
   if (action.value === "restore") return undefined;
+  if (action.value === "reconnect") return t("terminal.reconnectHint");
   return t("terminal.deleteWarning");
 });
 </script>
@@ -234,6 +237,15 @@ const confirmWarning = computed(() => {
                 variant="ghost"
                 :title="t('terminal.restore')"
                 @click="ask(term, 'restore')"
+              >
+                <RotateCcw class="h-3.5 w-3.5" />
+              </BaseButton>
+              <BaseButton
+                v-else-if="term.status === 'broken'"
+                size="sm"
+                variant="ghost"
+                :title="t('terminal.reconnect')"
+                @click="ask(term, 'reconnect')"
               >
                 <RotateCcw class="h-3.5 w-3.5" />
               </BaseButton>

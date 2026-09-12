@@ -40,7 +40,7 @@ const loading = ref(false);
 const expanded = ref<Set<string>>(new Set());
 
 const confirmOpen = ref(false);
-const action = ref<"delete" | "archive" | "restore">("delete");
+const action = ref<"delete" | "archive" | "restore" | "reconnect">("delete");
 const working = ref(false);
 
 async function load() {
@@ -86,6 +86,8 @@ function commandStatusLabel(status: string) {
 }
 
 const canRestore = computed(() => terminal.value?.status === "archived");
+/** 会话断开（broken）时可手动重连：与 Agent 自动重连走同一条路径（D39）。 */
+const canReconnect = computed(() => terminal.value?.status === "broken");
 
 function ask(a: typeof action.value) {
   action.value = a;
@@ -98,6 +100,7 @@ async function confirm() {
   try {
     if (action.value === "archive") await store.archive(id);
     else if (action.value === "restore") await store.restore(id);
+    else if (action.value === "reconnect") await store.reconnect(id);
     else {
       await store.remove(id);
       router.push("/terminals");
@@ -115,12 +118,14 @@ async function confirm() {
 const confirmTitle = computed(() => {
   if (action.value === "archive") return t("terminal.archiveConfirm");
   if (action.value === "restore") return t("terminal.restore");
+  if (action.value === "reconnect") return t("terminal.reconnect");
   return t("terminal.deleteConfirm");
 });
 
 const confirmWarning = computed(() => {
   if (action.value === "archive") return t("terminal.archiveWarning");
   if (action.value === "restore") return t("terminal.restoreHint");
+  if (action.value === "reconnect") return t("terminal.reconnectHint");
   return t("terminal.deleteWarning");
 });
 </script>
@@ -150,6 +155,14 @@ const confirmWarning = computed(() => {
       >
         <RotateCcw class="h-3.5 w-3.5" />
         {{ t("terminal.restore") }}
+      </BaseButton>
+      <BaseButton
+        v-else-if="canReconnect"
+        variant="primary"
+        @click="ask('reconnect')"
+      >
+        <RotateCcw class="h-3.5 w-3.5" />
+        {{ t("terminal.reconnect") }}
       </BaseButton>
       <BaseButton v-else variant="default" @click="ask('archive')">
         <Archive class="h-3.5 w-3.5" />

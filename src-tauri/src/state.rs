@@ -130,6 +130,53 @@ impl AppState {
         }))
     }
 
+    /// 确保某终端有一个**可用**的会话；已断开则按需重建（D39）。
+    ///
+    /// 返回 `Ok(Some(说明))` 表示本次发生了重建，调用方应把说明透出给
+    /// Agent（例如 `RunOutcome.session_reconnected = true`），
+    /// 因为重建后 shell 状态已重置，Agent 需要重新 `cd` / `export`。
+    ///
+    /// 设计取舍（D39）：
+    /// - 断开多由**人类重启应用**或网络引起，不是 Agent 的意图，
+    ///   因此由服务端自动处置，而不是要求 Agent 先探测再调"重连工具"；
+    /// - 只有 `broken`（或状态未同步但会话已丢）才重建；归档终端一律拒绝（D20）；
+    /// - 凭据未解锁时**明确报错**，不静默降级（P2）。
+    pub async fn ensure_terminal_session(&self, terminal_id: &str) -> Result<Option<String>> {
+        use crate::terminal::{decide_session_action, SessionAction};
+
+        let has_live = self.terminals.has_live_session(terminal_id).await;
+
+        let status = {
+            let conn = self.db.lock().await;
+            crate::store::terminals::get(&conn, terminal_id)?.status
+        };
+
+        match decide_session_action(has_live, status) {
+            SessionAction::UseExisting => Ok(None),
+            SessionAction::RejectArchived => {
+                Err(AppError::TerminalArchived(terminal_id.to_string()))
+            }
+            SessionAction::Reconnect => {
+                let key = {
+                    let guard = self.master_key.lock().await;
+                    // 未解锁时 `get()` 返回错误，这里归一为"无密钥"由下面统一报错（P1）。
+                    guard.get().ok().copied().map(zeroize::Zeroizing::new)
+                }
+                .ok_or_else(|| {
+                    AppError::KeyServiceUnavailable(
+                        "凭据尚未解锁，无法重建终端会话；请先在应用中解锁".into(),
+                    )
+                })?;
+
+                let (_, note) = self
+                    .terminals
+                    .reconnect_terminal(&self.db, &key, terminal_id)
+                    .await?;
+                Ok(Some(note))
+            }
+        }
+    }
+
     /// 以 K2 主密码解锁。
     pub async fn unlock_with_master_password(&self, password: &str) -> Result<()> {
         let conn = self.db.lock().await;
