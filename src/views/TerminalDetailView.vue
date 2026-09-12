@@ -4,8 +4,13 @@
  *
  * 采用时间线卡片而非终端回放：人类在本产品中是"日志审核者"，
  * 每条命令的边界、退出码与耗时比终端观感更重要。
+ *
+ * 实时性（D22）：命令列表直接渲染 store 中的历史（**不做本地拷贝**），
+ * 因此后端事件触发的 store 刷新会立即反映到界面；
+ * 早期版本把 `store.history` 拷进本地 ref，导致"store 更新了、页面不动"，
+ * 必须人工点刷新——这正是客户反馈的现象。
  */
-import { ref, computed, onMounted } from "vue";
+import { ref, computed, onMounted, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { useRoute, useRouter } from "vue-router";
 import {
@@ -25,7 +30,6 @@ import EmptyState from "@/components/ui/EmptyState.vue";
 import ConfirmDialog from "@/components/ui/ConfirmDialog.vue";
 import { useTerminalsStore } from "@/stores/terminals";
 import { formatDuration, formatDateTime } from "@/lib/format";
-import type { HistoryItem } from "@/lib/api";
 
 const { t } = useI18n();
 const route = useRoute();
@@ -35,9 +39,11 @@ const store = useTerminalsStore();
 const terminalId = computed(() => String(route.params.id ?? ""));
 const terminal = computed(() => store.findById(terminalId.value));
 
-const commands = ref<HistoryItem[]>([]);
+const commands = computed(() => store.history);
 const loading = ref(false);
 const expanded = ref<Set<string>>(new Set());
+/** 默认展开只做一次：后续事件驱动的刷新不应重置用户已展开/折叠的状态。 */
+let expandedInitialized = false;
 
 const confirmOpen = ref(false);
 const action = ref<"delete" | "archive" | "restore" | "reconnect">("delete");
@@ -49,11 +55,11 @@ async function load() {
     // 终端列表用于取详情（含归档终端，人类可审计）。
     if (store.terminals.length === 0) await store.refresh();
     await store.search({ terminalId: terminalId.value, limit: 500 });
-    commands.value = store.history;
 
     // 默认展开最新一条，便于快速查看最近发生了什么。
-    if (commands.value.length > 0) {
+    if (!expandedInitialized && commands.value.length > 0) {
       expanded.value = new Set([commands.value[0].id]);
+      expandedInitialized = true;
     }
   } finally {
     loading.value = false;
@@ -61,6 +67,9 @@ async function load() {
 }
 
 onMounted(load);
+
+// 切换终端（同一组件复用时参数会变）要重新取数，否则会继续显示上一个终端的历史。
+watch(terminalId, load);
 
 function toggle(id: string) {
   const next = new Set(expanded.value);

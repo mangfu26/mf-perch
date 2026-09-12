@@ -115,10 +115,12 @@ export const useTerminalsStore = defineStore("terminals", () => {
     unlisten = await listen<TerminalEventPayload>(EVENT_TERMINAL, (event) => {
       const payload = event.payload;
 
-      // 只有与"当前正在看的历史"相关时才刷新历史，避免无谓的查询。
+      // 命令类事件，以及会影响命令输出的会话事件（断开时输出里会追加
+      // `[mf-perch] 连接已断开…`，重连写审计备注），都要刷新历史。
       if (
         payload.kind === "command_started" ||
-        payload.kind === "command_finished"
+        payload.kind === "command_finished" ||
+        payload.kind === "session_changed"
       ) {
         const scope = lastHistoryQuery?.terminalId;
         if (!scope || scope === payload.terminal_id) historyDirty = true;
