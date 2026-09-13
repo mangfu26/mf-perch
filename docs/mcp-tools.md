@@ -267,14 +267,7 @@
 
 ## 6. 如何重新导出（避免文档漂移）
 
-```bash
-# 起一个使用内存数据库、完全隔离的真实 MCP 端点，并把 tools/list 打到 stdout
-# （§3 各工具"入参"一节的权威来源；改完工具定义后重新导出比对）
-cd src-tauri
-cargo run --features mcp --example mcp_tools_dump
-```
-
-也可用官方 Inspector 校验 schema 可移植性（`--strict` 无输出即无问题）：
+用官方 Inspector 连到真实端点导出 `tools/list`（`--strict` 无输出即 schema 无问题）：
 
 ```bash
 cd src-tauri
@@ -285,5 +278,6 @@ npx -y @modelcontextprotocol/inspector --cli \
   --method tools/list --strict
 ```
 
+> 本文 §3 的**入参 schema 即由该方式导出**（不是手抄代码）；改完工具定义后请重新导出比对。
 > 输出结构（§3 的"输出"表）来自 Rust 类型定义：`mcp/tools.rs` 的返回结构、
 > `terminal::RunOutcome`、`domain::command::CommandStatusView`、`error::AppError::code`。
