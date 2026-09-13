@@ -192,10 +192,10 @@ const confirmWarning = computed(() => {
         :hint="t('terminal.emptyHint')"
       />
 
-      <!-- 终端卡片集合：与主机/凭据页同款响应式网格（theme-spec §4.2） -->
+      <!-- 终端卡片集合：与主机/凭据页同款响应式网格（最小列宽 400px，theme-spec §4.2） -->
       <div
         v-else
-        class="grid gap-3 grid-cols-[repeat(auto-fill,minmax(320px,1fr))]"
+        class="grid gap-3 grid-cols-[repeat(auto-fill,minmax(400px,1fr))]"
       >
         <article
           v-for="term in visibleTerminals"

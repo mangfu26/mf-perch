@@ -103,12 +103,13 @@ function sudoLabel(policy: string) {
 
     <!--
       卡片集合用响应式网格（theme-spec §4.2）：
-      每张卡保持约 320px 以上的舒适宽度；窗口再宽也不会把单张卡拉成巨宽，
-      操作按钮因此始终在视线与鼠标附近，而不是横跨整屏的右上角。
+      最小列宽取 **400px**——卡片头部要在一行内容纳「名称 + 两枚状态标签 +
+      两个操作按钮」，实测需要约 380–400px；取 320px 时第二枚标签会换行、
+      地址也会被过度截断（客户反馈）。
     -->
     <div
       v-else
-      class="grid gap-3 grid-cols-[repeat(auto-fill,minmax(320px,1fr))]"
+      class="grid gap-3 grid-cols-[repeat(auto-fill,minmax(400px,1fr))]"
     >
       <article
         v-for="host in store.hosts"
