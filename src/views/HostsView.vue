@@ -101,7 +101,15 @@ function sudoLabel(policy: string) {
       </BaseButton>
     </EmptyState>
 
-    <div v-else class="grid gap-3">
+    <!--
+      卡片集合用响应式网格（theme-spec §4.2）：
+      每张卡保持约 320px 以上的舒适宽度；窗口再宽也不会把单张卡拉成巨宽，
+      操作按钮因此始终在视线与鼠标附近，而不是横跨整屏的右上角。
+    -->
+    <div
+      v-else
+      class="grid gap-3 grid-cols-[repeat(auto-fill,minmax(320px,1fr))]"
+    >
       <article
         v-for="host in store.hosts"
         :key="host.id"

@@ -99,7 +99,11 @@ async function confirmDelete() {
       </BaseButton>
     </EmptyState>
 
-    <div v-else class="grid gap-3">
+    <!-- 卡片集合用响应式网格，理由见 theme-spec §4.2 与 HostsView 同款注释 -->
+    <div
+      v-else
+      class="grid gap-3 grid-cols-[repeat(auto-fill,minmax(320px,1fr))]"
+    >
       <article
         v-for="cred in store.credentials"
         :key="cred.id"

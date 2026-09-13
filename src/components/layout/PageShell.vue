@@ -4,11 +4,12 @@
  * 统一各页面布局节奏，避免每个页面各自定义标题样式。
  *
  * `width` 决定内容列宽（见 theme-spec.md §4.2）：
- * - `full`（默认）：铺满可用宽度——列表 / 卡片网格 / 左右分栏这类页面需要它；
- * - `narrow`：标题区与内容区**共享一个居中限宽列**。
- *   设置页这类"标签 ↔ 值"表单在宽屏下若铺满，视线要来回横跳；
- *   限宽之后必须**居中**，否则整列会贴着左边、右侧空一大片，看起来没对齐。
- *   注意标题区一起进该列：只居中内容会让标题与卡片分成两条轴线。
+ * - `wide`（默认）：居中限宽 1280px。内容不再随窗口无限拉宽——否则卡片会被撑得
+ *   很空、卡片右上角的操作按钮要横跨整屏才点得到；
+ * - `narrow`：居中限宽 768px，用于设置页这类"标签 ↔ 值"的窄行表单；
+ * - `full`：铺满可用宽度（保留给将来确实需要横向空间的分栏视图）。
+ *
+ * 标题区与内容区**共享同一列**：只居中内容会让标题与卡片分处两条轴线。
  */
 import type { Component } from "vue";
 
@@ -19,16 +20,16 @@ const props = withDefaults(
     title: string;
     subtitle?: string;
     icon?: Component;
-    width?: "full" | "narrow";
+    width?: "narrow" | "wide" | "full";
   }>(),
-  { width: "full" },
+  { width: "wide" },
 );
 
-/** 居中限宽列：与设置页原有的 `max-w-3xl` 保持一致。 */
-const columnClass = cn(
-  "flex min-h-0 flex-1 flex-col",
-  props.width === "narrow" && "mx-auto w-full max-w-3xl",
-);
+/** 内容列宽档位。 */
+const columnClass = cn("flex min-h-0 flex-1 flex-col", {
+  "mx-auto w-full max-w-3xl": props.width === "narrow",
+  "mx-auto w-full max-w-7xl": props.width === "wide",
+});
 </script>
 
 <template>

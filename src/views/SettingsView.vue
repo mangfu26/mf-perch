@@ -25,6 +25,7 @@ import BaseButton from "@/components/ui/BaseButton.vue";
 import BaseInput from "@/components/ui/BaseInput.vue";
 import BaseSwitch from "@/components/ui/BaseSwitch.vue";
 import ConfirmDialog from "@/components/ui/ConfirmDialog.vue";
+import JsonCodeBlock from "@/components/ui/JsonCodeBlock.vue";
 import StatusTag from "@/components/ui/StatusTag.vue";
 import KeySetupDialog from "@/components/settings/KeySetupDialog.vue";
 import { useThemeStore, type ThemeMode } from "@/stores/theme";
@@ -316,10 +317,7 @@ async function confirmRegenerate() {
               {{ copied ? t("common.copied") : t("mcp.copyConfig") }}
             </BaseButton>
           </div>
-          <pre
-            v-if="mcp.clientConfig"
-            class="mt-3 max-h-56 overflow-auto rounded-lg bg-surface-code px-3 py-2.5 font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap break-all text-text-code"
-          >{{ mcp.clientConfig }}</pre>
+          <JsonCodeBlock v-if="mcp.clientConfig" :json="mcp.clientConfig" />
           <p v-else class="mt-2 text-[11.5px] text-text-muted">
             启动 MCP Server 后可复制客户端配置。
           </p>

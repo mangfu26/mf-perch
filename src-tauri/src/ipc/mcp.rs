@@ -113,8 +113,11 @@ pub async fn mcp_client_config(
 }
 
 /// 构造标准 MCP 客户端配置片段。
+///
+/// **输出美化后的 JSON（多行缩进）**：这段文本的用途是被人类读、复制进客户端
+/// 配置文件，紧凑单行既难读、在界面上还会被卡片右缘裁断。
 fn build_client_config(url: &str, token: &str) -> String {
-    serde_json::json!({
+    let config = serde_json::json!({
         "mcpServers": {
             "mf-perch": {
                 "type": "streamable-http",
@@ -124,8 +127,12 @@ fn build_client_config(url: &str, token: &str) -> String {
                 }
             }
         }
-    })
-    .to_string()
+    });
+
+    // 注意：serde_json 只在**自由函数**上提供美化输出，`Value` 没有
+    // `to_string_pretty` 方法。该结构恒可序列化，万一失败也退回紧凑文本，
+    // 保证返回的始终是合法 JSON，绝不 panic。
+    serde_json::to_string_pretty(&config).unwrap_or_else(|_| config.to_string())
 }
 
 #[cfg(test)]
@@ -147,5 +154,15 @@ mod tests {
         let cfg = build_client_config("http://127.0.0.1:50001/mcp", "t");
         let v: serde_json::Value = serde_json::from_str(&cfg).expect("应为合法 JSON");
         assert_eq!(v["mcpServers"]["mf-perch"]["type"], "streamable-http");
+    }
+
+    #[test]
+    fn client_config_is_pretty_printed_for_humans() {
+        // 客户反馈：紧凑单行既难读、界面上还会被卡片右缘裁断。
+        let cfg = build_client_config("http://127.0.0.1:50001/mcp", "t");
+        assert!(
+            cfg.contains('\n') && cfg.contains("  \"mcpServers\""),
+            "配置应为缩进多行，便于阅读与复制：\n{cfg}"
+        );
     }
 }
