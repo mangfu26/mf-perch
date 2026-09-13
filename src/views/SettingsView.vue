@@ -220,8 +220,10 @@ async function confirmRegenerate() {
 </script>
 
 <template>
-  <PageShell :title="t('settings.title')" :icon="Settings">
-    <div class="flex max-w-3xl flex-col gap-6 pb-8">
+  <!-- width="narrow"：设置页整页共享一个居中限宽列（标题与卡片同轴），
+       宽度由 PageShell 统一控制，此处不再自行限宽（见 theme-spec.md §4.2）。 -->
+  <PageShell :title="t('settings.title')" :icon="Settings" width="narrow">
+    <div class="flex flex-col gap-6 pb-8">
       <!-- ============ MCP Server ============ -->
       <section class="rounded-xl border border-border-base bg-surface p-5">
         <div class="mb-4 flex items-center justify-between">
@@ -316,7 +318,7 @@ async function confirmRegenerate() {
           </div>
           <pre
             v-if="mcp.clientConfig"
-            class="mt-3 max-h-56 overflow-auto rounded-lg bg-surface-code px-3 py-2.5 font-mono text-[11.5px] leading-relaxed text-text-code"
+            class="mt-3 max-h-56 overflow-auto rounded-lg bg-surface-code px-3 py-2.5 font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap break-all text-text-code"
           >{{ mcp.clientConfig }}</pre>
           <p v-else class="mt-2 text-[11.5px] text-text-muted">
             启动 MCP Server 后可复制客户端配置。
