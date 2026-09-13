@@ -167,6 +167,14 @@ async function openDownload(url: string) {
   }
 }
 
+/**
+ * 源码仓库地址（关于卡片）。
+ *
+ * 只放这一个外链：**不提供"文档"链接**——本项目没有、也不打算建文档站点
+ * （见 D41），站内也没有可发布的在线文档。若将来改变主意，直接在此追加常量。
+ */
+const REPO_URL = "https://github.com/mangfu26/mf-perch";
+
 const themeOptions: Array<{ value: ThemeMode; labelKey: string }> = [
   { value: "system", labelKey: "settings.themeSystem" },
   { value: "dark", labelKey: "settings.themeDark" },
@@ -595,13 +603,13 @@ async function confirmRegenerate() {
         </details>
 
         <div class="mt-4 flex gap-2 border-t border-border-base pt-4">
-          <BaseButton size="sm" variant="ghost">
+          <BaseButton
+            size="sm"
+            variant="ghost"
+            @click="openDownload(REPO_URL)"
+          >
             <ExternalLink class="h-3.5 w-3.5" />
             {{ t("settings.sourceCode") }}
-          </BaseButton>
-          <BaseButton size="sm" variant="ghost">
-            <ExternalLink class="h-3.5 w-3.5" />
-            {{ t("settings.docs") }}
           </BaseButton>
         </div>
       </section>

@@ -251,7 +251,7 @@ export default {
     about: "关于",
     version: "版本",
     license: "开源许可",
-    docs: "文档",
+    // 刻意没有"文档"一项：本项目不提供文档站点（D41）
     sourceCode: "源码仓库",
     mcpConfigExample: "MCP 客户端配置示例",
     disclaimer: "认证信息与 sudo 密码均由系统级加密保护，AI Agent 无法读取。",
