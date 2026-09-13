@@ -12,6 +12,7 @@ import {
   Power,
   Copy,
   RefreshCw,
+  RotateCcw,
   Eye,
   EyeOff,
   Download,
@@ -154,6 +155,15 @@ watch(
 
 async function saveUpdateSource() {
   await update.setSource(updateSource.value);
+}
+
+/** 恢复内置默认更新源（清空自定义值即为回退，见 D42）。 */
+async function resetUpdateSource() {
+  await update.resetSource();
+  // 输入框同步回显生效值（refresh 后 info.source_url 已是内置默认地址）。
+  if (update.info?.source_url !== undefined) {
+    updateSource.value = update.info.source_url;
+  }
 }
 
 /**
@@ -596,9 +606,25 @@ async function confirmRegenerate() {
             <BaseButton size="sm" @click="saveUpdateSource">
               {{ t("common.save") }}
             </BaseButton>
+            <!-- 内置默认值可被覆盖；「恢复默认」= 清空自定义值（D42） -->
+            <BaseButton
+              size="sm"
+              variant="ghost"
+              :disabled="!update.info?.source_is_custom"
+              :title="t('settings.updateSourceReset')"
+              @click="resetUpdateSource"
+            >
+              <RotateCcw class="h-3.5 w-3.5" />
+            </BaseButton>
           </div>
           <p class="mt-1.5 text-[11px] leading-relaxed text-text-muted">
             {{ t("settings.updateSourceHint") }}
+          </p>
+          <p
+            v-if="update.info && !update.info.source_is_custom"
+            class="mt-1 text-[11px] leading-relaxed text-text-muted"
+          >
+            {{ t("settings.updateSourceUsingDefault") }}
           </p>
         </details>
 

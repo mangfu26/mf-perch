@@ -239,9 +239,11 @@ export default {
     checkUpdate: "检查更新",
     autoCheckUpdate: "启动时自动检查更新",
     updateSource: "更新源地址",
-    updateSourcePlaceholder: "版本清单的 URL（留空则不做自动检查）",
+    updateSourcePlaceholder: "留空即使用内置默认地址",
     updateSourceHint:
-      "指向一个返回 JSON 版本清单的地址。可填入 Gist 的 raw 链接；更换源无需等待新版本。",
+      "指向一个返回 JSON 版本清单的地址。默认已内置官方源，可直接使用；如需换源或指向镜像，在此覆盖即可，无需等待新版本。",
+    updateSourceReset: "恢复默认",
+    updateSourceUsingDefault: "当前使用内置默认地址。",
     updateUpToDate: "已是最新版本",
     updateAvailable: "发现新版本 {version}",
     updateDownload: "前往下载",

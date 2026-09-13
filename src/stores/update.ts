@@ -14,7 +14,10 @@ import { useAppStore } from "./app";
  */
 export interface UpdateInfo {
   current_version: string;
+  /** **生效的**更新源地址（内置默认或用户自定义）。 */
   source_url: string;
+  /** 是否为用户自定义；false 表示正在使用内置默认地址（D42）。 */
+  source_is_custom: boolean;
   auto_check: boolean;
   ignored_version: string | null;
   last_result: UpdateStatus | null;
@@ -106,6 +109,18 @@ export const useUpdateStore = defineStore("update", () => {
     }
   }
 
+  /** 恢复内置默认更新源（清空自定义值即为回退，见 D42）。 */
+  async function resetSource() {
+    try {
+      await call<boolean>("update_set_source", { url: "" });
+      await refresh();
+      app.notify("已恢复内置默认更新源");
+    } catch (e) {
+      app.fail(e);
+      throw e;
+    }
+  }
+
   async function setAutoCheck(enabled: boolean) {
     try {
       await call<boolean>("update_set_auto_check", { enabled });
@@ -127,6 +142,7 @@ export const useUpdateStore = defineStore("update", () => {
     check,
     ignoreVersion,
     setSource,
+    resetSource,
     setAutoCheck,
   };
 });
