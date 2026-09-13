@@ -203,6 +203,8 @@ const confirmWarning = computed(() => {
           class="group cursor-pointer rounded-xl border border-border-base bg-surface p-4 transition-colors hover:bg-surface-hover"
           @click="router.push(`/terminals/${term.id}`)"
         >
+          <!-- 头部行只放「身份 + 导航指示」；状态标签移到元信息行（theme-spec §4.2），
+               头部便不再与标签抢宽度，长终端名也不会被挤到换行 -->
           <div class="flex items-start justify-between gap-3">
             <div class="min-w-0">
               <h3 class="truncate text-[14px] font-semibold">
@@ -212,17 +214,15 @@ const confirmWarning = computed(() => {
                 {{ term.id }} · {{ term.host_name || term.host_id }}
               </p>
             </div>
-            <div class="flex items-center gap-1.5">
-              <StatusTag :tone="statusTone(term.status)">
-                {{ statusLabel(term.status) }}
-              </StatusTag>
-              <ChevronRight
-                class="h-4 w-4 text-text-muted opacity-0 transition-opacity group-hover:opacity-100"
-              />
-            </div>
+            <ChevronRight
+              class="mt-0.5 h-4 w-4 shrink-0 text-text-muted opacity-0 transition-opacity group-hover:opacity-100"
+            />
           </div>
 
           <div class="mt-3 flex flex-wrap items-center gap-2">
+            <StatusTag :tone="statusTone(term.status)">
+              {{ statusLabel(term.status) }}
+            </StatusTag>
             <StatusTag tone="neutral">
               {{ term.command_count }} commands
             </StatusTag>
@@ -240,6 +240,7 @@ const confirmWarning = computed(() => {
                 size="sm"
                 variant="ghost"
                 :title="t('terminal.restore')"
+                :aria-label="t('terminal.restore')"
                 @click="ask(term, 'restore')"
               >
                 <RotateCcw class="h-3.5 w-3.5" />
@@ -249,6 +250,7 @@ const confirmWarning = computed(() => {
                 size="sm"
                 variant="ghost"
                 :title="t('terminal.reconnect')"
+                :aria-label="t('terminal.reconnect')"
                 @click="ask(term, 'reconnect')"
               >
                 <RotateCcw class="h-3.5 w-3.5" />
@@ -258,14 +260,18 @@ const confirmWarning = computed(() => {
                 size="sm"
                 variant="ghost"
                 :title="t('terminal.archive')"
+                :aria-label="t('terminal.archive')"
                 @click="ask(term, 'archive')"
               >
                 <Archive class="h-3.5 w-3.5" />
               </BaseButton>
+              <!-- 删除是破坏性操作：悬停转危险色，与确认弹窗的红色按钮呼应 -->
               <BaseButton
                 size="sm"
                 variant="ghost"
+                tone="danger"
                 :title="t('common.delete')"
+                :aria-label="t('common.delete')"
                 @click="ask(term, 'delete')"
               >
                 <Trash2 class="h-3.5 w-3.5" />

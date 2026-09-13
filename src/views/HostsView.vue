@@ -135,33 +135,50 @@ function sudoLabel(policy: string) {
             </div>
           </div>
 
-          <div class="flex items-center gap-1.5">
-            <div class="flex flex-wrap items-center gap-1.5">
-              <StatusTag :tone="host.has_credential ? 'success' : 'warning'">
-                <KeyRound class="h-3 w-3" />
-                {{
-                  host.has_credential
-                    ? t("host.credential")
-                    : t("host.credentialNone")
-                }}
-              </StatusTag>
-              <StatusTag :tone="host.sudo_policy === 'deny' ? 'neutral' : 'accent'">
-                <ShieldAlert class="h-3 w-3" />
-                {{ sudoLabel(host.sudo_policy) }}
-              </StatusTag>
-            </div>
-            <div class="flex gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-              <BaseButton size="sm" variant="ghost" @click="openEdit(host)">
-                <Pencil class="h-3.5 w-3.5" />
-              </BaseButton>
-              <BaseButton size="sm" variant="ghost" @click="askDelete(host)">
-                <Trash2 class="h-3.5 w-3.5" />
-              </BaseButton>
-            </div>
+          <!--
+            操作按钮独占右上角，**不与标签抢同一行**（theme-spec §4.2）：
+            早先把两枚标签也塞在这一行，头部所需宽度涨到 ~455px，
+            卡片一窄（例如两列布局时约 407px）第二枚标签就被挤到换行。
+            删除用 tone="danger"：悬停转危险色，与确认弹窗的红色按钮连成一致的语义链。
+          -->
+          <div class="flex shrink-0 gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+            <BaseButton
+              size="sm"
+              variant="ghost"
+              tone="accent"
+              :title="t('host.edit')"
+              :aria-label="t('host.edit')"
+              @click="openEdit(host)"
+            >
+              <Pencil class="h-3.5 w-3.5" />
+            </BaseButton>
+            <BaseButton
+              size="sm"
+              variant="ghost"
+              tone="danger"
+              :title="t('common.delete')"
+              :aria-label="t('common.delete')"
+              @click="askDelete(host)"
+            >
+              <Trash2 class="h-3.5 w-3.5" />
+            </BaseButton>
           </div>
         </div>
 
-        <div class="mt-3 flex items-center gap-2">
+        <!-- 元信息行：状态标签与计数并排，允许换行（空间不足时整行下移，不挤压头部） -->
+        <div class="mt-3 flex flex-wrap items-center gap-1.5">
+          <StatusTag :tone="host.has_credential ? 'success' : 'warning'">
+            <KeyRound class="h-3 w-3" />
+            {{
+              host.has_credential
+                ? t("host.credential")
+                : t("host.credentialNone")
+            }}
+          </StatusTag>
+          <StatusTag :tone="host.sudo_policy === 'deny' ? 'neutral' : 'accent'">
+            <ShieldAlert class="h-3 w-3" />
+            {{ sudoLabel(host.sudo_policy) }}
+          </StatusTag>
           <StatusTag tone="info">
             {{ t("host.activeTerminals") }} {{ host.active_terminals }}
           </StatusTag>
