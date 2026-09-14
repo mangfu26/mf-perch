@@ -753,3 +753,35 @@
 - **验证**：用应用自身的抓取代码实测客户 Gist——200、可解析、平台键
   `windows-x86_64` 存在、首发场景判定为 `UpToDate{0.1.0, 0.1.0}`（不误报更新）。
 - **相关**：D23（更新检查机制）、Q34（客户选 Gist）。
+
+---
+
+## D43 — 首发前修正三处 MCP 契约问题
+
+- **日期**：2026-09-12
+- **决策**（客户确认"首发前修"）：
+  1. **异步工具不再接受 `wait_seconds`**：新增 `RunCommandAsyncParams`，
+     异步工具只要求 `terminal_id` + `command`；
+  2. **`run_command.wait_seconds` 把上限写进 schema**：`anyOf` 内声明
+     `minimum: 0` / `maximum: 50`（此前只写在描述文字里）；
+  3. **删除 `error.rs` 中未被使用的 `ErrorPayload{code, message}`**，
+     保留线上形状 `{error, code}`。
+- **背景**：团队自查 MCP 工具契约时发现三处问题（详见
+  [`docs/mcp-tools.md`](mcp-tools.md) §5），客户核对该文档后要求首发前修：
+  - ① 契约与实现不符：异步模式立即返回，schema 却暴露"等待秒数"；
+  - ② 约束只写在自然语言里：客户端按 schema 校验会放行 `wait_seconds: 999`，
+    实现却静默夹到 50——"机器可读的约束才算约束"；
+  - ③ 两份错误形状并存（死代码 vs 线上形状），是给后来者挖坑。
+- **实现要点**：② 用**手写 schema**（`WaitSecondsSchema`）而非 derive 属性——
+  schemars 1.x 的 `range` 在当前依赖组合下报 `unknown schemars attribute`（实测）；
+  schema 里的 50 与实现常量由单测 `wait_seconds_schema_declares_maximum` 比对，
+  改一边忘另一边会立刻变红。
+- **影响**：
+  - `mcp/tools.rs`：`run_command_impl` 改为收 `terminal_id` / `command` / `wait`，
+    两个工具各自持有入参结构；新增 2 项 schema 单测
+    （`async_tool_does_not_expose_wait_seconds`、`wait_seconds_schema_declares_maximum`）；
+  - `error.rs`：删除死代码，并在原处留注释说明取舍；
+  - `docs/mcp-tools.md` §3.4 / §3.5 / §5 同步更新。
+- **兼容性**：异步工具若仍传 `wait_seconds` 会被 serde 忽略（不影响调用）；
+  `run_command` 的入参形状与返回结构**未变**。
+- **相关**：D32（可空参数用 anyOf）、D1（rmcp）、Q4（同步/异步双模式）。
