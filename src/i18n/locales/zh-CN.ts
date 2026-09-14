@@ -239,9 +239,11 @@ export default {
     checkUpdate: "检查更新",
     autoCheckUpdate: "启动时自动检查更新",
     updateSource: "更新源地址",
-    updateSourcePlaceholder: "版本清单的 URL（留空则不做自动检查）",
+    updateSourcePlaceholder: "留空即使用内置默认地址",
     updateSourceHint:
-      "指向一个返回 JSON 版本清单的地址。可填入 Gist 的 raw 链接；更换源无需等待新版本。",
+      "指向一个返回 JSON 版本清单的地址。默认已内置官方源，可直接使用；如需换源或指向镜像，在此覆盖即可，无需等待新版本。",
+    updateSourceReset: "恢复默认",
+    updateSourceUsingDefault: "当前使用内置默认地址。",
     updateUpToDate: "已是最新版本",
     updateAvailable: "发现新版本 {version}",
     updateDownload: "前往下载",
@@ -251,7 +253,7 @@ export default {
     about: "关于",
     version: "版本",
     license: "开源许可",
-    docs: "文档",
+    // 刻意没有"文档"一项：本项目不提供文档站点（D41）
     sourceCode: "源码仓库",
     mcpConfigExample: "MCP 客户端配置示例",
     disclaimer: "认证信息与 sudo 密码均由系统级加密保护，AI Agent 无法读取。",

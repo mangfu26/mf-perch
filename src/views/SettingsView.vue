@@ -12,6 +12,7 @@ import {
   Power,
   Copy,
   RefreshCw,
+  RotateCcw,
   Eye,
   EyeOff,
   Download,
@@ -25,6 +26,7 @@ import BaseButton from "@/components/ui/BaseButton.vue";
 import BaseInput from "@/components/ui/BaseInput.vue";
 import BaseSwitch from "@/components/ui/BaseSwitch.vue";
 import ConfirmDialog from "@/components/ui/ConfirmDialog.vue";
+import JsonCodeBlock from "@/components/ui/JsonCodeBlock.vue";
 import StatusTag from "@/components/ui/StatusTag.vue";
 import KeySetupDialog from "@/components/settings/KeySetupDialog.vue";
 import { useThemeStore, type ThemeMode } from "@/stores/theme";
@@ -155,6 +157,15 @@ async function saveUpdateSource() {
   await update.setSource(updateSource.value);
 }
 
+/** 恢复内置默认更新源（清空自定义值即为回退，见 D42）。 */
+async function resetUpdateSource() {
+  await update.resetSource();
+  // 输入框同步回显生效值（refresh 后 info.source_url 已是内置默认地址）。
+  if (update.info?.source_url !== undefined) {
+    updateSource.value = update.info.source_url;
+  }
+}
+
 /**
  * 打开下载页（D23：不自动打开浏览器，仅由用户点击触发）。
  */
@@ -165,6 +176,14 @@ async function openDownload(url: string) {
     app.fail(e);
   }
 }
+
+/**
+ * 源码仓库地址（关于卡片）。
+ *
+ * 只放这一个外链：**不提供"文档"链接**——本项目没有、也不打算建文档站点
+ * （见 D41），站内也没有可发布的在线文档。若将来改变主意，直接在此追加常量。
+ */
+const REPO_URL = "https://github.com/mangfu26/mf-perch";
 
 const themeOptions: Array<{ value: ThemeMode; labelKey: string }> = [
   { value: "system", labelKey: "settings.themeSystem" },
@@ -220,8 +239,10 @@ async function confirmRegenerate() {
 </script>
 
 <template>
-  <PageShell :title="t('settings.title')" :icon="Settings">
-    <div class="flex max-w-3xl flex-col gap-6 pb-8">
+  <!-- width="narrow"：设置页整页共享一个居中限宽列（标题与卡片同轴），
+       宽度由 PageShell 统一控制，此处不再自行限宽（见 theme-spec.md §4.2）。 -->
+  <PageShell :title="t('settings.title')" :icon="Settings" width="narrow">
+    <div class="flex flex-col gap-6 pb-8">
       <!-- ============ MCP Server ============ -->
       <section class="rounded-xl border border-border-base bg-surface p-5">
         <div class="mb-4 flex items-center justify-between">
@@ -314,10 +335,7 @@ async function confirmRegenerate() {
               {{ copied ? t("common.copied") : t("mcp.copyConfig") }}
             </BaseButton>
           </div>
-          <pre
-            v-if="mcp.clientConfig"
-            class="mt-3 max-h-56 overflow-auto rounded-lg bg-surface-code px-3 py-2.5 font-mono text-[11.5px] leading-relaxed text-text-code"
-          >{{ mcp.clientConfig }}</pre>
+          <JsonCodeBlock v-if="mcp.clientConfig" :json="mcp.clientConfig" />
           <p v-else class="mt-2 text-[11.5px] text-text-muted">
             启动 MCP Server 后可复制客户端配置。
           </p>
@@ -588,20 +606,36 @@ async function confirmRegenerate() {
             <BaseButton size="sm" @click="saveUpdateSource">
               {{ t("common.save") }}
             </BaseButton>
+            <!-- 内置默认值可被覆盖；「恢复默认」= 清空自定义值（D42） -->
+            <BaseButton
+              size="sm"
+              variant="ghost"
+              :disabled="!update.info?.source_is_custom"
+              :title="t('settings.updateSourceReset')"
+              @click="resetUpdateSource"
+            >
+              <RotateCcw class="h-3.5 w-3.5" />
+            </BaseButton>
           </div>
           <p class="mt-1.5 text-[11px] leading-relaxed text-text-muted">
             {{ t("settings.updateSourceHint") }}
           </p>
+          <p
+            v-if="update.info && !update.info.source_is_custom"
+            class="mt-1 text-[11px] leading-relaxed text-text-muted"
+          >
+            {{ t("settings.updateSourceUsingDefault") }}
+          </p>
         </details>
 
         <div class="mt-4 flex gap-2 border-t border-border-base pt-4">
-          <BaseButton size="sm" variant="ghost">
+          <BaseButton
+            size="sm"
+            variant="ghost"
+            @click="openDownload(REPO_URL)"
+          >
             <ExternalLink class="h-3.5 w-3.5" />
             {{ t("settings.sourceCode") }}
-          </BaseButton>
-          <BaseButton size="sm" variant="ghost">
-            <ExternalLink class="h-3.5 w-3.5" />
-            {{ t("settings.docs") }}
           </BaseButton>
         </div>
       </section>

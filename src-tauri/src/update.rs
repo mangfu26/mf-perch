@@ -120,17 +120,39 @@ pub enum UpdateStatus {
     },
 }
 
-/// 默认更新源地址。
+/// 内置默认更新源地址（客户维护的 Gist 清单）。
 ///
-/// 客户尚未提供 Gist 地址，因此默认置空：此时检查会明确返回
-/// "未配置更新源"，而不是静默无反应（P1：明确报错）。
-pub const DEFAULT_SOURCE_URL: &str = "";
+/// 设计取舍（D42）：
+/// - **默认可用**：以前默认留空，用户既不知道地址、自动检查也从不生效，
+///   等于"更新功能默认不存在"。现在内置一个默认值，开箱即可检查；
+/// - **仍可覆盖**：设置页可改成镜像或其它源（客户要求保留灵活性）；
+/// - **用不带修订号的 raw 地址**：
+///   `.../raw/<文件名>` 而不是 `.../raw/<一长串SHA>/<文件名>`。
+///   前者始终返回最新修订，因此**只改 Gist 内容就能让所有用户收到更新**；
+///   后者钉死在某一版，改了 Gist 老用户永远看不到（实测两种形式都返回 200、
+///   不跳转，所以这里选前者）；
+/// - 代价：**改这个默认值需要发新版**——地址真要变时，老版本用户需手动改设置，
+///   这正是保留可编辑入口的价值。
+pub const DEFAULT_SOURCE_URL: &str =
+    "https://gist.githubusercontent.com/mangfu26/311c09b123911b6a4860483a645a4eb0/raw/mf-perch-update.json";
 
-/// 读取更新源地址（可配置）。
+/// 读取**生效的**更新源地址。
+///
+/// 用户配置为空（未设置或已清空）时回退到 [`DEFAULT_SOURCE_URL`]。
 pub fn source_url(conn: &Connection) -> Result<String> {
     Ok(db::get_setting(conn, SETTING_SOURCE_URL)?
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_SOURCE_URL.to_string()))
+}
+
+/// 用户是否**自定义**过更新源（false 表示正在使用内置默认值）。
+///
+/// 界面据此显示"当前使用内置默认地址"，并决定「恢复默认」是否需要提示。
+/// 刻意不把默认地址复制到前端：地址只在 Rust 侧维护一处（单一事实来源）。
+pub fn source_is_custom(conn: &Connection) -> Result<bool> {
+    Ok(db::get_setting(conn, SETTING_SOURCE_URL)?
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false))
 }
 
 pub fn set_source_url(conn: &Connection, url: &str) -> Result<()> {
@@ -561,8 +583,47 @@ mod tests {
     }
 
     #[test]
-    fn source_url_defaults_to_empty_when_unset() {
+    fn source_url_falls_back_to_builtin_default() {
+        // D42：未配置时也应有一个可用的更新源，否则更新功能默认等于不存在。
         let conn = mem_conn();
+        assert_eq!(source_url(&conn).unwrap(), DEFAULT_SOURCE_URL);
+        assert!(
+            DEFAULT_SOURCE_URL.starts_with("https://"),
+            "内置默认必须是 https：{DEFAULT_SOURCE_URL}"
+        );
+        assert!(!source_is_custom(&conn).unwrap(), "默认值不算自定义");
+    }
+
+    #[test]
+    fn builtin_default_uses_unpinned_raw_url() {
+        // 关键：raw 地址**不带修订号（SHA）**，这样只改 Gist 内容即可让所有用户
+        // 收到更新；带 SHA 的形式会钉死在某一版（客户实测时给的就是带 SHA 的）。
+        let raw = DEFAULT_SOURCE_URL
+            .split("/raw/")
+            .nth(1)
+            .expect("默认地址应包含 /raw/");
+        assert_eq!(
+            raw.matches('/').count(),
+            0,
+            "raw 之后应直接是文件名，不应再有一层修订号目录：{DEFAULT_SOURCE_URL}"
+        );
+        assert!(raw.ends_with(".json"), "应指向清单文件：{raw}");
+    }
+
+    #[test]
+    fn custom_source_is_reported_as_custom() {
+        let conn = mem_conn();
+        set_source_url(&conn, "https://mirror.example.com/m.json").unwrap();
+        assert!(source_is_custom(&conn).unwrap());
+        assert_eq!(
+            source_url(&conn).unwrap(),
+            "https://mirror.example.com/m.json",
+            "自定义值应覆盖默认"
+        );
+
+        // 清空后回到默认（「恢复默认」正是这么实现的）。
+        set_source_url(&conn, "").unwrap();
+        assert!(!source_is_custom(&conn).unwrap());
         assert_eq!(source_url(&conn).unwrap(), DEFAULT_SOURCE_URL);
     }
 
@@ -576,7 +637,6 @@ mod tests {
         set_source_url(&conn, "   ").unwrap();
         assert_eq!(source_url(&conn).unwrap(), DEFAULT_SOURCE_URL);
     }
-
     #[tokio::test]
     async fn fetch_rejects_empty_url_with_clear_reason() {
         let err = fetch_manifest("").await.unwrap_err();

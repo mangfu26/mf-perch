@@ -17,8 +17,10 @@ use super::IpcResult;
 pub struct UpdateInfo {
     /// 当前应用版本。
     pub current_version: String,
-    /// 更新源地址（可能为空，表示未配置）。
+    /// 更新源地址（**生效值**：内置默认或用户自定义）。
     pub source_url: String,
+    /// 该地址是否由用户自定义；`false` 表示正在使用内置默认值（D42）。
+    pub source_is_custom: bool,
     /// 是否启用启动时自动检查。
     pub auto_check: bool,
     /// 用户忽略的版本。
@@ -32,6 +34,7 @@ async fn info_inner(state: &AppState) -> crate::error::Result<UpdateInfo> {
     Ok(UpdateInfo {
         current_version: update::current_version(),
         source_url: update::source_url(&conn)?,
+        source_is_custom: update::source_is_custom(&conn)?,
         auto_check: update::auto_check_enabled(&conn)?,
         ignored_version: update::ignored_version(&conn)?,
         last_result: update::cached_result(&conn)?,

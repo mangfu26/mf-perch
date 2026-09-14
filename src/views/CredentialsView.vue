@@ -99,7 +99,11 @@ async function confirmDelete() {
       </BaseButton>
     </EmptyState>
 
-    <div v-else class="grid gap-3">
+    <!-- 卡片集合用响应式网格，最小列宽 400px，理由见 theme-spec §4.2 与 HostsView 注释 -->
+    <div
+      v-else
+      class="grid gap-3 grid-cols-[repeat(auto-fill,minmax(400px,1fr))]"
+    >
       <article
         v-for="cred in store.credentials"
         :key="cred.id"
@@ -115,22 +119,28 @@ async function confirmDelete() {
             </p>
           </div>
 
-          <div class="flex items-center gap-1.5">
-            <StatusTag :tone="cred.kind === 'key' ? 'accent' : 'info'">
-              {{
-                cred.kind === "key"
-                  ? t("credential.kindKey")
-                  : t("credential.kindPassword")
-              }}
-            </StatusTag>
-            <div class="flex gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-              <BaseButton size="sm" variant="ghost" @click="openEdit(cred)">
-                <Pencil class="h-3.5 w-3.5" />
-              </BaseButton>
-              <BaseButton size="sm" variant="ghost" @click="askDelete(cred)">
-                <Trash2 class="h-3.5 w-3.5" />
-              </BaseButton>
-            </div>
+          <!-- 操作按钮独占右上角，不与标签同行（theme-spec §4.2）；删除悬停转危险色 -->
+          <div class="flex shrink-0 gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+            <BaseButton
+              size="sm"
+              variant="ghost"
+              tone="accent"
+              :title="t('credential.edit')"
+              :aria-label="t('credential.edit')"
+              @click="openEdit(cred)"
+            >
+              <Pencil class="h-3.5 w-3.5" />
+            </BaseButton>
+            <BaseButton
+              size="sm"
+              variant="ghost"
+              tone="danger"
+              :title="t('common.delete')"
+              :aria-label="t('common.delete')"
+              @click="askDelete(cred)"
+            >
+              <Trash2 class="h-3.5 w-3.5" />
+            </BaseButton>
           </div>
         </div>
 
@@ -143,7 +153,15 @@ async function confirmDelete() {
           <span class="truncate font-mono text-[11.5px]">{{ cred.fingerprint }}</span>
         </div>
 
+        <!-- 元信息行：认证方式标签与其余信息并排（标签不再与操作按钮抢头部那一行） -->
         <div class="mt-3 flex flex-wrap items-center gap-2">
+          <StatusTag :tone="cred.kind === 'key' ? 'accent' : 'info'">
+            {{
+              cred.kind === "key"
+                ? t("credential.kindKey")
+                : t("credential.kindPassword")
+            }}
+          </StatusTag>
           <StatusTag v-if="cred.has_passphrase" tone="warning">
             {{ t("credential.passphrase") }}
           </StatusTag>
