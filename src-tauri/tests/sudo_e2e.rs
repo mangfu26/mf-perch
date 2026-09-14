@@ -40,14 +40,28 @@ struct Target {
     sudo_password: String,
 }
 
-fn target() -> Option<Target> {
-    Some(Target {
-        address: std::env::var("MFPERCH_TEST_HOST").ok()?,
-        port: std::env::var("MFPERCH_TEST_PORT").ok()?.parse().ok()?,
-        username: std::env::var("MFPERCH_TEST_USER").ok()?,
-        key_pem: std::fs::read_to_string(std::env::var("MFPERCH_TEST_KEY").ok()?).ok()?,
-        sudo_password: std::env::var("MFPERCH_TEST_SUDO_PW").ok()?,
-    })
+/// 读取测试目标。
+///
+/// **缺失即失败**（AGENTS.md §5.6）：这里直接 `panic!`，而不是返回 `Option`
+/// 让调用方 `return` 跳过——静默跳过会让测试报告显示"通过"，
+/// 而实际一条断言都没执行（绿灯假象）。需要跳过时请用 `#[ignore]` 表达。
+fn target() -> Target {
+    fn need(key: &str) -> String {
+        std::env::var(key).unwrap_or_else(|_| {
+            panic!("未设置环境变量 {key}；联调环境准备见 docs/design/test-environment.md")
+        })
+    }
+
+    Target {
+        address: need("MFPERCH_TEST_HOST"),
+        port: need("MFPERCH_TEST_PORT")
+            .parse()
+            .expect("MFPERCH_TEST_PORT 应为端口号"),
+        username: need("MFPERCH_TEST_USER"),
+        key_pem: std::fs::read_to_string(need("MFPERCH_TEST_KEY"))
+            .expect("读取测试私钥失败：确认 MFPERCH_TEST_KEY 指向可读文件"),
+        sudo_password: need("MFPERCH_TEST_SUDO_PW"),
+    }
 }
 
 fn test_state() -> (Arc<AppState>, [u8; 32]) {
@@ -111,10 +125,7 @@ async fn collect(
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
 async fn deny_mode_makes_sudo_fail() {
-    let Some(t) = target() else {
-        eprintln!("跳过：未设置 MFPERCH_TEST_HOST / PORT / USER / KEY / SUDO_PW");
-        return;
-    };
+    let t = target();
 
     let (state, key) = test_state();
     let host_id = seed_host(&state, &key, &t, SudoPolicy::Deny).await;
@@ -158,9 +169,7 @@ async fn deny_mode_makes_sudo_fail() {
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
 async fn auto_mode_injects_password_and_succeeds() {
-    let Some(t) = target() else {
-        return;
-    };
+    let t = target();
 
     let (state, key) = test_state();
     let host_id = seed_host(&state, &key, &t, SudoPolicy::Auto).await;
@@ -201,9 +210,7 @@ async fn auto_mode_injects_password_and_succeeds() {
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
 async fn ask_mode_with_allow_succeeds() {
-    let Some(t) = target() else {
-        return;
-    };
+    let t = target();
 
     let (state, key) = test_state();
     let host_id = seed_host(&state, &key, &t, SudoPolicy::Ask).await;
@@ -256,9 +263,7 @@ async fn ask_mode_with_allow_succeeds() {
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
 async fn ask_mode_with_deny_fails_and_keeps_queue_alive() {
-    let Some(t) = target() else {
-        return;
-    };
+    let t = target();
 
     let (state, key) = test_state();
     let host_id = seed_host(&state, &key, &t, SudoPolicy::Ask).await;
@@ -324,9 +329,7 @@ async fn ask_mode_with_deny_fails_and_keeps_queue_alive() {
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
 async fn ask_mode_does_not_prompt_for_non_sudo_commands() {
-    let Some(t) = target() else {
-        return;
-    };
+    let t = target();
 
     let (state, key) = test_state();
     let host_id = seed_host(&state, &key, &t, SudoPolicy::Ask).await;
@@ -378,9 +381,7 @@ async fn ask_mode_does_not_prompt_for_non_sudo_commands() {
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
 async fn sudo_password_never_lands_in_a_regular_file() {
-    let Some(t) = target() else {
-        return;
-    };
+    let t = target();
 
     let (state, key) = test_state();
     let host_id = seed_host(&state, &key, &t, SudoPolicy::Auto).await;
@@ -488,9 +489,7 @@ async fn sudo_password_never_lands_in_a_regular_file() {
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
 async fn concurrent_sudo_requests_do_not_cross_route() {
-    let Some(t) = target() else {
-        return;
-    };
+    let t = target();
 
     let (state, key) = test_state();
     let host_id = seed_host(&state, &key, &t, SudoPolicy::Ask).await;

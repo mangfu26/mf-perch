@@ -1,5 +1,3 @@
-use serde::{Deserialize, Serialize};
-
 /// 应用统一错误类型。
 ///
 /// 面向 MCP / IPC 的返回需要可读的中文原因，因此每个变体都携带足够上下文，
@@ -99,18 +97,8 @@ impl AppError {
 
 pub type Result<T> = std::result::Result<T, AppError>;
 
-/// 面向 MCP 工具的结构化错误返回。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ErrorPayload {
-    pub code: String,
-    pub message: String,
-}
-
-impl From<&AppError> for ErrorPayload {
-    fn from(e: &AppError) -> Self {
-        Self {
-            code: e.code().to_string(),
-            message: e.to_string(),
-        }
-    }
-}
+// 说明（D43）：这里曾有一个 `ErrorPayload { code, message }` 结构，
+// 但从未被任何代码使用，而 MCP 工具实际返回的是 `{ error, code }`
+// （见 `mcp/tools.rs` 的 `ToolError`）。两份"错误形状"并存的后果是：
+// 后来者可能照抄那份没被使用的，从而与线上契约不一致。
+// 已删除未使用者，保留线上形状 —— 契约以 `docs/mcp-tools.md` 为准。

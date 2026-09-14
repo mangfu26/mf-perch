@@ -20,17 +20,27 @@ use mf_perch_lib::domain::host::{Host, ShellEnvMode, SudoPasswordSource, SudoPol
 use mf_perch_lib::ssh::auth::AuthMethod;
 use mf_perch_lib::ssh::{Session, SessionOutput};
 
-/// 从环境变量读取测试目标；缺失时返回 `None`（测试跳过）。
-fn test_target() -> Option<(Host, AuthMethod)> {
-    let address = std::env::var("MFPERCH_TEST_HOST").ok()?;
-    let port: u16 = std::env::var("MFPERCH_TEST_PORT")
-        .ok()?
-        .parse()
-        .ok()?;
-    let username = std::env::var("MFPERCH_TEST_USER").ok()?;
-    let key_path = std::env::var("MFPERCH_TEST_KEY").ok()?;
+/// 从环境变量读取测试目标。
+///
+/// **缺失即失败**（AGENTS.md §5.6）：直接 `panic!` 而不是返回 `None` 让调用方
+/// `return` 跳过——静默跳过会让报告显示"通过"而实际没跑任何断言。
+/// 需要跳过时请用 `#[ignore]` 表达。
+fn test_target() -> (Host, AuthMethod) {
+    fn need(key: &str) -> String {
+        std::env::var(key).unwrap_or_else(|_| {
+            panic!("未设置环境变量 {key}；联调环境准备见 docs/design/test-environment.md")
+        })
+    }
 
-    let private_key_pem = std::fs::read_to_string(&key_path).ok()?;
+    let address = need("MFPERCH_TEST_HOST");
+    let port: u16 = need("MFPERCH_TEST_PORT")
+        .parse()
+        .expect("MFPERCH_TEST_PORT 应为端口号");
+    let username = need("MFPERCH_TEST_USER");
+    let key_path = need("MFPERCH_TEST_KEY");
+
+    let private_key_pem = std::fs::read_to_string(&key_path)
+        .expect("读取测试私钥失败：确认 MFPERCH_TEST_KEY 指向可读文件");
 
     let mut host = Host::new(address, port);
     host.name = Some("integration test host".into());
@@ -44,7 +54,7 @@ fn test_target() -> Option<(Host, AuthMethod)> {
         passphrase: None,
     };
 
-    Some((host, auth))
+    (host, auth)
 }
 
 /// 等待并收集某个序号命令的输出，直到收到结束标记或超时。
@@ -83,10 +93,7 @@ async fn wait_for_command(
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 环境变量后以 --ignored 运行"]
 async fn connect_and_execute_simple_command() {
-    let Some((host, auth)) = test_target() else {
-        eprintln!("跳过：未设置 MFPERCH_TEST_HOST / PORT / USER / KEY");
-        return;
-    };
+    let (host, auth) = test_target();
 
     let (session, mut rx) = Session::connect("term_test", &host, auth, false)
         .await
@@ -107,9 +114,7 @@ async fn connect_and_execute_simple_command() {
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 环境变量后以 --ignored 运行"]
 async fn session_preserves_cwd_and_env() {
-    let Some((host, auth)) = test_target() else {
-        return;
-    };
+    let (host, auth) = test_target();
 
     let (session, mut rx) = Session::connect("term_state", &host, auth, false)
         .await
@@ -150,9 +155,7 @@ async fn session_preserves_cwd_and_env() {
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 环境变量后以 --ignored 运行"]
 async fn session_reports_nonzero_exit_code() {
-    let Some((host, auth)) = test_target() else {
-        return;
-    };
+    let (host, auth) = test_target();
 
     let (session, mut rx) = Session::connect("term_rc", &host, auth, false)
         .await
@@ -175,9 +178,7 @@ async fn session_reports_nonzero_exit_code() {
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 环境变量后以 --ignored 运行"]
 async fn session_handles_quoting_and_special_chars() {
-    let Some((host, auth)) = test_target() else {
-        return;
-    };
+    let (host, auth) = test_target();
 
     let (session, mut rx) = Session::connect("term_quote", &host, auth, false)
         .await
@@ -200,9 +201,7 @@ async fn session_handles_quoting_and_special_chars() {
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 环境变量后以 --ignored 运行"]
 async fn session_is_not_confused_by_marker_like_output() {
-    let Some((host, auth)) = test_target() else {
-        return;
-    };
+    let (host, auth) = test_target();
 
     let (session, mut rx) = Session::connect("term_spoof", &host, auth, false)
         .await

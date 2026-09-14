@@ -66,6 +66,47 @@ impl<T: JsonSchema> JsonSchema for Nullable<T> {
     }
 }
 
+/// `run_command.wait_seconds` 的 JSON Schema：可空 + 上下限（①②）。
+///
+/// 手写而非用 derive 属性：schemars 1.x 的 `range` 在本 crate 组合下报
+/// `unknown schemars attribute`（实测），而"把上限写进机器可读的 schema"
+/// 正是本次修复的要点——实现的 `min(MAX_WAIT_SECS)` 静默夹紧必须与 schema 一致。
+///
+/// 数值 50 与 [`MAX_WAIT_SECS`] 的一致性由单测 `wait_seconds_schema_declares_maximum`
+/// 守住：谁改了一边而忘了另一边，测试立刻变红。
+struct WaitSecondsSchema;
+
+impl JsonSchema for WaitSecondsSchema {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "WaitSeconds".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        "WaitSeconds".into()
+    }
+
+    fn json_schema(_generator: &mut rmcp::schemars::SchemaGenerator) -> rmcp::schemars::Schema {
+        rmcp::schemars::json_schema!({
+            "anyOf": [
+                {
+                    "type": "integer",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "maximum": 50
+                },
+                { "type": "null" }
+            ],
+            "default": null,
+            "description": "Seconds to wait synchronously before returning a handle. \
+                            Defaults to 30, maximum 50. Use `run_command_async` for long tasks."
+        })
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EmptyParams {}
 
@@ -94,8 +135,21 @@ pub struct RunCommandParams {
     /// Seconds to wait synchronously before returning a handle.
     /// Defaults to 30, maximum 50. Use `run_command_async` for long tasks.
     #[serde(default)]
-    #[schemars(with = "Nullable<u64>")]
+    #[schemars(with = "WaitSecondsSchema")]
     pub wait_seconds: Option<u64>,
+}
+
+/// 异步执行的入参。
+///
+/// **刻意不含 `wait_seconds`**：异步模式立即返回句柄，该参数会被直接忽略。
+/// 此前两个工具共用同一个入参结构，于是"等待秒数"出现在异步工具的 schema 里、
+/// 描述里还写着"长任务请用 run_command_async"——自相矛盾，容易误导 Agent（①）。
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunCommandAsyncParams {
+    /// Terminal ID to run the command on.
+    pub terminal_id: String,
+    /// The shell command to execute.
+    pub command: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -275,7 +329,10 @@ impl McpService {
         let wait = Some(std::time::Duration::from_secs(
             p.wait_seconds.unwrap_or(DEFAULT_WAIT_SECS).min(MAX_WAIT_SECS),
         ));
-        match self.run_command_impl(p, wait).await {
+        match self
+            .run_command_impl(&p.terminal_id, &p.command, wait)
+            .await
+        {
             Ok(v) => json_result(&v),
             Err(e) => Ok(error_result(&e)),
         }
@@ -296,9 +353,13 @@ impl McpService {
     )]
     async fn run_command_async(
         &self,
-        Parameters(p): Parameters<RunCommandParams>,
+        Parameters(p): Parameters<RunCommandAsyncParams>,
     ) -> Result<CallToolResult, McpError> {
-        match self.run_command_impl(p, None).await {
+        // 异步模式：立即返回句柄，不等待（入参里也就没有 wait_seconds）。
+        match self
+            .run_command_impl(&p.terminal_id, &p.command, None)
+            .await
+        {
             Ok(v) => json_result(&v),
             Err(e) => Ok(error_result(&e)),
         }
@@ -436,29 +497,27 @@ impl McpService {
 
     async fn run_command_impl(
         &self,
-        p: RunCommandParams,
+        terminal_id: &str,
+        command: &str,
         wait: Option<std::time::Duration>,
     ) -> Result<crate::terminal::RunOutcome, AppError> {
         // 归档终端的命令必须被拒绝，且给出可区分的原因。
         {
             let conn = self.state.db.lock().await;
-            let t = terminals::get(&conn, &p.terminal_id)?;
+            let t = terminals::get(&conn, terminal_id)?;
             if t.status == TerminalStatus::Archived {
-                return Err(AppError::TerminalArchived(p.terminal_id.clone()));
+                return Err(AppError::TerminalArchived(terminal_id.to_string()));
             }
         }
 
         // 会话已断开（应用重启、网络中断）时**按需重建**（D39）：
         // 断开的成因是人类重启或网络，不该让 Agent 先去发现再处理。
-        let reconnected = self
-            .state
-            .ensure_terminal_session(&p.terminal_id)
-            .await?;
+        let reconnected = self.state.ensure_terminal_session(terminal_id).await?;
 
         let mut outcome = self
             .state
             .terminals
-            .run_command(&self.state.db, &p.terminal_id, &p.command, wait)
+            .run_command(&self.state.db, terminal_id, command, wait)
             .await?;
 
         // 明确告知 Agent：这条命令跑在**全新**的 shell 上，状态已重置。
@@ -712,8 +771,79 @@ mod tests {
         assert_nullable_anyof("create_terminal", "name", "string");
         assert_nullable_anyof("list_terminals", "host_id", "string");
         assert_nullable_anyof("run_command", "wait_seconds", "integer");
-        assert_nullable_anyof("run_command_async", "wait_seconds", "integer");
         assert_nullable_anyof("get_command_status", "tail_lines", "integer");
+    }
+
+    #[test]
+    fn async_tool_does_not_expose_wait_seconds() {
+        // ①：异步工具立即返回句柄，wait_seconds 会被忽略。
+        // 此前两个工具共用入参结构，于是"等待秒数"出现在异步工具的 schema 里，
+        // Agent 可能以为它真的会等——契约与实现不符。
+        let router = McpService::tool_router();
+        let def = router
+            .get("run_command_async")
+            .expect("应有 run_command_async");
+
+        assert!(
+            def.input_schema["properties"].get("wait_seconds").is_none(),
+            "异步工具的入参不应包含 wait_seconds：{:?}",
+            def.input_schema
+        );
+
+        let required: Vec<String> = def.input_schema["required"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            required,
+            vec!["terminal_id".to_string(), "command".to_string()],
+            "异步工具只应要求 terminal_id 与 command"
+        );
+
+        // 便于人工/排查时核对（默认被测试框架捕获，`--nocapture` 可见）。
+        println!(
+            "run_command_async 入参 schema：{}",
+            serde_json::to_string_pretty(&def.input_schema).unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn wait_seconds_schema_declares_maximum() {
+        // ②：实现会把 wait_seconds 夹紧到 MAX_WAIT_SECS，schema 必须把这个上限
+        // 写进机器可读层面——只写在描述文字里，客户端校验时会放行 999。
+        let router = McpService::tool_router();
+        let def = router.get("run_command").expect("应有 run_command");
+        let prop = &def.input_schema["properties"]["wait_seconds"];
+
+        let integer = prop["anyOf"]
+            .as_array()
+            .and_then(|branches| {
+                branches
+                    .iter()
+                    .find(|b| b["type"] == serde_json::json!("integer"))
+            })
+            .unwrap_or_else(|| panic!("wait_seconds 应有 integer 分支：{prop}"));
+
+        assert_eq!(
+            integer["maximum"],
+            serde_json::json!(MAX_WAIT_SECS),
+            "schema 必须声明 maximum 且与实现用的常量一致：{integer}"
+        );
+        assert_eq!(
+            integer["minimum"],
+            serde_json::json!(0),
+            "秒数不应为负：{integer}"
+        );
+
+        // 便于人工/排查时核对（默认被测试框架捕获，`--nocapture` 可见）。
+        println!(
+            "run_command.wait_seconds schema：{}",
+            serde_json::to_string_pretty(prop).unwrap_or_default()
+        );
     }
 
     #[test]

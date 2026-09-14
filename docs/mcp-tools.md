@@ -125,7 +125,7 @@
 | ---- | ---- | ---- | ---- |
 | `terminal_id` | string | ✅ | 目标终端 |
 | `command` | string | ✅ | 要执行的 shell 命令（在常驻会话中 `eval`，工作目录与环境变量保留） |
-| `wait_seconds` | integer \| null | ✗ | 同步等待秒数：默认 30、上限 50；超时不打断命令，改为返回句柄 |
+| `wait_seconds` | integer \| null | ✗ | 同步等待秒数：默认 30，**schema 声明 `minimum: 0` / `maximum: 50`**；超时不打断命令，改为返回句柄。超出上限会被夹到 50 |
 
 **输出**（`RunOutcome`）
 
@@ -169,7 +169,16 @@
 
 ### 3.5 `run_command_async`
 
-**入参**：与 `run_command` **同结构**（含 `wait_seconds`，但实现忽略它，见 §5 问题 ①）。
+**入参**
+
+| 字段 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `terminal_id` | string | ✅ | 目标终端 |
+| `command` | string | ✅ | 要执行的命令 |
+
+> **不含 `wait_seconds`**：异步模式立即返回句柄，该参数无意义。
+> 早期两个工具共用入参结构，导致"等待秒数"出现在异步工具的 schema 里、
+> 描述里还写着"长任务请用 run_command_async"（自相矛盾），已在 D43 修正。
 
 **输出**：立即返回 `status: "queued"`、`still_running: true`、`output: ""` 的同一结构；
 命令在后台执行并自行落库终态，用 `get_command_status` 轮询。
@@ -251,17 +260,25 @@
 
 ---
 
-## 5. 供核对的已知问题（团队自查发现）
+## 5. 契约问题的处理结果
 
-| # | 问题 | 影响 | 团队建议 |
-| ---- | ---- | ---- | ---- |
-| ① | **`run_command_async` 的 schema 里包含 `wait_seconds`，但实现忽略它** | Agent 可能以为异步工具会等 N 秒，实际立即返回；字段描述里还写着"用 `run_command_async` 干长任务"，出现在异步工具自己的 schema 里更易误解 | 给异步工具独立的入参结构（去掉 `wait_seconds`），契约更干净 |
-| ② | `run_command.wait_seconds` 描述写了"max 50"，但 schema 没有 `maximum` | 客户端按 schema 校验时会放行 `wait_seconds: 999`，实际被静默夹到 50 | 给该字段加 `maximum: 50`，让约束进入机器可读层面 |
-| ③ | `error.rs` 里的 `ErrorPayload{code, message}` 是**死代码**，实际返回的是 `{error, code}` | 两份"错误形状"并存，后来者可能照抄错的那份 | 二选一：推荐保留线上形状 `{error, code}`，删除未使用的结构；若要统一为 `message` 需改契约（首发前改成本低） |
-| ④ | 所有输出都是 `content[0].text` 里的 JSON **文本** | 客户端需自行解析；无法用 MCP 的结构化输出特性做校验 | 保持现状（兼容性优先）；若客户希望，可评估补 `structuredContent` |
-| ⑤ | `list_hosts` 的 schema 只有 `{"type":"object"}`（无 `properties`） | 个别严格客户端可能显示为"无参数"以外的异常 | 可补 `"properties": {}`；影响很小，待客户意见 |
+### 5.1 已在首发前修复（D43，2026-09-12）
 
-> 以上均为**契约层面**的问题，不涉及行为正确性；①③ 建议在首发前处理（越晚改成本越高）。
+| # | 问题 | 处理 |
+| ---- | ---- | ---- |
+| ① | `run_command_async` 的 schema 里带 `wait_seconds`，但实现忽略它（字段描述里还写着"长任务请用 run_command_async"，自相矛盾） | 为异步工具新增独立入参 `RunCommandAsyncParams`，**去掉该字段**；单测 `async_tool_does_not_expose_wait_seconds` 守住 |
+| ② | `run_command.wait_seconds` 只在描述里写"max 50"，schema 无 `maximum`（客户端会放行 999，实际被静默夹到 50） | 手写该字段的 schema：`anyOf` 内声明 `minimum: 0` / `maximum: 50`；单测 `wait_seconds_schema_declares_maximum` 守住（并与实现的常量比对） |
+| ③ | `error.rs` 的 `ErrorPayload{code, message}` 是死代码，线上实际返回 `{error, code}` | 删除未使用的结构，保留线上形状；在原处留注释说明取舍，避免后来者照抄错的那份 |
+
+> 说明：② 之所以手写 schema 而不用 derive 属性——schemars 1.x 的 `range`
+> 在当前依赖组合下报 `unknown schemars attribute`（实测）。
+
+### 5.2 有意保留（经客户确认）
+
+| # | 现状 | 保留理由 |
+| ---- | ---- | ---- |
+| ④ | 输出统一是 `content[0].text` 里的 JSON **文本**，未用 `structuredContent` | 兼容性优先：只认文本的客户端最多，改动收益小、风险大 |
+| ⑤ | `list_hosts` 的 schema 只有 `{"type":"object"}`（无 `properties`） | 无参数工具的标准写法，实测客户端均正常；补空 `properties` 收益极小 |
 
 ---
 
