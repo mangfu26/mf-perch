@@ -175,10 +175,8 @@ async fn expired_session_is_reported_as_not_found() {
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器与 MCP 端点；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
 async fn run_command_auto_reconnects_broken_terminal_after_restart() {
-    if test_target().is_none() {
-        eprintln!("跳过：未设置 MFPERCH_TEST_HOST / PORT / USER / KEY");
-        return;
-    }
+    // 环境变量缺失时由 `test_target()` 直接 panic（§5.6：不得静默跳过）。
+    let _ = test_target();
 
     let dir = tempfile::tempdir().expect("临时目录");
     let db_path = dir.path().join("mf-perch-reconnect.sqlite");
@@ -446,22 +444,33 @@ fn contains_array_type(value: &serde_json::Value) -> bool {
     }
 }
 
-/// 读取测试目标环境变量；缺失时返回 `None`（测试跳过）。
-fn test_target() -> Option<(String, u16, String, String)> {
-    Some((
-        std::env::var("MFPERCH_TEST_HOST").ok()?,
-        std::env::var("MFPERCH_TEST_PORT").ok()?.parse().ok()?,
-        std::env::var("MFPERCH_TEST_USER").ok()?,
-        std::env::var("MFPERCH_TEST_KEY").ok()?,
-    ))
+/// 读取测试目标环境变量。
+///
+/// **缺失即失败**（AGENTS.md §5.6）：直接 `panic!`，不返回 `Option` 让调用方
+/// `return` 跳过——静默跳过会让报告显示"通过"而实际一条断言都没执行。
+/// 需要跳过时请用 `#[ignore]` 表达。
+fn test_target() -> (String, u16, String, String) {
+    fn need(key: &str) -> String {
+        std::env::var(key).unwrap_or_else(|_| {
+            panic!("未设置环境变量 {key}；联调环境准备见 docs/design/test-environment.md")
+        })
+    }
+
+    (
+        need("MFPERCH_TEST_HOST"),
+        need("MFPERCH_TEST_PORT")
+            .parse()
+            .expect("MFPERCH_TEST_PORT 应为端口号"),
+        need("MFPERCH_TEST_USER"),
+        need("MFPERCH_TEST_KEY"),
+    )
 }
 
 /// 在测试状态中创建主机与密钥凭据。
 async fn seed_host(state: &AppState, key: &[u8; 32]) -> String {
-    let Some((address, port, username, key_path)) = test_target() else {
-        panic!("未设置测试环境变量");
-    };
-    let pem = std::fs::read_to_string(&key_path).expect("读取测试私钥");
+    let (address, port, username, key_path) = test_target();
+    let pem = std::fs::read_to_string(&key_path)
+        .expect("读取测试私钥失败：确认 MFPERCH_TEST_KEY 指向可读文件");
 
     let conn = state.db.lock().await;
 
@@ -547,10 +556,8 @@ fn tool_payload(resp: &serde_json::Value) -> serde_json::Value {
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器与 MCP 端点；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
 async fn mcp_full_lifecycle_over_real_ssh() {
-    if test_target().is_none() {
-        eprintln!("跳过：未设置 MFPERCH_TEST_HOST / PORT / USER / KEY");
-        return;
-    }
+    // 环境变量缺失时由 `test_target()` 直接 panic（§5.6：不得静默跳过）。
+    let _ = test_target();
 
     let (state, key) = test_state();
     let host_id = seed_host(&state, &key).await;
@@ -898,9 +905,8 @@ async fn mcp_rejects_missing_or_wrong_token() {
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
 async fn mcp_rejects_when_command_queue_is_full() {
-    if test_target().is_none() {
-        return;
-    }
+    // 环境变量缺失时由 `test_target()` 直接 panic（§5.6：不得静默跳过）。
+    let _ = test_target();
 
     let (state, key) = test_state();
     let host_id = seed_host(&state, &key).await;
