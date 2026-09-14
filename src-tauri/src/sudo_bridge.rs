@@ -41,22 +41,39 @@ impl SudoBridge {
         Arc::new(Self::default())
     }
 
+    /// 把请求登记进待决表，返回等待用户决定的接收端。
+    ///
+    /// 与 [`Self::request`] 分离：`request` 还要唤出窗口、发事件与系统通知
+    /// （都依赖 `AppHandle`，单测无法构造），而**登记语义本身**必须能被直接测试。
+    ///
+    /// 锁中毒（此前有 panic）时返回 `None`：调用方应**宁可拒绝也不提权**，
+    /// 并且不要再打扰用户——一个注定无法被应答的确认框只会让人困惑。
+    fn register_pending(&self, request_id: String) -> Option<oneshot::Receiver<SudoDecision>> {
+        let (tx, rx) = oneshot::channel();
+        match self.pending.lock() {
+            Ok(mut map) => {
+                // 同 id 不应重复登记；若发生（异常情况），旧通道被替换，
+                // 其接收端会因发送端被丢弃而立即结束，按拒绝处理。
+                map.insert(request_id, tx);
+                Some(rx)
+            }
+            Err(_) => {
+                tracing::error!("sudo 待决表不可用，按拒绝处理");
+                None
+            }
+        }
+    }
+
     /// 登记一个 sudo 请求并通知用户，返回等待决定的接收端。
     ///
     /// 同步函数：登记只涉及一次加锁，随后的通知通过事件与系统通知完成，
     /// 不阻塞调用方（调用方是输出泵中的独立任务）。
     pub fn request(&self, app: &AppHandle, req: SudoRequest) -> oneshot::Receiver<SudoDecision> {
-        let (tx, rx) = oneshot::channel();
-
-        // 同 id 不应重复登记；若发生（异常情况），旧通道被替换，
-        // 其接收端会因发送端被丢弃而立即结束，按拒绝处理。
-        if let Ok(mut map) = self.pending.lock() {
-            map.insert(req.request_id.clone(), tx);
-        } else {
-            // 锁中毒（此前有 panic）：宁可拒绝也不提权。
-            tracing::error!("sudo 待决表不可用，按拒绝处理");
+        let Some(rx) = self.register_pending(req.request_id.clone()) else {
+            // 锁中毒：返回一个已关闭的通道（调用方立即得到"未获允许"），
+            // 且不再唤出窗口/发通知——这次请求注定无法被应答。
             return oneshot::channel().1;
-        }
+        };
 
         // 窗口可能被隐藏到托盘（D16）。若不唤出，用户看不到确认界面，
         // 请求只能等到超时被拒绝——功能等于不可用。
@@ -216,17 +233,35 @@ mod tests {
         assert_eq!(bridge.pending_count(), 0);
     }
 
+    /// 登记语义：登记后进入待决表，用户提交决定后即被取走并送达。
     #[test]
-    fn request_registers_pending_entry() {
-        // 不做事件/通知（需要 AppHandle），仅验证登记语义：
-        // 这里直接模拟 request 中的登记步骤。
+    fn register_pending_adds_entry_and_respond_removes_it() {
         let bridge = SudoBridge::new();
-        let (tx, _rx) = oneshot::channel();
-        bridge
-            .pending
-            .lock()
-            .unwrap()
-            .insert(req("x").request_id, tx);
-        assert_eq!(bridge.pending_count(), 1);
+        let rx = bridge
+            .register_pending("sudo_x".into())
+            .expect("正常状态下登记应成功");
+        assert_eq!(bridge.pending_count(), 1, "登记后应有一个待决请求");
+
+        assert!(bridge.respond("sudo_x", SudoDecision::Allow));
+        assert_eq!(bridge.pending_count(), 0, "提交决定后应从待决表移除");
+        assert_eq!(rx.blocking_recv().unwrap(), SudoDecision::Allow);
+    }
+
+    /// 同 id 重复登记时旧通道被替换：旧接收端按拒绝处理，待决表不重复计数。
+    #[test]
+    fn register_pending_replaces_entry_with_same_id() {
+        let bridge = SudoBridge::new();
+        let first = bridge
+            .register_pending("dup".into())
+            .expect("正常状态下登记应成功");
+        let _second = bridge
+            .register_pending("dup".into())
+            .expect("正常状态下登记应成功");
+
+        assert_eq!(bridge.pending_count(), 1, "同 id 不应重复计数");
+        assert!(
+            first.blocking_recv().is_err(),
+            "被替换的请求应按拒绝处理（接收端随发送端丢弃而结束）"
+        );
     }
 }

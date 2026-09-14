@@ -278,18 +278,25 @@ async fn save_credential_computes_key_fingerprint() {
     // 生成一把真实测试密钥。
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("k");
+    // 本环境下 `ssh-keygen` 写同名 `.pub` 会失败并以 255 退出（"Bad file descriptor"），
+    // 但**私钥已正确生成**——而本用例只需要私钥正文。
+    // 因此判定标准是"私钥确实生成、非空且像私钥"，而不是 ssh-keygen 的退出码。
+    // 关键是不能静默跳过（§5.6.3）：连私钥都拿不到时必须明确失败——
+    // 改之前正是静默 return，于是这条覆盖在本机一直没真正执行过。
     let status = std::process::Command::new("ssh-keygen")
         .args(["-t", "ed25519", "-N", "", "-f"])
         .arg(&path)
         .arg("-q")
-        .status();
+        .status()
+        .expect("应能执行 ssh-keygen 生成测试密钥（环境需具备 OpenSSH 客户端）");
 
-    if status.map(|s| !s.success()).unwrap_or(true) {
-        eprintln!("跳过：环境无 ssh-keygen");
-        return;
-    }
-
-    let pem = std::fs::read_to_string(&path).unwrap();
+    let pem = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("ssh-keygen 未生成私钥（status={status:?}）：{e}"));
+    assert!(
+        pem.contains("PRIVATE KEY"),
+        "生成的应当是私钥正文，实际开头：{}",
+        pem.chars().take(40).collect::<String>()
+    );
     let mut input = credential_input("git", Some(&pem));
     input.kind = "key".into();
 

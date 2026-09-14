@@ -396,7 +396,9 @@ Refs: #123
 1. 打标注：`#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 环境变量后以 --ignored 运行"]`；
    默认配置（不带 `--ignored`）**不要求**跑通，因为这些测试依赖客户机器上的环境；
 2. 目标信息一律从 `MFPERCH_TEST_*` 环境变量读取（见 [`docs/design/test-environment.md`](docs/design/test-environment.md)）；
-3. **环境变量缺失时必须明确失败（`panic!` / `expect`），不得 `return` 静默跳过。**
+3. **前置条件不满足时必须明确失败（`panic!` / `expect`），不得 `return` 静默跳过。**
+   适用场景包括但不限于：`MFPERCH_TEST_*` 环境变量缺失、依赖的外部工具（如 `ssh-keygen`）不可用、
+   测试私钥读不到、断言所需的样本拿不到。
    静默跳过会制造"绿灯假象"——测试报告显示通过，实际一行断言都没执行。
    **跳过只能由 `#[ignore]` 表达，不能由测试体自己决定**；
 4. 测试用的私钥 / 口令只放在 `.tmp-test/`（已在 `.gitignore` 中排除），**绝不入库**（§2.6）。

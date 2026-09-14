@@ -242,29 +242,9 @@ mod tests {
         assert_eq!(decide_close(true, false), CloseDecision::AllowClose);
     }
 
-    #[test]
-    fn exit_flag_starts_clear() {
-        // 复位全局标志，避免测试间相互影响；
-        // 该标志是进程级单例，此处仅验证读写接口。
-        EXITING.store(false, Ordering::SeqCst);
-        assert!(!is_exiting());
-        EXITING.store(true, Ordering::SeqCst);
-        assert!(is_exiting());
-        EXITING.store(false, Ordering::SeqCst);
-    }
-
-    #[test]
-    fn tray_ready_flag_reflects_creation() {
-        // 初始为未就绪，创建成功后置位。
-        TRAY_READY.store(false, Ordering::SeqCst);
-        assert!(!is_tray_ready());
-        TRAY_READY.store(true, Ordering::SeqCst);
-        assert!(is_tray_ready());
-        TRAY_READY.store(false, Ordering::SeqCst);
-    }
-
-    #[test]
-    fn menu_ids_are_distinct() {
-        assert_ne!(MENU_OPEN, MENU_QUIT);
-    }
+    // 关于 `EXITING` / `TRAY_READY` / `MENU_*`：
+    // 它们只是进程级标志与私有常量，"写进去再读出来"证明不了任何用户可见行为，
+    // 反而因为改动全局单例而与同二进制的其他测试相互干扰（§5.3）。
+    // 真正要守的决策逻辑是 `decide_close`（生产路径见 `on_window_event`），
+    // 上面四条用例已覆盖它的全部输入组合。
 }

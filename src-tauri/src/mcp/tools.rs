@@ -26,6 +26,15 @@ const DEFAULT_WAIT_SECS: u64 = crate::domain::DEFAULT_SYNC_WAIT_SECS;
 /// 同步等待上限，避免撞上 MCP 客户端自身超时（Q4）。
 const MAX_WAIT_SECS: u64 = crate::domain::MAX_SYNC_WAIT_SECS;
 
+/// 同步工具的**有效等待秒数**：未指定时用默认值，超过上限则夹紧。
+///
+/// 提取成独立函数是为了让"夹紧"这一契约能被直接测试——
+/// 同一契约还写在入参 schema 里（由 `wait_seconds_schema_declares_maximum` 守住两者一致）。
+/// 超过上限的同步等待没有意义：MCP 客户端自己会先超时断开。
+fn effective_wait_seconds(requested: Option<u64>) -> u64 {
+    requested.unwrap_or(DEFAULT_WAIT_SECS).min(MAX_WAIT_SECS)
+}
+
 // ============================ 工具入参 ============================
 
 /// 可空参数的 JSON Schema 包装器（只参与 schema 生成，不参与序列化）。
@@ -326,9 +335,9 @@ impl McpService {
         &self,
         Parameters(p): Parameters<RunCommandParams>,
     ) -> Result<CallToolResult, McpError> {
-        let wait = Some(std::time::Duration::from_secs(
-            p.wait_seconds.unwrap_or(DEFAULT_WAIT_SECS).min(MAX_WAIT_SECS),
-        ));
+        let wait = Some(std::time::Duration::from_secs(effective_wait_seconds(
+            p.wait_seconds,
+        )));
         match self
             .run_command_impl(&p.terminal_id, &p.command, wait)
             .await
@@ -660,12 +669,26 @@ mod tests {
         assert!(text.contains("archived"));
     }
 
+    /// 同步等待的秒数契约：未指定→默认；超上限→夹紧（Q4）。
+    ///
+    /// 直接调用生产函数 `effective_wait_seconds`，而不是在测试里重写一遍 `min`——
+    /// 后者无论实现怎么改都会通过（断言的是标准库，不是本项目的行为）。
     #[test]
     fn wait_seconds_is_clamped_to_maximum() {
-        // 上限存在的意义：避免同步等待超过 MCP 客户端自身超时（Q4）。
-        let requested = 999u64;
-        assert_eq!(requested.min(MAX_WAIT_SECS), MAX_WAIT_SECS);
-        assert_eq!(MAX_WAIT_SECS, 50);
+        let cases = [
+            (None, DEFAULT_WAIT_SECS, "未指定时应使用默认值"),
+            (Some(10), 10, "未超上限时应原样使用"),
+            (Some(MAX_WAIT_SECS), MAX_WAIT_SECS, "恰好等于上限时不应改动"),
+            (Some(MAX_WAIT_SECS + 1), MAX_WAIT_SECS, "刚超上限即应夹紧"),
+            (Some(u64::MAX), MAX_WAIT_SECS, "极端值必须夹紧而不是溢出"),
+        ];
+        for (requested, expected, why) in cases {
+            assert_eq!(
+                effective_wait_seconds(requested),
+                expected,
+                "{why}：requested={requested:?}"
+            );
+        }
     }
 
     #[test]

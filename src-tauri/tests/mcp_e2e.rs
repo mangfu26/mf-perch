@@ -123,6 +123,19 @@ async fn initialize_session(
         .to_string()
 }
 
+/// 会话空闲时长（秒）：默认 1 秒便于几秒内复现，可用
+/// `MFPERCH_TEST_SESSION_IDLE_SECS` 覆盖（慢机器或需要更长观察窗口时用）。
+///
+/// §5.3 例外的正当理由：本用例验证的**就是"时间流逝"本身**——
+/// 空闲到期后会话被回收。任何请求都会重置空闲计时，所以无法用轮询代替等待；
+/// 因此按要求把时长做成可覆盖参数，而不是写死。
+fn session_idle_secs() -> u64 {
+    std::env::var("MFPERCH_TEST_SESSION_IDLE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+}
+
 /// **机制复现（红例）**：会话空闲超时一旦到期，客户端再带原会话 id 请求
 /// 就会被判定为"会话不存在"（404），这正是用户用 MCP Inspector 实测到的现象。
 ///
@@ -130,14 +143,17 @@ async fn initialize_session(
 /// （默认值为 5 分钟，见 `mcp::server` 的单测）。
 #[tokio::test]
 async fn expired_session_is_reported_as_not_found() {
+    let idle = session_idle_secs();
     let (state, _key) = test_state();
-    let (url, handle) = spawn_raw_mcp_endpoint(state, Some(std::time::Duration::from_secs(1))).await;
+    let (url, handle) =
+        spawn_raw_mcp_endpoint(state, Some(std::time::Duration::from_secs(idle))).await;
     let client = reqwest::Client::new();
 
     let sid = initialize_session(&client, &url, None).await;
 
-    // 空闲超过 1 秒 → 会话 worker 退出、会话被移除。
-    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    // 空闲超过 idle 秒 → 会话 worker 退出、会话被移除。
+    // 额外多等 1.5 秒作为余量（调度抖动）；时长整体可用环境变量放大。
+    tokio::time::sleep(std::time::Duration::from_millis(idle * 1000 + 1500)).await;
 
     let (status, body, _) = mcp_call_raw(
         &client,
@@ -781,20 +797,34 @@ async fn mcp_full_lifecycle_over_real_ssh() {
         "轮询应返回状态：{poll1_payload}"
     );
 
-    // 等待完成后再轮询：应为 completed 且输出包含结果。
-    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-    let (poll2, _) = mcp_call(
-        &client,
-        &url,
-        &token,
-        sid_ref,
-        serde_json::json!({
-            "jsonrpc": "2.0", "id": 9, "method": "tools/call",
-            "params": { "name": "get_command_status", "arguments": { "command_id": command_id } }
-        }),
-    )
-    .await;
-    let poll2_payload = tool_payload(&poll2);
+    // 轮询直到命令进入终态。
+    // 原先这里用固定 `sleep 4s` 等远端 `sleep 2` 跑完——机器慢或负载高就会假失败，
+    // 而慢只会让测试更慢（§5.3）。这里改为有上限的轮询：状态没变就继续问，超时才失败。
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let poll2_payload = loop {
+        let (poll2, _) = mcp_call(
+            &client,
+            &url,
+            &token,
+            sid_ref,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                "params": { "name": "get_command_status", "arguments": { "command_id": command_id } }
+            }),
+        )
+        .await;
+        let payload = tool_payload(&poll2);
+        let status = payload["status"].as_str().unwrap_or_default().to_string();
+        if status != "running" && status != "queued" {
+            break payload;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "命令在 15 秒内未进入终态，最后状态：{status}"
+        );
+        // 这是**轮询间隔**（有上限的等待），不是"等事情大概已经发生"。
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
     assert_eq!(
         poll2_payload["status"].as_str(),
         Some("completed"),
@@ -863,8 +893,12 @@ async fn mcp_full_lifecycle_over_real_ssh() {
 }
 
 /// 鉴权：错误或缺省 Token 必须被拒绝（Q2）。
+///
+/// 不需要真实 SSH，也不需要任何 `MFPERCH_TEST_*` 环境变量——它只用内存库在本机起
+/// 一个 MCP 端点。原先挂着 `#[ignore = "需要 MCP 端点；设置环境变量后以 --ignored 运行"]`，
+/// 但函数体既不读环境变量也不碰 SSH；而这是全仓**唯一**覆盖 401 鉴权分支的用例，
+/// 于是默认 `cargo test` 永远不跑它，这条安全属性实际上没有门禁（§5.7）。改为默认执行。
 #[tokio::test]
-#[ignore = "需要 MCP 端点；设置环境变量后以 --ignored 运行"]
 async fn mcp_rejects_missing_or_wrong_token() {
     let (state, _key) = test_state();
     let manager = McpManager::new(state);
@@ -943,9 +977,13 @@ async fn mcp_rejects_when_command_queue_is_full() {
         .unwrap()
         .to_string();
 
-    // 连续提交 12 条长命令（队列上限为 10）。
+    // 队列上限语义：`inflight`（排队中 + 执行中）达到上限即拒绝（Q4）。
+    // 命令用足够长的 sleep，保证这十几次提交期间不可能有命令结束——
+    // 否则"拒绝几条"会随机器快慢变化，精确断言也就失去意义。
+    let limit = mf_perch_lib::domain::DEFAULT_COMMAND_QUEUE_LIMIT;
+    let submitted = limit + 2;
     let mut outcomes = Vec::new();
-    for i in 0..12 {
+    for i in 0..submitted {
         let (resp, _) = mcp_call(
             &client,
             &base,
@@ -953,7 +991,7 @@ async fn mcp_rejects_when_command_queue_is_full() {
             sid_ref,
             serde_json::json!({ "jsonrpc": "2.0", "id": 100 + i, "method": "tools/call",
                 "params": { "name": "run_command_async",
-                    "arguments": { "terminal_id": terminal_id, "command": "sleep 8" } } }),
+                    "arguments": { "terminal_id": terminal_id, "command": "sleep 30" } } }),
         )
         .await;
         outcomes.push(tool_payload(&resp));
@@ -963,9 +1001,11 @@ async fn mcp_rejects_when_command_queue_is_full() {
         .iter()
         .filter(|o| o["code"].as_str() == Some("command_queue_full"))
         .count();
-    assert!(
-        rejected > 0,
-        "超过队列上限的提交应被拒绝，实际结果：{outcomes:?}"
+    // 精确条数：提交 limit + 2 条，前 limit 条占满队列，其余 2 条必须被拒。
+    // 原先只断言 `rejected > 0`——拒绝 1 条还是 11 条都算通过，上限形同没验。
+    assert_eq!(
+        rejected, 2,
+        "队列上限 {limit}，提交 {submitted} 条，应恰好拒绝 2 条；实际结果：{outcomes:?}"
     );
 
     manager.stop().await.ok();
