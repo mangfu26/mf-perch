@@ -468,6 +468,93 @@ async fn sudo_password_never_lands_in_a_regular_file() {
     state.terminals.delete_terminal(&state.db, &t2.id).await.ok();
 }
 
+/// **Q36 回归**：同一条命令内，人类只被问一次。
+///
+/// 背景：sudo 在密码错误时会重试（默认最多 3 次），`-A` 下每次重试都会重新
+/// 调用 askpass，因此产生新的索要（§7.10 实测 3 次）。若每次索要都弹窗，
+/// 人类要在几十秒内连点三次几乎相同的「拒绝」。
+///
+/// 本用例借**真实 sudo 的重试循环**验证两条不变式：
+/// 1. 拒绝一经给出，同一条命令的后续索要自动沿用，不再询问人类；
+/// 2. **下一条命令必须重新询问**——否则"拒绝"会退化成"该终端永久禁止提权"，
+///    那是把 fail-closed 做成了 fail-broken。
+#[tokio::test]
+#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
+async fn deny_is_asked_only_once_per_command() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let t = target();
+
+    let (state, key) = test_state();
+    let host_id = seed_host(&state, &key, &t, SudoPolicy::Ask).await;
+
+    // 替身回调每被调用一次 = 人类被弹一次窗。
+    let asked = Arc::new(AtomicUsize::new(0));
+    let asked_for_asker = asked.clone();
+    let asker: mf_perch_lib::terminal::SudoAsker = Arc::new(move |_req: SudoRequest| {
+        asked_for_asker.fetch_add(1, Ordering::SeqCst);
+        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        let _ = rtx.send(SudoDecision::Deny);
+        rrx
+    });
+    state.terminals.set_sudo_asker(asker).await;
+
+    let terminal = state
+        .terminals
+        .open_terminal(&state.db, &key, &host_id, None)
+        .await
+        .expect("终端应能建立");
+
+    let outcome = state
+        .terminals
+        .run_command(
+            &state.db,
+            &terminal.id,
+            "sudo id -u",
+            Some(Duration::from_secs(30)),
+        )
+        .await
+        .expect("命令应能下发");
+    let (output, code) = collect(&state.terminals, &state.db, &outcome.command_id).await;
+
+    assert_ne!(code, Some(0), "拒绝后 sudo 应失败。输出：{output}");
+    assert!(
+        !output.trim().lines().any(|l| l.trim() == "0"),
+        "拒绝后不得提权。输出：{output}"
+    );
+    let asks_after_first = asked.load(Ordering::SeqCst);
+    assert_eq!(
+        asks_after_first, 1,
+        "同一条命令内的 sudo 重试不得重复询问人类，实际询问 {asks_after_first} 次。输出：{output}"
+    );
+
+    // 记忆必须随命令结束而失效。
+    let again = state
+        .terminals
+        .run_command(
+            &state.db,
+            &terminal.id,
+            "sudo id -u",
+            Some(Duration::from_secs(30)),
+        )
+        .await
+        .expect("命令应能下发");
+    let (out2, _) = collect(&state.terminals, &state.db, &again.command_id).await;
+
+    let asks_total = asked.load(Ordering::SeqCst);
+    assert_eq!(
+        asks_total, 2,
+        "新命令应重新询问人类（否则拒绝会变成永久禁止提权），实际累计询问 {asks_total} 次。\
+         第二条命令输出：{out2}"
+    );
+
+    state
+        .terminals
+        .delete_terminal(&state.db, &terminal.id)
+        .await
+        .ok();
+}
+
 /// **B2 回归（错配）**：并发的 sudo 索要必须各自收到自己的应答。
 ///
 /// 背景：曾用**一条会话级 FIFO** 承载所有索要。FIFO 上一次写入只会被

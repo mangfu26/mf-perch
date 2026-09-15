@@ -39,7 +39,7 @@ pub mod sudo;
 
 pub use events::{event_channel, EventSink, TerminalEvent, EVENT_TERMINAL};
 pub use sudo::{
-    resolve_action, policy_description, validate_for_policy, SudoAction, SudoContext,
+    resolve_action, policy_description, validate_for_policy, AskOutcome, SudoAction, SudoContext,
     SudoDecision, SudoRequest,
 };
 
@@ -59,6 +59,15 @@ struct ActiveCommand {
     /// 命令结束后的退出码；`None` 表示仍在执行。
     exit_code: Option<i32>,
     started: Instant,
+    /// 本条命令的 sudo 提权是否已被拒绝（Q36）。
+    ///
+    /// sudo 密码错误时会重试（默认最多 3 次），每次重试都重新调用 askpass、
+    /// 产生一次新的索要。拒绝一经给出便对**本条命令**的后续索要生效，
+    /// 人类只被问一次。
+    ///
+    /// 记忆挂在"当前命令"上，随命令结束（`active` 置回 `None`）自动消失：
+    /// 它不是"该终端禁止提权"，下一条命令照常询问。
+    sudo_denied: bool,
 }
 
 /// 命令结束信号，用于唤醒同步等待者。
@@ -641,6 +650,8 @@ impl TerminalRuntime {
                     output: OutputAccumulator::new(max_bytes, max_lines),
                     exit_code: None,
                     started,
+                    // 新命令重新开始：提权的询问记忆不跨命令（Q36）。
+                    sudo_denied: false,
                 });
 
                 // 会话重建的审计备注（D39）：写在**这条**命令的输出开头。
@@ -1116,7 +1127,6 @@ pub(crate) fn decide_session_action(
 const SUDO_ASK_TIMEOUT: Duration = Duration::from_secs(crate::domain::SUDO_ASK_TIMEOUT_SECS);
 
 /// 处理一次 sudo 请求：按策略决定注入还是拒绝（Q33）。
-/// 处理一次 sudo 请求：按策略决定注入还是拒绝（Q33）。
 ///
 /// `token` 标识本次索要（远端 askpass PID），应答据此精确定向到该次索要的
 /// FIFO——这是并发索要不会互相错配的前提（B2）。
@@ -1124,36 +1134,17 @@ async fn handle_sudo_request(entry: &TerminalEntry, token: &str) {
     let sudo = entry.sudo.clone();
     let has_password = sudo.password.is_some();
 
-    // ask 模式：先取用户决策，带超时。
-    let decision = if sudo.policy == SudoPolicy::Ask {
-        let request = SudoRequest {
-            request_id: crate::domain::new_id("sudo"),
-            terminal_id: entry.session.terminal_id().to_string(),
-            host_label: entry.host_label.clone(),
-        };
-
-        let rx = (entry.asker)(request);
-        match tokio::time::timeout(SUDO_ASK_TIMEOUT, rx).await {
-            Ok(Ok(d)) => Some(d),
-            // 用户拒绝、通道异常、或超时：一律视为拒绝。
-            Ok(Err(_)) => Some(SudoDecision::Deny),
-            Err(_) => {
-                tracing::info!("sudo 确认请求超时，按拒绝处理");
-                Some(SudoDecision::on_timeout())
-            }
+    let (decision, audit_note) = match sudo.policy {
+        // ask 模式：先取人类决策（本条命令已拒绝过则不再询问，Q36）。
+        // 先记下"这次询问属于哪条命令"：拒绝只记在那条命令上。
+        SudoPolicy::Ask => {
+            let asked_for = current_command_id(entry).await;
+            let outcome = ask_human(entry, asked_for.as_deref()).await;
+            (Some(outcome.decision()), outcome.audit_note())
         }
-    } else {
-        None
-    };
-
-    // 人类侧审计（O3）：提权决策必须留在命令历史里，可被事后核对。
-    // 只记决策与策略，绝不记录密码本身。
-    let audit_note = match (sudo.policy, decision) {
-        (SudoPolicy::Ask, Some(SudoDecision::Allow)) => Some("sudo 提权请求：用户已允许".to_string()),
-        (SudoPolicy::Ask, Some(SudoDecision::Deny)) => Some("sudo 提权请求：用户已拒绝".to_string()),
-        (SudoPolicy::Ask, None) => Some("sudo 提权请求：等待确认超时，已按拒绝处理".to_string()),
-        (SudoPolicy::Auto, _) => Some("sudo 提权请求：按主机策略自动注入密码".to_string()),
-        (SudoPolicy::Deny, _) => Some("sudo 提权请求：该主机已禁用提权注入".to_string()),
+        SudoPolicy::Auto => (None, "sudo 提权请求：按主机策略自动注入密码"),
+        // deny 模式不会部署 askpass，正常不会走到这里；保守按拒绝记录。
+        SudoPolicy::Deny => (None, "sudo 提权请求：该主机已禁用提权注入"),
     };
 
     match resolve_action(sudo.policy, has_password, decision) {
@@ -1194,8 +1185,96 @@ async fn handle_sudo_request(entry: &TerminalEntry, token: &str) {
         }
     }
 
-    if let Some(note) = audit_note {
-        push_audit_note(entry, &note).await;
+    // 人类侧审计（O3）：提权决策必须留在命令历史里，可被事后核对。
+    // 只记决策与来源，绝不记录密码本身。
+    push_audit_note(entry, audit_note).await;
+}
+
+/// 取人类对本次提权的决定（Q36 / Q33）。
+///
+/// 本条命令此前已被拒绝时**不再询问**，直接沿用——这正是 Q36 的目的：
+/// sudo 密码错误会重试（默认 3 次），每次都弹窗等于让人在几十秒内
+/// 连点三次几乎相同的「拒绝」。
+///
+/// `asked_for` 是发起询问时的命令标识：拒绝只记在那条命令上（见
+/// [`remember_denial`]）。
+async fn ask_human(entry: &TerminalEntry, asked_for: Option<&str>) -> AskOutcome {
+    if denial_is_remembered(entry).await {
+        tracing::info!(
+            host = %entry.host_label,
+            "本条命令已拒绝过 sudo 提权，自动沿用拒绝（不再询问）"
+        );
+        return AskOutcome::DeniedByMemo;
+    }
+
+    let request = SudoRequest {
+        request_id: crate::domain::new_id("sudo"),
+        terminal_id: entry.session.terminal_id().to_string(),
+        host_label: entry.host_label.clone(),
+    };
+
+    // 注意：等待人类应答期间**不得持有** `active` 锁——输出泵要用它记录输出，
+    // 持锁等待会让整条命令的输出在弹窗期间停止积累。
+    let rx = (entry.asker)(request);
+    let outcome = match tokio::time::timeout(SUDO_ASK_TIMEOUT, rx).await {
+        Ok(Ok(SudoDecision::Allow)) => AskOutcome::Allowed,
+        Ok(Ok(SudoDecision::Deny)) => AskOutcome::Denied,
+        // 通道异常（桥接不可用）：无法询问，等同拒绝。
+        Ok(Err(_)) => AskOutcome::Unavailable,
+        Err(_) => {
+            tracing::info!("sudo 确认请求超时，按拒绝处理");
+            AskOutcome::TimedOut
+        }
+    };
+
+    if outcome.should_remember() {
+        remember_denial(entry, asked_for).await;
+    }
+    outcome
+}
+
+/// 当前正在执行的命令标识（没有则为 `None`）。
+async fn current_command_id(entry: &TerminalEntry) -> Option<String> {
+    let active = entry.active.lock().await;
+    active.as_ref().map(|a| a.command_id.clone())
+}
+
+/// 本条命令此前是否已被拒绝过提权（Q36）。
+///
+/// 记忆挂在"当前命令"上（见 [`ActiveCommand::sudo_denied`]）：命令一结束
+/// 记忆即消失，下一条命令照常询问。当前没有执行中的命令时按"未拒绝"处理
+/// （例如上一条命令留下的后台进程又触发了一次 sudo）——宁可按常规询问，
+/// 也不要让一次旧拒绝静默吞掉新问题的确认机会。
+async fn denial_is_remembered(entry: &TerminalEntry) -> bool {
+    let active = entry.active.lock().await;
+    active.as_ref().is_some_and(|a| a.sudo_denied)
+}
+
+/// 记住"**这条**命令的提权已被拒绝"（Q36）。
+///
+/// `asked_for` 是发起询问时的命令标识，必须与当前命令一致才记——
+/// 人类可能在弹窗期间等上几十秒，而提问那条命令可能早已结束
+/// （例如后台进程触发的索要）。不校验就会把拒绝记到**下一条**命令上，
+/// 使它的确认被静默跳过：方向虽然仍是"拒绝"，但人类会莫名失去一次确认机会。
+async fn remember_denial(entry: &TerminalEntry, asked_for: Option<&str>) {
+    let mut active = entry.active.lock().await;
+    if let Some(a) = active.as_mut() {
+        if denial_applies_to(Some(a.command_id.as_str()), asked_for) {
+            a.sudo_denied = true;
+        }
+    }
+}
+
+/// 这次拒绝是否应记在当前命令上（Q36）。
+///
+/// 抽成纯函数，是因为它守的竞态分支在端到端里无法稳定复现
+/// （要求命令恰好在人类应答期间结束），见 [`remember_denial`]。
+fn denial_applies_to(current: Option<&str>, asked_for: Option<&str>) -> bool {
+    match (current, asked_for) {
+        // 有当前命令才能记；且必须是**发起这次询问的那条**命令。
+        (Some(current), Some(asked_for)) => current == asked_for,
+        // 没有当前命令（命令已结束）：无处可记，也不该记到别的命令上。
+        _ => false,
     }
 }
 
@@ -1259,6 +1338,27 @@ mod tests {
         assert_eq!(tail(text, 2), "4\n5");
         assert_eq!(tail(text, 10), text);
         assert_eq!(tail(text, 0), "");
+    }
+
+    /// 守的不变式：人类对 sudo 的拒绝**只对发起询问的那条命令**生效（Q36）。
+    ///
+    /// 记错命令的后果不是"更安全"，而是让别的命令的确认被静默跳过——
+    /// 人类以为自己会被问，实际没有。
+    #[test]
+    fn denial_is_recorded_only_for_the_command_that_asked() {
+        let cases = [
+            (Some("cmd_1"), Some("cmd_1"), true, "同一条命令：应记住"),
+            (Some("cmd_2"), Some("cmd_1"), false, "命令已切换：不得记到下一条上"),
+            (None, Some("cmd_1"), false, "命令已结束：无处可记"),
+            (Some("cmd_1"), None, false, "发起询问时没有命令：不得记"),
+        ];
+        for (current, asked_for, expected, why) in cases {
+            assert_eq!(
+                denial_applies_to(current, asked_for),
+                expected,
+                "{why}（current={current:?}, asked_for={asked_for:?}）"
+            );
+        }
     }
 
     #[tokio::test]
