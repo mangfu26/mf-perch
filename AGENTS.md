@@ -323,6 +323,21 @@ Refs: #123
 > 并在本文件 §2.6 安全红线中引用：**功能测试通过不等于安全属性成立**，
 > 涉及安全属性的修复必须构造能区分对错实现的断言。
 
+### 4.6 当前测试债
+
+> §5 测试规范落地后仍未完成的项，**登记在此，不要靠"没人记得"来掩盖**。
+> 每条写清"为什么留着"；标 **待定** 的需要客户拍板，不要自行决定。
+
+| 项 | 位置 | 说明 | 优先级 |
+| ---- | ---- | ---- | ---- |
+| 跨层重复用例 | `tests/update_e2e.rs` ↔ `src/update.rs`；`tests/mcp_e2e.rs`（schema 段）↔ `src/mcp/tools.rs`；`tests/ssh_integration.rs` ↔ `src/ssh/protocol.rs` | 同一不变量在两层各断言一份（违反 §5.2）。收敛时注意 e2e 独有的是"清单 JSON 线上字段格式"与端到端链路，**不要连真覆盖一起删** | 中 |
+| 内联 fixture 重复 4 份 | `src/ipc/tests.rs`、`src/mcp/tools.rs`、`tests/mcp_e2e.rs`、`tests/sudo_e2e.rs` | `open_in_memory + generate_master_key + AppState` 各写一份，可收敛到 `tests/common/mod.rs` | 低 |
+| 直接操作私有字段 | `src/sudo_bridge.rs` 另有 5 条用例 | 手工 `pending.lock().insert(...)` 摆状态；`register_pending` 已抽出，迁移成本很低 | 低 |
+| 断言偏宽 | `tests/mcp_e2e.rs` 的 `poll1` 状态断言 | Q4 契约为 queued / running / completed / failed 四态，现仅断言 `.is_some()` | 低 |
+| 生成脚本文本断言 15+ 条 | `src/ssh/protocol.rs` | 对生成的 shell 脚本**源码**做子串断言。由真实缺陷驱动（V1 明文落盘、askpass 标记必须走 stderr），有价值；但与 `tests/*_e2e.rs` 的行为级覆盖重复，且改文案即失效 | **待定** |
+| `rmcp` 默认值绊线 | `src/mcp/server.rs` 的 `rmcp_default_idle_timeout_is_the_five_minute_trap` | 断言第三方库默认 300s；产品不变式已由相邻用例覆盖。留作"上游改了会报警"的绊线，还是删掉 | **待定** |
+| 前端无测试 | `src/` | 无 vitest / jest、无 `test` 脚本，质量门禁只有 `pnpm typecheck`（见 §5.9）。引入属**范围决策** | **待定** |
+
 ---
 
 ## 5. 测试规范（强制）
@@ -416,7 +431,7 @@ Refs: #123
 
 - 清理测试**必须保留有意义的回归覆盖**；
 - 若删除的测试间接守住了某条真实契约，要**补一个更小、直接断言该契约的测试**，而不是直接删掉；
-- 尚未完成的测试债登记在 §4.4 / §4.5，不要靠"没人记得"来掩盖。
+- 尚未完成的测试债登记在 §4.6，不要靠"没人记得"来掩盖。
 
 ### 5.9 前端测试（现状说明）
 
@@ -428,7 +443,9 @@ Refs: #123
 
 ```bash
 # 本地测试（单元 + 不依赖真实环境的集成），日常与提交前必跑
-cd src-tauri && cargo test
+# -j 2：并发过高会耗尽 Windows 页面文件、把 target 产物写坏（E0463/E0462），
+#      现象、根因与恢复步骤见 docs/development-troubleshooting.md
+cd src-tauri && cargo test -j 2
 
 # 真实环境端到端（需先导出 MFPERCH_TEST_*，见 docs/design/test-environment.md）
 cd src-tauri && cargo test --test ssh_integration -- --ignored --test-threads=1
