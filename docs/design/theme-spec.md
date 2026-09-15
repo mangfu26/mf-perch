@@ -27,6 +27,8 @@
 | 表面 | `--surface` | `rgba(255,255,255,.035)` | `#ffffff` |
 | 表面（悬停） | `--surface-hover` | `rgba(255,255,255,.06)` | `#f5f5f4` |
 | 代码底 | `--surface-code` | `rgba(0,0,0,.30)` | `#fafaf9` |
+| 原生下拉弹层底 | `--option-bg` | `#1a1a24` | `#ffffff` |
+| 原生下拉弹层字 | `--option-fg` | `#e8e8f0` | `#1c1917` |
 | 描边 | `--border` | `rgba(255,255,255,.08)` | `#e7e5e4` |
 | 正文 | `--text` | `#e8e8f0` | `#1c1917` |
 | 次要文字 | `--text-muted` | `#8a8a9e` | `#78716c` |
@@ -37,6 +39,10 @@
 | 信息/执行中 | `--info` | `#22d3ee` | `#0891b2` |
 
 每种语义色配套 `*-soft` 令牌（低透明度背景），用于状态标签。
+
+> **`--option-bg` / `--option-fg` 刻意用不透明实色，不是笔误**：原生 `<select>`
+> 的弹出层由 WebView 绘制，只有当 `<option>` 背景为实色时才采用作者样式；
+> 半透明值会被当作"未设背景"回退到系统配色（暗色主题下变白底）。详见 §4.5。
 
 ## 4. 组件与状态约定
 
@@ -50,6 +56,7 @@
 | 主按钮 | 暗色为紫渐变 + 辉光；亮色为纯靛蓝 + 浅阴影 |
 | MCP 状态卡 | 左下角常驻，显示监听地址与运行指示点 |
 | 弹窗（模态） | **只有内容区滚动**，标题与底部按钮常驻；顶部对齐；见 §4.1 |
+| 原生下拉 `<select>` | 弹层配色走 `--option-bg/--option-fg`（实色），根元素按主题设 `color-scheme`；见 §4.5 |
 
 ### 4.1 弹窗（模态）的高度与滚动
 
@@ -144,6 +151,43 @@
 3. **不用 `v-html`**：用 Vue 模板渲染 `<span>`，不给将来留注入面；
 4. 解析失败时**退回纯文本**展示，格式化绝不导致内容丢失；
 5. 保留 `max-h-56 overflow-auto` 与 `whitespace-pre-wrap break-all`（窄窗口兜底）。
+
+### 4.5 原生下拉 `<select>` 的主题适配
+
+表单里的下拉统一用 [`BaseInput`](../../src/components/ui/BaseInput.vue) 的
+`as="select"`，其弹出层配色由两处配合实现：
+
+1. **根元素设 `color-scheme`**（`src/styles/theme.css`）：`:root/[data-theme="dark"]` → `dark`，
+   `[data-theme="light"]` → `light`。这驱动滚动条、勾选框等**多数**原生控件跟随主题。
+2. **`<option>` 显式给不透明实色**：`BaseInput` 对 select 追加
+   `[&>option]:bg-option-bg [&>option]:text-option-fg`。
+
+> **为什么两步都要、且 option 必须实色（踩过的坑）**：
+> 起初只设了 `color-scheme: dark` + 半透明的 `--surface` 作 option 背景，
+> 结果暗色主题下主机下拉弹层**仍是白底**。原因是 Chromium/WebView2 只在
+> `<option>` 背景为**不透明实色**时才肯用作者样式绘制弹层；半透明值被判定为
+> "未显式设背景"，回退到跟随系统的浅色。故新增专用实色令牌 `--option-bg/--option-fg`，
+> 不能复用 `--surface` 这类带 alpha 的令牌。
+
+**已知边界（诚实记录）**：这是**原生 select 的固有约束**——`color-scheme` + 实色 option
+能让弹层明暗正确，但弹出项的圆角、间距、悬停高亮仍受系统渲染限制，无法与应用完全统一。
+若将来要严格统一视觉，需改用自绘下拉（reka-ui `Listbox`，含键盘导航 / 焦点管理 / portal 定位），
+属另一轮工作量，当前刻意不做（客户已确认走原生方案）。
+
+### 4.6 BaseInput 的宽度覆盖契约
+
+[`BaseInput`](../../src/components/ui/BaseInput.vue) 内部基础样式写死了 `w-full`，
+调用方常需覆盖宽度（如搜索行的 `w-48`、设置页的 `w-24`）。为此：
+
+- 组件设 `defineOptions({ inheritAttrs: false })`，**关闭 Vue 的 attribute 自动透传**；
+- 改为在三个分支（input/textarea/select）上用 `cn()`（tailwind-merge）把**外部 class 放最后合并**，
+  冲突项（宽度、内边距等）由调用方可靠覆盖；其余透传属性经 `useAttrs` 解构后 `v-bind` 落到根元素。
+
+> **为什么不能靠默认透传（踩过的坑）**：Vue 的 fallthrough 会把外部 class **原样字符串拼接**
+> 到内部 class 之后，**不经过 tailwind-merge**。于是 DOM 上同时有 `w-full` 和 `w-48`，
+> 两者特异性相同、胜负取决于样式表顺序——实测 `w-full` 赢，下拉撑满整行、把同行元素挤走。
+> 这与 §4.4 里 BaseButton 的处理**方向相反**：按钮的语义色刻意**不给 class 覆盖**（走 `tone` prop），
+> 而输入框的宽度**就是要让 class 覆盖**，所以两者契约不同，勿混用。
 
 ## 5. 设计原则
 
