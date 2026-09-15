@@ -8,6 +8,10 @@
 //! | `ask` | 经系统通知征得同意后注入；拒绝或超时则让 sudo 失败 |
 //! | `auto` | 检测到请求即自动注入 |
 //!
+//! `ask` 模式下**同一条命令只问一次**（Q36 / D44）：sudo 密码错误会重试
+//! （默认 3 次），每次重试都重新调用 askpass；拒绝一经给出便对该命令的
+//! 后续索要生效，人类不必连点三次「拒绝」。记忆随命令结束失效。
+//!
 //! ## 防误用的关键设计
 //!
 //! - **不靠命令改写**：拦截由远端 shell 函数完成（`protocol::sudo_function_def`），
@@ -28,6 +32,9 @@
 //! 为什么不用"关闭 FIFO 让 read 得到 EOF"（初版设计）：askpass 已用
 //! `exec 3<>fifo` 以 O_RDWR 同时持有读写端，EOF 不会因外部关闭写端而出现。
 //! 该结论由 WSL 端到端实测得出，详见 `docs/design/sudo.md` §7.3。
+//!
+//! 注意：写入空密码会让 sudo **重试**（默认 3 次），因此拒绝必须被记住，
+//! 否则人类会被连续询问三次——见 [`AskOutcome`] 与 `docs/design/sudo.md` §7.10。
 
 use zeroize::Zeroizing;
 
@@ -102,6 +109,60 @@ impl SudoDecision {
     /// 超时视为拒绝：无人响应时不应默认提权。
     pub fn on_timeout() -> Self {
         Self::Deny
+    }
+}
+
+/// ask 模式下一次询问的**来源**（Q36）。
+///
+/// 五种来源对 sudo 的动作都是"不注入密码"，但它们**不是同一件事**：
+/// 审计（人类事后核对"这次提权是谁拒绝的"）与"还要不要再问一次"
+/// 都依赖这个区分。把它们折叠成一个 `Deny`，命令历史就会把"没人应答"
+/// 写成"用户已拒绝"——那是在审计栏里说假话。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskOutcome {
+    /// 人类本次点击「允许」。
+    Allowed,
+    /// 人类本次点击「拒绝」。
+    Denied,
+    /// 等待人类应答超时，按拒绝处理（fail-closed）。
+    TimedOut,
+    /// 询问通道不可用（界面 / 桥接异常），按拒绝处理。
+    Unavailable,
+    /// 本条命令此前已被拒绝，自动沿用，未再打扰人类（Q36）。
+    DeniedByMemo,
+}
+
+impl AskOutcome {
+    /// 对应的 sudo 决策：**只有「允许」会提权**，其余一律 fail-closed。
+    pub fn decision(self) -> SudoDecision {
+        match self {
+            Self::Allowed => SudoDecision::Allow,
+            Self::Denied | Self::TimedOut | Self::Unavailable | Self::DeniedByMemo => {
+                SudoDecision::Deny
+            }
+        }
+    }
+
+    /// 是否应记住这次结果，使同一条命令的后续索要不再询问人类（Q36）。
+    ///
+    /// 除「允许」外都要记住：允许意味着这次提权已经成功，sudo 不会再问；
+    /// 而拒绝 / 超时 / 无法询问都会让 sudo 重试，不记住的话人类会在
+    /// 「60 秒超时 × 最多 3 次重试」的窗口里被反复弹窗。
+    pub fn should_remember(self) -> bool {
+        self != Self::Allowed
+    }
+
+    /// 写入命令输出的审计备注（人类与 Agent 都读得到）。
+    pub fn audit_note(self) -> &'static str {
+        match self {
+            Self::Allowed => "sudo 提权请求：用户已允许",
+            Self::Denied => "sudo 提权请求：用户已拒绝",
+            Self::TimedOut => "sudo 提权请求：等待确认超时，已按拒绝处理",
+            Self::Unavailable => "sudo 提权请求：确认通道不可用，已按拒绝处理",
+            Self::DeniedByMemo => {
+                "sudo 提权请求：本次命令此前已拒绝提权，后续索要自动沿用拒绝（未再询问）"
+            }
+        }
     }
 }
 
@@ -244,6 +305,58 @@ mod tests {
     #[test]
     fn timeout_decision_is_deny() {
         assert_eq!(SudoDecision::on_timeout(), SudoDecision::Deny);
+    }
+
+    /// `AskOutcome` →（决策、是否记住）的完整映射。
+    ///
+    /// 守的是一条**权限边界不变式**：除「允许」外一律不得提权，
+    /// 且必须被记住——不记住，同一条命令里的 sudo 重试就会反复弹窗（Q36）。
+    #[test]
+    fn only_allow_may_escalate_and_every_other_outcome_is_remembered() {
+        let cases = [
+            (AskOutcome::Allowed, SudoDecision::Allow, false),
+            (AskOutcome::Denied, SudoDecision::Deny, true),
+            (AskOutcome::TimedOut, SudoDecision::Deny, true),
+            (AskOutcome::Unavailable, SudoDecision::Deny, true),
+            (AskOutcome::DeniedByMemo, SudoDecision::Deny, true),
+        ];
+        for (outcome, decision, remember) in cases {
+            assert_eq!(outcome.decision(), decision, "{outcome:?} 的决策不符");
+            assert_eq!(
+                outcome.should_remember(),
+                remember,
+                "{outcome:?} 的记忆语义不符"
+            );
+            assert!(
+                !outcome.audit_note().is_empty(),
+                "{outcome:?} 必须有审计备注"
+            );
+        }
+    }
+
+    /// 五种来源的审计备注两两不同。
+    ///
+    /// 守的是审计的可核对性：命令历史里读到哪一条备注，就唯一对应一种经过。
+    /// 若"当场拒绝"与"自动沿用"用了同一句话，人类事后核对时会误以为
+    /// 每一次重试都是自己点的拒绝。
+    #[test]
+    fn audit_notes_distinguish_every_ask_outcome() {
+        let notes = [
+            AskOutcome::Allowed,
+            AskOutcome::Denied,
+            AskOutcome::TimedOut,
+            AskOutcome::Unavailable,
+            AskOutcome::DeniedByMemo,
+        ]
+        .map(AskOutcome::audit_note);
+
+        for (i, a) in notes.iter().enumerate() {
+            for (j, b) in notes.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "第 {i} 与第 {j} 种来源的审计备注相同，无法区分经过");
+                }
+            }
+        }
     }
 
     #[test]
