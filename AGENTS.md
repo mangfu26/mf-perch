@@ -330,10 +330,9 @@ Refs: #123
 
 | 项 | 位置 | 说明 | 优先级 |
 | ---- | ---- | ---- | ---- |
-| 生成脚本文本断言 15+ 条 | `src/ssh/protocol.rs` | 对生成的 shell 脚本**源码**做子串断言。由真实缺陷驱动（V1 明文落盘、askpass 标记必须走 stderr），有价值；但与 `tests/*_e2e.rs` 的行为级覆盖重复，且改文案即失效 | **待定** |
-| └ 其中的真子集 | `src/ssh/protocol.rs` 的 `session_setup_only_cleans_regular_files_with_delete_flag` | 与同文件 `session_setup_deletes_leave_no_window_for_plaintext` 是**同一份脚本 + 同一谓词**，属真子集；随上一行的政策题一并处理，不单独动 | **待定** |
-| `rmcp` 默认值绊线 | `src/mcp/server.rs` 的 `rmcp_default_idle_timeout_is_the_five_minute_trap` | 断言第三方库默认 300s；产品不变式已由相邻用例覆盖。留作"上游改了会报警"的绊线，还是删掉 | **待定** |
-| 前端无测试 | `src/` | 无 vitest / jest、无 `test` 脚本，质量门禁只有 `pnpm typecheck`（见 §5.9）。引入属**范围决策** | **待定** |
+| 生成脚本文本断言 15+ 条 | `src/ssh/protocol.rs` | 对生成的 shell 脚本**源码**做子串断言，由真实缺陷驱动（V1 明文落盘、askpass 标记必须走 stderr）。按 §5.2 判定：替代覆盖在 `#[ignore]` 后面、默认不跑，**不构成"已在别处覆盖"**，故不属于该删的重复；真正遗留的弱点是**脆**（改脚本文案可能失效）。**已决策：保留主体**（客户确认） | 已决 |
+
+**当前没有待决策的测试债。**
 
 **已复核、判定不算债（不要重复上报）**：
 
@@ -343,7 +342,7 @@ Refs: #123
 | `tests/ssh_integration.rs::session_is_not_confused_by_marker_like_output` ↔ `src/ssh/session.rs` 的 nonce 单测 | **不是重复**。单测喂的是合成输入，集成测试走真实 SSH 回显与真实输出交错 |
 | `src/ipc/tests.rs`、`src/mcp/tools.rs` 的 fixture ↔ `tests/common/mod.rs` | **无法合并**。`src/` 内的单元测试在生产 crate 内部，拿不到 `tests/` 的模块，只能各自保留 |
 
-**本轮已清偿**（保留记录，避免重复劳动）：集成测试 fixture 已收敛到 `tests/common/mod.rs`（`test_state` / `need_env` / `need_env_port`）；`src/sudo_bridge.rs` 全部用例改经 `register_pending` 登记，不再直接操作私有字段；`tests/mcp_e2e.rs` 的 `poll1` 改为精确四态断言；`tests/mcp_e2e.rs` 中与 `src/mcp/tools.rs` 重复的工具 schema **内容**断言已删（保留"经协议返回为对象形态"这一端到端事实）。
+**本轮已清偿**（保留记录，避免重复劳动）：集成测试 fixture 已收敛到 `tests/common/mod.rs`（`test_state` / `need_env` / `need_env_port`）；`src/sudo_bridge.rs` 全部用例改经 `register_pending` 登记，不再直接操作私有字段；`tests/mcp_e2e.rs` 的 `poll1` 改为精确四态断言；`tests/mcp_e2e.rs` 中与 `src/mcp/tools.rs` 重复的工具 schema **内容**断言已删（保留"经协议返回为对象形态"这一端到端事实）；`src/ssh/protocol.rs` 的真子集用例 `session_setup_only_cleans_regular_files_with_delete_flag` 已删——它被同文件 `session_setup_deletes_leave_no_window_for_plaintext` 严格覆盖（后者遍历**每一处** `-delete` 并额外断言删除早于本会话 askpass 写入，前者只看第一处），删除无覆盖损失；`src/mcp/server.rs` 的 `rmcp_default_idle_timeout_is_the_five_minute_trap` 已删——它断言的是第三方库的内部常量，失败不指向用户问题（§5.1 自检为「否」），知识已完整保存在 `docs/decisions.md` **D38** 与 `src/mcp/server.rs` 的生产注释中，而真不变式（我们的值不等于该默认值、且足够长）另有两条用例覆盖；相邻用例的注释已改为指向 D38，并说明为何刻意不再断言上游默认值；**前端测试基础设施已落地**（vitest 覆盖 `src/lib/` 纯逻辑，另有 `scripts/check-ipc-contract.mjs` 守住跨语言命令名契约），范围与边界见 §5.9。
 
 ---
 
@@ -369,10 +368,27 @@ Refs: #123
 
 ### 5.2 不要为一个改动到处撒测试
 
+**本条针对的是"为一个小改动把测试撒到各层"的膨胀，不是"删除任何看起来重复的测试"的许可。**
+判定两条测试是否真属重复、该收敛，必须**三条全为「是」**：
+
+1. **是同一条不变式吗？** 换个更硬的问法：**同一个生产缺陷会让这两条测试都失败吗？**
+   如果它们守的是**不同的**缺陷，那就不是重复——即使断言写法看着很像。
+   例：`tests/update_e2e.rs`（走真实 JSON，覆盖"清单字段名 → 状态分支"的线上映射）与
+   `src/update.rs` 的单测（直接构造 `UpdateManifest`，绕过 serde）：字段名写错只让前者失败，
+   两者守的不是同一个缺陷，**都要留**。
+2. **"已在别处覆盖"的那个"别处"，在同一道门禁里跑吗？**
+   带 `#[ignore]`、需要真实 SSH / WSL / 外部服务的端到端测试**不能**作为进程内测试的替代覆盖——
+   它平时不跑，删掉进程内断言等于把防线搬出默认门禁（P3 的教训形态：报告是绿的，属性却没被验证）。
+3. **删掉后维护成本真的降了吗？** fixture 与断言**逐字重复**才算降；只是"看着像"不算。
+
+三条全为「是」→ 收敛（合并 fixture 或删重复用例）。
+有任何一条为「否」→ 保留，并把判断理由写进 §4.6 的"已复核、判定不算债"小节，避免反复重审。
+
+其余要求：
+
 - 一个聚焦的功能 / 修复，**优先扩展现有合适的测试文件**；确实需要新建文件时**最多新增一个**，
   并把关键回归用例集中在那里；
 - **禁止**因为调用链跨了 `store/`、`ssh/`、`mcp/`、`ipc/`、`terminal/` 等层，就在每一层各建一个测试文件；
-- **禁止**在多层重复同一套 fixture 与断言；同一个不变量只在一个最贴近它的层上断言；
 - 触碰的生产文件数量多，**不是**增加测试文件的理由；
 - 用例要紧凑，只针对可观察行为。
 
@@ -440,11 +456,27 @@ Refs: #123
 - 若删除的测试间接守住了某条真实契约，要**补一个更小、直接断言该契约的测试**，而不是直接删掉；
 - 尚未完成的测试债登记在 §4.6，不要靠"没人记得"来掩盖。
 
-### 5.9 前端测试（现状说明）
+### 5.9 前端测试（范围与边界）
 
-前端（`src/`）目前**没有任何测试基础设施**（无 vitest / jest，无 `test` 脚本），属**已知缺口**。
-新增前端测试需先由客户确认技术选型（§0.5 提问纪律）；一旦引入，同样适用本章 §5.1–§5.4 的质量标准。
-在补齐之前，前端的质量门禁只有 `pnpm typecheck`。
+前端测试**范围刻意收窄**：只覆盖 `src/lib/` 的**纯逻辑**（IPC 信封解包与错误码映射、
+数值格式化）。配置见 `vitest.config.ts`，运行方式见 §5.10。
+
+**不覆盖**（有意为之，不是遗漏）：
+
+- **组件测试**：`src/components/` 多为声明式展示，引入 `@vue/test-utils` + DOM 环境
+  投入大、收益低。等出现"值得用测试锁住的交互逻辑"再加，避免"框架在就顺手写测试"（§5.1）。
+- **Store 测试**：`src/stores/` 需要 Pinia 测试环境，同上，按需再加。
+
+前端共有**三道**默认门禁，分工明确、互不替代：
+
+| 门禁 | 守住什么 |
+| ---- | ---- |
+| `pnpm typecheck` | 类型层面（`vue-tsc`） |
+| `pnpm check:ipc` | **跨语言契约**：命令名必须在「Rust `#[tauri::command]` 定义」「`generate_handler!` 注册」「前端 `call()` 字符串」**三处**一致。这是 `vue-tsc` 与 `cargo` **都查不出**的运行期失败——尤其"定义了但没注册 = 命令不可达"是 Tauri 最经典的静默坑 |
+| `pnpm test` | 运行期逻辑：信封/错误码契约与格式化边界（vitest，node 环境） |
+
+> `check:ipc` 只看**生产**调用点，会跳过 `*.test.ts`——测试里的 `call()` 是打桩，
+> 命令名是假的，算进来只会制造误报。
 
 ### 5.10 运行方式（速查）
 
@@ -457,6 +489,8 @@ cd src-tauri && cargo test -j 2
 # 真实环境端到端（需先导出 MFPERCH_TEST_*，见 docs/design/test-environment.md）
 cd src-tauri && cargo test --test ssh_integration -- --ignored --test-threads=1
 
-# 前端类型检查（当前唯一的前端质量门禁）
-pnpm typecheck
+# 前端三道门禁（都不需要真实环境，与 §5.9 的分工一致）
+pnpm test        # src/lib 纯逻辑单测（vitest）
+pnpm typecheck   # 类型（vue-tsc）
+pnpm check:ipc   # 跨语言命令名契约：Rust 定义 / generate_handler! 注册 / 前端 call 字符串三处一致
 ```

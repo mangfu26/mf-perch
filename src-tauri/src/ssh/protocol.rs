@@ -906,19 +906,6 @@ mod tests {
     }
 
     #[test]
-    fn session_setup_only_cleans_regular_files_with_delete_flag() {
-        // 清理遗留必须限定为普通文件（-type f），
-        // 这样即便真有 FIFO 残留也不会误删其它会话正在使用的节点。
-        let s = session_setup_script("deadbeef", true);
-        let ix = s.find("-delete").expect("应清理历史遗留的普通文件");
-        let prefix = &s[..ix];
-        assert!(
-            prefix.contains("-type f"),
-            "遗留清理必须限定 -type f，避免误删 FIFO：\n{prefix}"
-        );
-    }
-
-    #[test]
     fn cleanup_script_removes_only_this_session_files() {
         let s = session_cleanup_script("nonce_x");
         assert!(s.contains(&format!("{ASKPASS_NAME}.nonce_x")), "{s}");
