@@ -17,6 +17,7 @@ import {
   ArrowLeft,
   Archive,
   RotateCcw,
+  Unplug,
   Trash2,
   ChevronDown,
   ChevronRight,
@@ -170,7 +171,8 @@ const confirmWarning = computed(() => {
         variant="primary"
         @click="ask('reconnect')"
       >
-        <RotateCcw class="h-3.5 w-3.5" />
+        <!-- 重连用 Unplug，与"恢复归档"的 RotateCcw、顶栏"刷新页面"的 RefreshCw 都区分开 -->
+        <Unplug class="h-3.5 w-3.5" />
         {{ t("terminal.reconnect") }}
       </BaseButton>
       <BaseButton v-else variant="default" @click="ask('archive')">
