@@ -31,6 +31,9 @@ use mf_perch_lib::state::AppState;
 use mf_perch_lib::store::{credentials, hosts};
 use mf_perch_lib::terminal::sudo::{SudoDecision, SudoRequest};
 
+mod common;
+use common::{need_env, need_env_port, test_state};
+
 /// 测试目标信息。
 struct Target {
     address: String,
@@ -42,32 +45,19 @@ struct Target {
 
 /// 读取测试目标。
 ///
-/// **缺失即失败**（AGENTS.md §5.6）：这里直接 `panic!`，而不是返回 `Option`
-/// 让调用方 `return` 跳过——静默跳过会让测试报告显示"通过"，
-/// 而实际一条断言都没执行（绿灯假象）。需要跳过时请用 `#[ignore]` 表达。
+/// 环境变量缺失时的失败语义由 `common::need_env` 统一保证（AGENTS.md §5.6）：
+/// 直接 `panic!`，而不是返回 `Option` 让调用方 `return` 跳过——静默跳过会让
+/// 测试报告显示"通过"，而实际一条断言都没执行（绿灯假象）。
+/// 需要跳过时请用 `#[ignore]` 表达。
 fn target() -> Target {
-    fn need(key: &str) -> String {
-        std::env::var(key).unwrap_or_else(|_| {
-            panic!("未设置环境变量 {key}；联调环境准备见 docs/design/test-environment.md")
-        })
-    }
-
     Target {
-        address: need("MFPERCH_TEST_HOST"),
-        port: need("MFPERCH_TEST_PORT")
-            .parse()
-            .expect("MFPERCH_TEST_PORT 应为端口号"),
-        username: need("MFPERCH_TEST_USER"),
-        key_pem: std::fs::read_to_string(need("MFPERCH_TEST_KEY"))
+        address: need_env("MFPERCH_TEST_HOST"),
+        port: need_env_port("MFPERCH_TEST_PORT"),
+        username: need_env("MFPERCH_TEST_USER"),
+        key_pem: std::fs::read_to_string(need_env("MFPERCH_TEST_KEY"))
             .expect("读取测试私钥失败：确认 MFPERCH_TEST_KEY 指向可读文件"),
-        sudo_password: need("MFPERCH_TEST_SUDO_PW"),
+        sudo_password: need_env("MFPERCH_TEST_SUDO_PW"),
     }
-}
-
-fn test_state() -> (Arc<AppState>, [u8; 32]) {
-    let conn = mf_perch_lib::store::db::open_in_memory().expect("in-memory db");
-    let key = mf_perch_lib::store::crypto::generate_master_key();
-    (Arc::new(AppState::new_for_test(conn, key)), key)
 }
 
 /// 建主机与密钥凭据，并配置 sudo 策略。

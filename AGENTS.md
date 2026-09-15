@@ -330,13 +330,20 @@ Refs: #123
 
 | 项 | 位置 | 说明 | 优先级 |
 | ---- | ---- | ---- | ---- |
-| 跨层重复用例 | `tests/update_e2e.rs` ↔ `src/update.rs`；`tests/mcp_e2e.rs`（schema 段）↔ `src/mcp/tools.rs`；`tests/ssh_integration.rs` ↔ `src/ssh/protocol.rs` | 同一不变量在两层各断言一份（违反 §5.2）。收敛时注意 e2e 独有的是"清单 JSON 线上字段格式"与端到端链路，**不要连真覆盖一起删** | 中 |
-| 内联 fixture 重复 4 份 | `src/ipc/tests.rs`、`src/mcp/tools.rs`、`tests/mcp_e2e.rs`、`tests/sudo_e2e.rs` | `open_in_memory + generate_master_key + AppState` 各写一份，可收敛到 `tests/common/mod.rs` | 低 |
-| 直接操作私有字段 | `src/sudo_bridge.rs` 另有 5 条用例 | 手工 `pending.lock().insert(...)` 摆状态；`register_pending` 已抽出，迁移成本很低 | 低 |
-| 断言偏宽 | `tests/mcp_e2e.rs` 的 `poll1` 状态断言 | Q4 契约为 queued / running / completed / failed 四态，现仅断言 `.is_some()` | 低 |
 | 生成脚本文本断言 15+ 条 | `src/ssh/protocol.rs` | 对生成的 shell 脚本**源码**做子串断言。由真实缺陷驱动（V1 明文落盘、askpass 标记必须走 stderr），有价值；但与 `tests/*_e2e.rs` 的行为级覆盖重复，且改文案即失效 | **待定** |
+| └ 其中的真子集 | `src/ssh/protocol.rs` 的 `session_setup_only_cleans_regular_files_with_delete_flag` | 与同文件 `session_setup_deletes_leave_no_window_for_plaintext` 是**同一份脚本 + 同一谓词**，属真子集；随上一行的政策题一并处理，不单独动 | **待定** |
 | `rmcp` 默认值绊线 | `src/mcp/server.rs` 的 `rmcp_default_idle_timeout_is_the_five_minute_trap` | 断言第三方库默认 300s；产品不变式已由相邻用例覆盖。留作"上游改了会报警"的绊线，还是删掉 | **待定** |
 | 前端无测试 | `src/` | 无 vitest / jest、无 `test` 脚本，质量门禁只有 `pnpm typecheck`（见 §5.9）。引入属**范围决策** | **待定** |
+
+**已复核、判定不算债（不要重复上报）**：
+
+| 疑似重复 | 复核结论 |
+| ---- | ---- |
+| `tests/update_e2e.rs` ↔ `src/update.rs` | **不是重复**。`src/update.rs` 的单测直接构造 `UpdateManifest` 结构体（`manifest()` / `manifest_with_asset()`），**绕过 serde 解析**；只有 e2e 走真实 JSON 文本，覆盖"清单字段名 → 状态分支"的线上映射。删掉 e2e 会丢掉"字段名写错、解析静默失配"这类缺陷的防线 |
+| `tests/ssh_integration.rs::session_is_not_confused_by_marker_like_output` ↔ `src/ssh/session.rs` 的 nonce 单测 | **不是重复**。单测喂的是合成输入，集成测试走真实 SSH 回显与真实输出交错 |
+| `src/ipc/tests.rs`、`src/mcp/tools.rs` 的 fixture ↔ `tests/common/mod.rs` | **无法合并**。`src/` 内的单元测试在生产 crate 内部，拿不到 `tests/` 的模块，只能各自保留 |
+
+**本轮已清偿**（保留记录，避免重复劳动）：集成测试 fixture 已收敛到 `tests/common/mod.rs`（`test_state` / `need_env` / `need_env_port`）；`src/sudo_bridge.rs` 全部用例改经 `register_pending` 登记，不再直接操作私有字段；`tests/mcp_e2e.rs` 的 `poll1` 改为精确四态断言；`tests/mcp_e2e.rs` 中与 `src/mcp/tools.rs` 重复的工具 schema **内容**断言已删（保留"经协议返回为对象形态"这一端到端事实）。
 
 ---
 
