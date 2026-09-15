@@ -12,6 +12,9 @@
 
 :root,
 [data-theme="dark"] {
+  /* 让浏览器/WebView 的原生控件（下拉弹出层、滚动条、日期选择等）走暗色配色 */
+  color-scheme: dark;
+
   /* 背景层级 */
   --bg: #08080c;
   --bg-elevated: rgba(0, 0, 0, 0.35);
@@ -53,6 +56,9 @@
 }
 
 [data-theme="light"] {
+  /* 亮色主题下原生控件（下拉弹出层等）走亮色配色 */
+  color-scheme: light;
+
   --bg: #fafaf9;
   --bg-elevated: #ffffff;
   --surface: #ffffff;

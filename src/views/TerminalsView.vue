@@ -284,8 +284,10 @@ const confirmWarning = computed(() => {
 
     <!-- ============ 全局搜索（Q17） ============ -->
     <template v-else>
-      <div class="mb-4 flex gap-2">
-        <div class="relative flex-1">
+      <div class="mb-4 flex items-center gap-2">
+        <!-- min-w-0：允许该 flex 项收缩到内容宽度以下，否则长主机名的下拉
+             会把搜索框挤成图标宽的窄条（flex 子项默认 min-width:auto）。 -->
+        <div class="relative min-w-0 flex-1">
           <Search
             class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-text-muted"
           />
@@ -295,13 +297,14 @@ const confirmWarning = computed(() => {
             :placeholder="t('command.searchPlaceholder')"
           />
         </div>
-        <BaseInput v-model="filterHostId" as="select" class="w-48">
+        <!-- shrink-0：下拉与按钮不参与压缩，宽度由自身决定。 -->
+        <BaseInput v-model="filterHostId" as="select" class="w-48 shrink-0">
           <option value="">{{ t("command.allHosts") }}</option>
           <option v-for="h in hosts.hosts" :key="h.id" :value="h.id">
             {{ hosts.label(h) }}
           </option>
         </BaseInput>
-        <BaseButton variant="primary" @click="runSearch">
+        <BaseButton variant="primary" class="shrink-0 whitespace-nowrap" @click="runSearch">
           {{ t("common.search") }}
         </BaseButton>
       </div>
