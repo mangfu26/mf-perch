@@ -21,6 +21,11 @@
   --surface: rgba(255, 255, 255, 0.035);
   --surface-hover: rgba(255, 255, 255, 0.06);
   --surface-code: rgba(0, 0, 0, 0.3);
+  /* 原生 <select> 弹出层背景：必须是**不透明实色**。
+     Chromium/WebView2 只在 option 背景为实色时才采用作者样式，
+     半透明（如 --surface）会被当作"未设背景"而回退到系统浅色。 */
+  --option-bg: #1a1a24;
+  --option-fg: #e8e8f0;
 
   /* 描边 */
   --border: rgba(255, 255, 255, 0.08);
@@ -64,6 +69,9 @@
   --surface: #ffffff;
   --surface-hover: #f5f5f4;
   --surface-code: #fafaf9;
+  /* 原生下拉弹出层：亮色下同样给不透明实色（白底深字）。 */
+  --option-bg: #ffffff;
+  --option-fg: #1c1917;
 
   --border: #e7e5e4;
   --border-strong: #d6d3d1;
@@ -101,6 +109,8 @@
   --color-surface: var(--surface);
   --color-surface-hover: var(--surface-hover);
   --color-surface-code: var(--surface-code);
+  --color-option-bg: var(--option-bg);
+  --color-option-fg: var(--option-fg);
   --color-border-base: var(--border);
   --color-border-strong: var(--border-strong);
   --color-text-base: var(--text);

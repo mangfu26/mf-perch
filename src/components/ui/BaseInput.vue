@@ -39,10 +39,10 @@ const classes = computed(() =>
     "text-text-base outline-none transition-colors",
     "placeholder:text-text-muted focus:border-accent",
     "disabled:cursor-not-allowed disabled:opacity-60",
-    // 下拉弹出层：根元素已按主题设 color-scheme，这里再给 <option> 兜底配色，
-    // 避免个别 WebView 版本仍用系统默认白底黑字（Q：暗色主题下弹层不适配）。
-    props.as === "select" &&
-      "[&>option]:bg-surface [&>option]:text-text-base",
+    // 下拉弹出层：Chromium/WebView2 只在 <option> 背景为**不透明实色**时才采用
+    // 作者样式，半透明令牌（如 --surface）会被当作"未设背景"回退到系统浅色。
+    // 故用专用的实色令牌 bg-option-bg / text-option-fg（见 theme.css）。
+    props.as === "select" && "[&>option]:bg-option-bg [&>option]:text-option-fg",
     props.mono && "font-mono text-[12px]",
     // 外部 class 放最后：让调用方覆盖宽度/内边距等冲突项。
     attrs.class as string | undefined,
