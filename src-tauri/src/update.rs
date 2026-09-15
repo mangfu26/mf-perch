@@ -41,18 +41,22 @@ pub const REQUEST_TIMEOUT_SECS: u64 = 5;
 ///
 /// 与 Tauri 的目标三元组风格一致，便于将来扩展多平台。
 pub fn platform_key() -> &'static str {
-    if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        "windows-x86_64"
-    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
-        "windows-aarch64"
-    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "darwin-aarch64"
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "darwin-x86_64"
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "linux-x86_64"
-    } else {
-        "unknown"
+    platform_key_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// 平台标识的映射规则本身（与编译目标无关，因此可以对**全部**平台做测试）。
+///
+/// 参数取自 `std::env::consts::OS` / `ARCH`，取值如 `"windows"` / `"x86_64"`。
+/// 未列出的组合返回 `"unknown"`：更新检查会因此找不到安装包——
+/// 这正是"漏配平台"应有的显式表现，而不是静默取到别的平台的包。
+fn platform_key_for(os: &str, arch: &str) -> &'static str {
+    match (os, arch) {
+        ("windows", "x86_64") => "windows-x86_64",
+        ("windows", "aarch64") => "windows-aarch64",
+        ("macos", "aarch64") => "darwin-aarch64",
+        ("macos", "x86_64") => "darwin-x86_64",
+        ("linux", "x86_64") => "linux-x86_64",
+        _ => "unknown",
     }
 }
 
@@ -710,11 +714,40 @@ mod tests {
         assert!(ignored_version(&conn).unwrap().is_none());
     }
 
+    /// 清单里已支持的平台必须逐个映射正确：漏掉一个，该平台的更新检查就永远找不到安装包。
+    ///
+    /// 这里对**全部**平台断言。原先用 `#[cfg(target_os = "windows")]` 包住断言行，
+    /// 在 macOS / Linux 上测试体为空、恒绿——等于没测（§5.3 的"绿灯假象"）。
     #[test]
-    fn platform_key_is_not_unknown_on_supported_targets() {
-        // 若为 unknown，说明遗漏了当前平台，检查将永远找不到安装包。
-        #[cfg(target_os = "windows")]
-        assert_ne!(platform_key(), "unknown");
+    fn platform_key_maps_every_supported_target() {
+        let cases = [
+            ("windows", "x86_64", "windows-x86_64"),
+            ("windows", "aarch64", "windows-aarch64"),
+            ("macos", "aarch64", "darwin-aarch64"),
+            ("macos", "x86_64", "darwin-x86_64"),
+            ("linux", "x86_64", "linux-x86_64"),
+        ];
+        for (os, arch, expected) in cases {
+            assert_eq!(platform_key_for(os, arch), expected, "{os}/{arch} 映射错误");
+        }
+
+        assert_eq!(
+            platform_key_for("freebsd", "x86_64"),
+            "unknown",
+            "未知平台应显式回落为 unknown，而不是取到别的平台的包"
+        );
+    }
+
+    /// 当前构建必须落在已支持的组合里（项目宣称跨平台打包，任一平台漏配都会让更新检查失效）。
+    #[test]
+    fn platform_key_is_known_on_this_build() {
+        assert_ne!(
+            platform_key(),
+            "unknown",
+            "当前构建平台（{}/{}）未在清单映射中",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
     }
 
     #[test]

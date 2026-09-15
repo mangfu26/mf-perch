@@ -250,8 +250,15 @@ impl client::Handler for TofuHandler {
 mod tests {
     use super::*;
 
-    const ED25519_A: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKq7WZ1x8Yy0dG2sJm4pqvJm8sEjPqXwZ1YqL5tN0aBc testA";
-    const ED25519_B: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILm8Xa2y9Zz1eH3tKn5qrwKn9tFkQrYxZ2ZrM6uO1bCd testB";
+    /// 两把**真实可解析**的 ed25519 测试公钥（非机密，仅用于比对分支）。
+    ///
+    /// 必须是真实格式：`check_host_key` 的比对与指纹计算都走
+    /// `PublicKey::from_openssh`，构造出来的假 base64 无法解析，
+    /// 会让测试退化成"字符串不相等"这种恒真断言。
+    const ED25519_A: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIACMVRDrimjsRpnPnxWxVpK2RqCtL1k5Yb0qwgA1Na03 testA";
+    const ED25519_B: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINiIsvulZy36SSkIjC1O05QrsH5BESNWTPFIDzkZ6CZt testB";
 
     // 说明：无法用无效 base64 构造真实 PublicKey，故此处仅覆盖
     // 无需真实密钥的纯逻辑分支；带真实密钥的校验由集成测试覆盖。
@@ -322,11 +329,51 @@ mod tests {
         assert!(h.take_captured().is_none());
     }
 
+    /// TOFU 之后出示**不同的**密钥，必须判定为不一致（fail-closed，D10）。
+    ///
+    /// 这是主机密钥校验的核心安全属性：它直接调用 `check_host_key`，
+    /// 而不是比较两个常量是否相等——后者无论实现怎么错都会通过。
     #[test]
-    fn check_host_key_short_circuits_to_mismatch_for_different_keys() {
-        // 构造两个真实格式但内容不同的密钥文本，验证比对走"不一致"分支。
-        // 由于无法解析为 PublicKey，这里直接验证字符串比较逻辑的走向：
-        // recorded 与 presented 编码不同 -> 必须判定为不一致（fail-closed）。
-        assert_ne!(ED25519_A, ED25519_B);
+    fn check_host_key_reports_mismatch_for_different_keys() {
+        let presented = PublicKey::from_openssh(ED25519_B).expect("测试公钥 B 应可解析");
+        match check_host_key(Some(ED25519_A), &presented) {
+            HostKeyCheck::Mismatch {
+                expected_fingerprint,
+                presented_fingerprint,
+            } => {
+                assert!(
+                    presented_fingerprint.starts_with("SHA256:"),
+                    "出示密钥应给出可核对的指纹，实际：{presented_fingerprint}"
+                );
+                assert_ne!(
+                    expected_fingerprint, presented_fingerprint,
+                    "不一致的密钥必须给出不同的指纹，否则人类无法核对"
+                );
+            }
+            other => panic!("密钥不一致时必须判定为 Mismatch（fail-closed），实际 {other:?}"),
+        }
+    }
+
+    /// 与已记录密钥一致时不得误报不一致（否则正常连接会被拦下）。
+    #[test]
+    fn check_host_key_matches_identical_key() {
+        let presented = PublicKey::from_openssh(ED25519_A).expect("测试公钥 A 应可解析");
+        assert!(
+            matches!(check_host_key(Some(ED25519_A), &presented), HostKeyCheck::Match),
+            "同一把密钥应判定为 Match"
+        );
+    }
+
+    /// 首次连接（无记录）按 TOFU 信任，并交回可持久化的密钥与指纹。
+    #[test]
+    fn check_host_key_trusts_on_first_use() {
+        let presented = PublicKey::from_openssh(ED25519_A).expect("测试公钥 A 应可解析");
+        match check_host_key(None, &presented) {
+            HostKeyCheck::Trusted { key, fingerprint } => {
+                assert_eq!(key, ED25519_A, "TOFU 应交回可原样持久化的 OpenSSH 公钥");
+                assert!(fingerprint.starts_with("SHA256:"));
+            }
+            other => panic!("无记录时应按 TOFU 信任，实际 {other:?}"),
+        }
     }
 }

@@ -247,17 +247,8 @@ impl Session {
                         // 数据（如 `yes | tr -d '\n'`、读大二进制文件），缓冲会无界
                         // 增长直至 OOM。超过上限时强制切出一段作为输出交出，
                         // 既不丢数据，也不让内存继续膨胀。
-                        if buf.len() > MAX_PENDING_LINE_BYTES && !buf.contains(&b'\n') {
-                            let over = buf.len() - MAX_PENDING_LINE_BYTES;
-                            let chunk: Vec<u8> = buf.drain(..over).collect();
-                            let line = String::from_utf8_lossy(&chunk).to_string();
-                            if !line.is_empty()
-                                && !forward_event(
-                                    &tx,
-                                    SessionEvent::OutputLine(line),
-                                )
-                                .await
-                            {
+                        if let Some(line) = take_overflow_chunk(&mut buf) {
+                            if !forward_event(&tx, SessionEvent::OutputLine(line)).await {
                                 break;
                             }
                         }
@@ -527,6 +518,28 @@ fn consume_lines<F: FnMut(SessionEvent)>(buf: &mut Vec<u8>, nonce: &str, mut f: 
 /// 既保住内存，又不丢数据（内容仍会作为输出交给上层）。
 const MAX_PENDING_LINE_BYTES: usize = 1024 * 1024;
 
+/// 超过未换行缓冲上限时，切出超出的部分作为一行输出交出（V12）。
+///
+/// 返回 `None` 表示**不该切**：要么没超限，要么缓冲里已经有 `\n`
+/// （此时应交给正常分行路径处理，强行切分会把一整行拆散）。
+///
+/// 提取成独立函数是为了让这条内存护栏能被直接测试——
+/// 它原先内联在读取循环里，测试只能自己重写一遍 `drain` 逻辑，
+/// 那样无论生产代码怎么写都会通过。
+fn take_overflow_chunk(buf: &mut Vec<u8>) -> Option<String> {
+    if buf.len() <= MAX_PENDING_LINE_BYTES || buf.contains(&b'\n') {
+        return None;
+    }
+    let over = buf.len() - MAX_PENDING_LINE_BYTES;
+    let chunk: Vec<u8> = buf.drain(..over).collect();
+    let line = String::from_utf8_lossy(&chunk).to_string();
+    if line.is_empty() {
+        None
+    } else {
+        Some(line)
+    }
+}
+
 /// 把事件投递到通道。
 ///
 /// - 普通输出行尽力投递（`try_send`）：丢几行输出可接受，
@@ -638,24 +651,42 @@ fn parse_env_snapshot(
 mod tests {
     use super::*;
 
+    /// V12：不含换行的持续输出不得让缓冲无界增长。
+    ///
+    /// 直接调用生产函数 `take_overflow_chunk`——切出的内容会作为输出交给上层，
+    /// 属可观察行为；而不是"常量看起来落在合理区间"这种断言。
     #[test]
-    fn pending_line_cap_is_bounded() {
-        // V12：持续输出不含换行的数据时，缓冲不得无界增长。
-        // 这里验证上限常量存在且合理（1 MiB 量级），
-        // 以及超限切分后缓冲确实变小。
-        assert!(
-            MAX_PENDING_LINE_BYTES > 0 && MAX_PENDING_LINE_BYTES <= 16 * 1024 * 1024,
-            "上限应在合理区间（既不至于频繁切分，也不至于吃掉内存）"
-        );
-
+    fn overflow_chunk_is_taken_when_buffer_exceeds_cap() {
         let mut buf: Vec<u8> = vec![b'x'; MAX_PENDING_LINE_BYTES + 4096];
-        assert!(buf.len() > MAX_PENDING_LINE_BYTES);
-        let over = buf.len() - MAX_PENDING_LINE_BYTES;
-        let _: Vec<u8> = buf.drain(..over).collect();
+
+        let chunk = take_overflow_chunk(&mut buf).expect("超限时应切出超出的部分");
+        assert_eq!(chunk.len(), 4096, "切出的应是超出上限的那一段");
+        assert_eq!(buf.len(), MAX_PENDING_LINE_BYTES, "缓冲应回落到上限之内");
+        assert!(chunk.bytes().all(|b| b == b'x'), "切出的内容不得被改动");
+
         assert!(
-            buf.len() <= MAX_PENDING_LINE_BYTES,
-            "切分后缓冲应回到上限之内"
+            take_overflow_chunk(&mut buf).is_none(),
+            "恰好等于上限时不应再切分"
         );
+    }
+
+    /// 缓冲里已有换行时必须走正常分行路径，不得被上限强行拆行。
+    #[test]
+    fn overflow_chunk_does_not_split_complete_lines() {
+        let mut buf = vec![b'x'; MAX_PENDING_LINE_BYTES + 10];
+        buf.push(b'\n');
+        assert!(
+            take_overflow_chunk(&mut buf).is_none(),
+            "有换行时不应按上限切分（会把一整行拆散）"
+        );
+    }
+
+    /// 未超限时不得切分，也不得改动缓冲。
+    #[test]
+    fn overflow_chunk_is_not_taken_below_cap() {
+        let mut buf = b"partial line".to_vec();
+        assert!(take_overflow_chunk(&mut buf).is_none());
+        assert_eq!(buf, b"partial line", "未超限时缓冲不应被改动");
     }
 
     #[test]

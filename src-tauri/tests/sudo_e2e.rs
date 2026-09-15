@@ -96,12 +96,17 @@ async fn seed_host(
 }
 
 /// 等待某条命令结束，返回（输出，退出码）。
+///
+/// 超时必须**明确失败**：原先超时返回 `(String::new(), None)`，
+/// 而调用方多用 `assert_ne!(code, Some(0))` 断言"提权未成功"——
+/// 命令根本没结束（SSH 断了、队列卡住）时该断言同样通过，
+/// 于是绿灯的理由与用例名不符。超时属于测试环境异常，不是被测行为。
 async fn collect(
-    rt: &mf_perch_lib::terminal::TerminalRuntime,
+    _rt: &mf_perch_lib::terminal::TerminalRuntime,
     db: &mf_perch_lib::store::Db,
     command_id: &str,
 ) -> (String, Option<i32>) {
-    // 轮询直到命令结束（或超时）。
+    // 轮询直到命令结束：30 秒上限（200 × 150ms）。
     for _ in 0..200 {
         {
             let conn = db.lock().await;
@@ -115,10 +120,10 @@ async fn collect(
                 }
             }
         }
+        // 轮询间隔——有上限的等待，不是"等事情大概已经发生"（§5.3）。
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    let _ = rt;
-    (String::new(), None)
+    panic!("命令 {command_id} 在 30 秒内未结束：测试环境异常（SSH 断开或队列卡住），而非被测行为");
 }
 
 /// **模式一：deny** —— sudo 必须失败，绝不提权。
@@ -198,9 +203,11 @@ async fn auto_mode_injects_password_and_succeeds() {
         Some(0),
         "auto 模式应自动注入密码并成功。输出：{output}"
     );
+    // 与 deny 用例同一标准：整行等于 "0" 才算拿到 root 的 uid。
+    // 原先用 `output.contains('0')`——任何含字符 0 的输出都会通过，等于没验。
     assert!(
-        output.contains('0'),
-        "sudo id -u 应输出 0（root）。输出：{output}"
+        output.trim().lines().any(|l| l.trim() == "0"),
+        "sudo id -u 应输出 root 的 uid（整行为 0）。输出：{output}"
     );
 
     state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
@@ -248,8 +255,8 @@ async fn ask_mode_with_allow_succeeds() {
 
     assert_eq!(code, Some(0), "允许后 sudo 应成功。输出：{output}");
     assert!(
-        output.contains('0'),
-        "应输出 root 的 uid。输出：{output}"
+        output.trim().lines().any(|l| l.trim() == "0"),
+        "应输出 root 的 uid（整行为 0）。输出：{output}"
     );
 
     // 应当收到过确认请求（否则说明 ask 流程未被触发）。
@@ -516,8 +523,12 @@ async fn concurrent_sudo_requests_do_not_cross_route() {
         let second = rx_req.recv().await.expect("应有第 2 次索要");
         seen_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        // 先批准 B（写入密码），让"密码写入"早于"空密码写入"。
+        // 先批准 B（写入密码），再拒绝 A——按设计意图让"密码写入"早于"空密码写入"。
         let _ = second.send(SudoDecision::Allow);
+        // 这 300ms 只是为了让**旧实现**的错配稳定复现（它曾用一条会话级 FIFO 串答）。
+        // 它不承担正确性：修复后每个请求各有自己的 FIFO 与令牌，两个应答以任何次序
+        // 落地，结论都必须是"A 被拒、B 拿到 root"。因此这里不适合改成轮询——
+        // 没有任何可观测信号表示"密码已写入"，而断言本身并不依赖这个次序。
         tokio::time::sleep(Duration::from_millis(300)).await;
         // 再拒绝 A。
         let _ = first.send(SudoDecision::Deny);

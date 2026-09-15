@@ -129,3 +129,53 @@ npx -y @modelcontextprotocol/inspector --cli \
   **stderr 是否有内容**，不要只看退出码。
 - 后续新增带可选参数的工具时，凡 `Option<T>` 字段都要加
   `#[schemars(with = "Nullable<T>")]` 并保留 `#[serde(default)]`，否则告警会重新出现。
+
+---
+
+## `cargo build` / `cargo test` 报 `E0463` / `E0462` / `E0460`：`.rlib` 缺失、crate 无法加载
+
+### 现象
+
+构建在**没有任何代码错误**的情况下失败，报错彼此矛盾且都指向依赖：
+
+```
+error[E0463]: can't find crate for `mf_perch_lib`
+error: crate `tokio` required to be available in rlib format, but was not found in this form
+error[E0460]: found possibly newer version of crate `webview2_com_sys` which `mf_perch_lib` depends on
+error[E0786]: found invalid metadata files for crate `webview2_com_sys`
+  = note: failed to mmap file '...\libwebview2_com_sys-....rlib': 页面文件太小，无法完成操作。 (os error 1455)
+```
+
+特征：`target/debug/deps` 里 `.d` 文件齐全，但对应的 `.rlib` / `.rmeta` **缺失或只有 0 字节**；
+cargo 的指纹仍认为"已是最新"，于是不去重建，直到链接阶段才暴露产物是坏的。
+
+### 原因
+
+**Windows 页面文件（虚拟内存）耗尽**。最后那行 `os error 1455`（"页面文件太小"）才是根因：
+rustc 写 `.rlib` 失败，留下不完整的产物与"最新"的指纹记录。上面的 `E0460`
+（"possibly newer version"）是**症状而不是病因**，不要去查依赖版本冲突。
+
+本项目特别容易触发，因为：
+
+1. Rust 侧依赖重（`tauri`、`russh`、`rusqlite` bundled SQLite、`rmcp`），默认并发会同时跑
+   N 个 rustc（N = CPU 核数），内存峰值很高；
+2. `src-tauri/target` 是**共享资源**——同时开两个构建（两个 Agent / 两个终端，
+   或一个 `pnpm tauri dev` 加一个 `cargo test`）会成倍叠加内存压力。
+   cargo 的文件锁只能让构建**串行**，防不住单个构建自身的内存峰值。
+
+### 解决办法
+
+```bash
+cd src-tauri
+cargo clean          # 必须先清：坏产物的指纹是"最新"，不清就不会重建
+cargo test -j 2      # 限制并发，避免再次耗尽页面文件
+```
+
+`target` 约 40 GB，`cargo clean` 后首次全量编译需数分钟到十几分钟；之后增量编译恢复正常。
+
+### 预防
+
+- **并发跑构建时一律加 `-j 2`**（或设 `CARGO_BUILD_JOBS=2`）；
+- 不要在 `pnpm tauri dev` 还在编译时另开 `cargo test` / `cargo build`；
+- 看到 `E0460` / `E0463` 先往下翻有没有 `os error 1455`，有就直接走上面的恢复步骤，
+  不要改 `Cargo.toml`。

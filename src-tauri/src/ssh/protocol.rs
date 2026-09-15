@@ -633,9 +633,11 @@ mod tests {
         let without = wrapper_script("n", None, false);
         assert!(!without.contains("export FOO=bar"));
 
-        // 空白初始化脚本应被忽略。
+        // 空白（或仅空白字符）的初始化脚本必须与"未提供"完全等价：
+        // 不得往脚本里插入空的初始化段落。这里比对**整份脚本**，
+        // 而不是"某句注释文本是否出现"——后者一改文案就失效，也抓不到行为回归。
         let blank = wrapper_script("n", Some("   \n  "), false);
-        assert!(!blank.contains("初始化脚本"));
+        assert_eq!(blank, without, "空白初始化脚本不应改变生成的脚本");
     }
 
     #[test]
