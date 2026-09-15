@@ -149,14 +149,6 @@ pub async fn sudo_respond(
 mod tests {
     use super::*;
 
-    fn req(id: &str) -> SudoRequest {
-        SudoRequest {
-            request_id: id.to_string(),
-            terminal_id: "term_1".to_string(),
-            host_label: "test-host".to_string(),
-        }
-    }
-
     #[test]
     fn respond_returns_false_for_unknown_request() {
         let bridge = SudoBridge::new();
@@ -168,8 +160,9 @@ mod tests {
     #[tokio::test]
     async fn respond_delivers_decision_to_waiter() {
         let bridge = SudoBridge::new();
-        let (tx, rx) = oneshot::channel();
-        bridge.pending.lock().unwrap().insert("sudo_1".into(), tx);
+        let rx = bridge
+            .register_pending("sudo_1".into())
+            .expect("登记应成功");
 
         assert_eq!(bridge.pending_count(), 1);
         assert!(bridge.respond("sudo_1", SudoDecision::Allow));
@@ -183,8 +176,8 @@ mod tests {
     fn respond_is_idempotent_for_same_request() {
         // 用户可能重复点击；第二次应安全失败而非 panic。
         let bridge = SudoBridge::new();
-        let (tx, _rx) = oneshot::channel();
-        bridge.pending.lock().unwrap().insert("r".into(), tx);
+        // 接收端必须存活，否则第一次 respond 就会因发送失败而返回 false。
+        let _rx = bridge.register_pending("r".into()).expect("登记应成功");
 
         assert!(bridge.respond("r", SudoDecision::Deny));
         assert!(!bridge.respond("r", SudoDecision::Deny));
@@ -194,8 +187,7 @@ mod tests {
     fn dropping_receiver_does_not_panic_on_respond() {
         // 超时后运行时丢弃接收端，此时用户再点允许不应导致 panic。
         let bridge = SudoBridge::new();
-        let (tx, rx) = oneshot::channel();
-        bridge.pending.lock().unwrap().insert("r2".into(), tx);
+        let rx = bridge.register_pending("r2".into()).expect("登记应成功");
         drop(rx);
 
         assert!(!bridge.respond("r2", SudoDecision::Allow));
@@ -204,8 +196,7 @@ mod tests {
     #[test]
     fn deny_decision_is_delivered_when_user_rejects() {
         let bridge = SudoBridge::new();
-        let (tx, rx) = oneshot::channel();
-        bridge.pending.lock().unwrap().insert("r3".into(), tx);
+        let rx = bridge.register_pending("r3".into()).expect("登记应成功");
 
         assert!(bridge.respond("r3", SudoDecision::Deny));
         assert_eq!(rx.blocking_recv().unwrap(), SudoDecision::Deny);
@@ -214,13 +205,8 @@ mod tests {
     #[test]
     fn multiple_pending_requests_are_independent() {
         let bridge = SudoBridge::new();
-        let (tx1, rx1) = oneshot::channel();
-        let (tx2, rx2) = oneshot::channel();
-        {
-            let mut m = bridge.pending.lock().unwrap();
-            m.insert("a".into(), tx1);
-            m.insert("b".into(), tx2);
-        }
+        let rx1 = bridge.register_pending("a".into()).expect("登记应成功");
+        let rx2 = bridge.register_pending("b".into()).expect("登记应成功");
         assert_eq!(bridge.pending_count(), 2);
 
         // 只处理其中一个，另一个应保持待决。
