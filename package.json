@@ -13,7 +13,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "dev:clean": "node scripts/clean-dev.mjs",
-    "check:secrets": "bash scripts/check-secrets.sh",
+    "check:secrets": "node scripts/check-secrets.mjs",
     "check:ipc": "node scripts/check-ipc-contract.mjs",
     "tauri": "tauri"
   },

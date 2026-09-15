@@ -262,3 +262,72 @@ Vite 在 Windows 上解析真实路径时要先执行一次 `net use`（探测�
   不要去改 `vite.config.ts` / `vitest.config.ts`；
 - 与之无关：这条与上面的 `ERR_SQLITE_ERROR` 经常成对出现，但**根因不同**——
   前者是 store 位置，后者是子进程权限。
+
+---
+
+## `pnpm check:secrets` 第 1 步总是失败（脚本被 WSL 的 bash 执行）
+
+### 现象
+
+提交前自检的第 1 步（真实密钥形态扫描）总是报"扫描未能执行（node 不可用？）"，
+整条命令以退出码 1 结束；而第 2–4 步却是 OK：
+
+```
+== 1/4 扫描真实密钥形态 ==
+  警告：扫描未能执行（node 不可用？），请人工确认无凭据入库
+== 2/4 检查凭据类文件是否被跟踪 ==
+  OK：无凭据类文件被跟踪
+...
+自检未通过：请处理上述问题后再提交（AGENTS.md 2.6 安全红线）。
+```
+
+### 原因
+
+三个环节叠加（均实测确认）：
+
+1. `package.json` 里写的是 `bash scripts/check-secrets.sh`，而 Windows 上 `bash`
+   解析到 **WSL 的 bash**（`C:\Windows\system32\bash.exe`），**不是 Git Bash**：
+
+   ```powershell
+   PS> (Get-Command bash).Source
+   C:\Windows\system32\bash.exe
+   PS> bash -c 'uname -s; command -v node; command -v git'
+   Linux
+   NO_NODE
+   /usr/bin/git
+   ```
+
+2. WSL Ubuntu 里**有 git 但没有 node**，因此第 2–4 步（纯 git 命令）正常，
+   唯独第 1 步的 `node -e` 失败（退出码 127）；
+3. 原脚本把标准错误重定向进了 `/dev/null`（`2>/dev/null`），把"命令不存在"
+   这个真实原因也一并吞掉，只留下一句猜谜式的"node 不可用？"。
+
+**脚本逻辑本身没问题**：改用 Git Bash（`C:\Program Files\Git\bin\bash.exe`）
+跑同一份 `.sh`，四步全过、退出码 0。
+
+### 解决办法
+
+**已改为纯 node 脚本**，不再依赖任何 shell：
+
+| 项 | 变化 |
+| ---- | ---- |
+| `scripts/check-secrets.mjs` | 新增，承载全部四步检查 |
+| `package.json` | `"check:secrets": "node scripts/check-secrets.mjs"` |
+| `scripts/check-secrets.sh` | **已删除**（单一入口，避免两份逻辑并存） |
+
+```bash
+pnpm check:secrets
+```
+
+### 预防（重要）
+
+- **不要把这条门禁改回 `.sh`**：只要它由 `bash` 执行，Windows 上就会再次落到
+  WSL 的 bash，问题复发。要加检查就往 `.mjs` 里加。
+- **不要用重定向吞掉子进程错误**：正是 `2>/dev/null` 把"node 不存在"变成了一句
+  猜谜提示。宁可输出啰嗦的真实报错，也不要为了"输出干净"牺牲可诊断性。
+- **一条长期失败的安全门禁等于没有门禁**——它会被当成噪声忽略，真出问题时没人拦。
+  门禁必须在本机**默认可通过**（`pnpm check:secrets` → 退出码 0），
+  红灯只应指向**真实问题**。
+- 改动这类门禁后要做**差分验证**（P3）：故意放入假私钥 / 假令牌 / 凭据类文件，
+  确认它**确实会红灯**；只验证"能通过"说明不了任何事。
+
