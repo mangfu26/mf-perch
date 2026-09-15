@@ -330,8 +330,7 @@ Refs: #123
 
 | 项 | 位置 | 说明 | 优先级 |
 | ---- | ---- | ---- | ---- |
-| 生成脚本文本断言 15+ 条 | `src/ssh/protocol.rs` | 对生成的 shell 脚本**源码**做子串断言，由真实缺陷驱动（V1 明文落盘、askpass 标记必须走 stderr）。按 §5.2 判定：替代覆盖在 `#[ignore]` 后面、默认不跑，**不构成"已在别处覆盖"**，故不属于该删的重复；真正遗留的弱点是**脆**（改脚本文案可能失效）。保留还是收敛由客户拍板 | **待定** |
-| └ 其中的真子集 | `src/ssh/protocol.rs` 的 `session_setup_only_cleans_regular_files_with_delete_flag` | 与同文件 `session_setup_deletes_leave_no_window_for_plaintext` 是**同一份脚本 + 同一谓词**，属真子集——§5.2 三条全为「是」，无论政策题怎么定都该收敛 | 低 |
+| 生成脚本文本断言 15+ 条 | `src/ssh/protocol.rs` | 对生成的 shell 脚本**源码**做子串断言，由真实缺陷驱动（V1 明文落盘、askpass 标记必须走 stderr）。按 §5.2 判定：替代覆盖在 `#[ignore]` 后面、默认不跑，**不构成"已在别处覆盖"**，故不属于该删的重复；真正遗留的弱点是**脆**（改脚本文案可能失效）。**已决策：保留主体**（客户确认） | 已决 |
 | `rmcp` 默认值绊线 | `src/mcp/server.rs` 的 `rmcp_default_idle_timeout_is_the_five_minute_trap` | 断言第三方库默认 300s；产品不变式已由相邻用例覆盖。留作"上游改了会报警"的绊线，还是删掉 | **待定** |
 | 前端无测试 | `src/` | 无 vitest / jest、无 `test` 脚本，质量门禁只有 `pnpm typecheck`（见 §5.9）。引入属**范围决策** | **待定** |
 
@@ -343,7 +342,7 @@ Refs: #123
 | `tests/ssh_integration.rs::session_is_not_confused_by_marker_like_output` ↔ `src/ssh/session.rs` 的 nonce 单测 | **不是重复**。单测喂的是合成输入，集成测试走真实 SSH 回显与真实输出交错 |
 | `src/ipc/tests.rs`、`src/mcp/tools.rs` 的 fixture ↔ `tests/common/mod.rs` | **无法合并**。`src/` 内的单元测试在生产 crate 内部，拿不到 `tests/` 的模块，只能各自保留 |
 
-**本轮已清偿**（保留记录，避免重复劳动）：集成测试 fixture 已收敛到 `tests/common/mod.rs`（`test_state` / `need_env` / `need_env_port`）；`src/sudo_bridge.rs` 全部用例改经 `register_pending` 登记，不再直接操作私有字段；`tests/mcp_e2e.rs` 的 `poll1` 改为精确四态断言；`tests/mcp_e2e.rs` 中与 `src/mcp/tools.rs` 重复的工具 schema **内容**断言已删（保留"经协议返回为对象形态"这一端到端事实）。
+**本轮已清偿**（保留记录，避免重复劳动）：集成测试 fixture 已收敛到 `tests/common/mod.rs`（`test_state` / `need_env` / `need_env_port`）；`src/sudo_bridge.rs` 全部用例改经 `register_pending` 登记，不再直接操作私有字段；`tests/mcp_e2e.rs` 的 `poll1` 改为精确四态断言；`tests/mcp_e2e.rs` 中与 `src/mcp/tools.rs` 重复的工具 schema **内容**断言已删（保留"经协议返回为对象形态"这一端到端事实）；`src/ssh/protocol.rs` 的真子集用例 `session_setup_only_cleans_regular_files_with_delete_flag` 已删——它被同文件 `session_setup_deletes_leave_no_window_for_plaintext` 严格覆盖（后者遍历**每一处** `-delete` 并额外断言删除早于本会话 askpass 写入，前者只看第一处），删除无覆盖损失。
 
 ---
 
