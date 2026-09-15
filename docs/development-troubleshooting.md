@@ -179,3 +179,86 @@ cargo test -j 2      # 限制并发，避免再次耗尽页面文件
 - 不要在 `pnpm tauri dev` 还在编译时另开 `cargo test` / `cargo build`；
 - 看到 `E0460` / `E0463` 先往下翻有没有 `os error 1455`，有就直接走上面的恢复步骤，
   不要改 `Cargo.toml`。
+
+---
+
+## `pnpm add` 报 `ERR_PNPM_UNEXPECTED_STORE`：装新依赖会重链全部依赖
+
+### 现象
+
+```
+[ERR_PNPM_UNEXPECTED_STORE] Unexpected store location
+The dependencies at "D:\projects\mf-perch\node_modules" are currently linked from
+the store at "D:\.pnpm-store\v11".
+pnpm now wants to use the store at "D:\projects\mf-perch\.pnpm-store\v11".
+```
+
+若改用 `--store-dir` 指向原 store，还可能继续报：
+
+```
+[ERR_SQLITE_ERROR] unable to open database file
+```
+
+### 原因
+
+pnpm 的默认 store 在**项目所在盘**（`<项目>/.pnpm-store`），而本机的 `node_modules`
+当初是从**盘根的另一个 store**（`D:\.pnpm-store\v11`）链出来的。两者不一致时 pnpm 会
+拒绝继续——它不能把新包装进一个与现有链接来源不同的 store。
+
+`ERR_SQLITE_ERROR` 则是**受限执行环境**的次生现象：盘根 store 在项目目录之外，
+若执行环境只允许写项目目录，pnpm 打不开 store 的索引库。
+
+### 解决办法
+
+**保留原 store，不要重新 install**：
+
+```bash
+pnpm add -D <包名> --store-dir "D:\.pnpm-store\v11"
+```
+
+### 为什么不能直接 `pnpm install`
+
+那会把**全部依赖**重新链接到新 store：耗时长，而且期间 `node_modules` 处于变动状态——
+此时若有别的进程在用（另一个 Agent、`pnpm dev`、`pnpm tauri dev`），会直接失败。
+
+### 预防
+
+- 装包前先用 `pnpm config get store-dir` 与现有链接来源对一下；不一致就带上 `--store-dir`；
+- 需要写项目目录之外的 store 时，确认当前执行环境允许——受限沙箱下会被拒。
+
+---
+
+## `pnpm test` / `pnpm check:ipc` 报 `spawn EPERM`
+
+### 现象
+
+```
+Error: Build failed with 1 error:
+[plugin externalize-deps]
+Error: spawn EPERM
+    at ChildProcess.spawn (node:internal/child_process:441:11)
+    ...
+    at optimizeSafeRealPathSync (.../vite/dist/node/chunks/node.js:2497:2)
+    at windowsSafeRealPathSync (.../vite/dist/node/chunks/node.js:2483:2)
+```
+
+报错点在 `vite.config.ts` / `vitest.config.ts` **加载阶段**，看起来与测试内容无关。
+
+### 原因
+
+Vite 在 Windows 上解析真实路径时要先执行一次 `net use`（探测网络驱动器映射）。
+该调用以 **piped stdio** 启动子进程；在**受限执行环境**（严格沙箱、受限服务账户）下，
+创建管道会被拒绝，于是抛 `EPERM`。
+
+这是环境限制，**不是配置或代码问题**——同一份代码在普通终端里正常运行。
+
+### 解决办法
+
+在允许创建子进程管道的环境里运行（普通终端，或放宽沙箱的写/执行范围）。
+
+### 预防
+
+- 看到 `spawn EPERM` + 调用栈里出现 `windowsSafeRealPathSync`，直接判定为环境限制，
+  不要去改 `vite.config.ts` / `vitest.config.ts`；
+- 与之无关：这条与上面的 `ERR_SQLITE_ERROR` 经常成对出现，但**根因不同**——
+  前者是 store 位置，后者是子进程权限。
