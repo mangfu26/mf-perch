@@ -8,7 +8,7 @@
  *
  * 权限边界：人类只读，可归档 / 恢复 / 删除，**不能向终端输入命令**。
  */
-import { onMounted, ref, computed } from "vue";
+import { onMounted, ref, computed, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { useRouter } from "vue-router";
 import {
@@ -16,8 +16,10 @@ import {
   Search,
   Archive,
   RotateCcw,
+  Unplug,
   Trash2,
   ChevronRight,
+  ChevronDown,
   Clock,
 
 } from "lucide-vue-next";
@@ -66,6 +68,28 @@ const filteredHistory = computed(() =>
       })
     : store.history,
 );
+
+/**
+ * 全局搜索里命令卡片的展开态（问题 3：与终端详情页统一，支持收起）。
+ * 默认全部收起——搜索结果往往一次几十条，全展开会把页面撑得极长；
+ * 用户点开想看的那条即可，与详情页"默认只展开最新一条"的取向一致。
+ */
+const expandedCommands = ref<Set<string>>(new Set());
+
+function toggleCommand(id: string) {
+  const next = new Set(expandedCommands.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  expandedCommands.value = next;
+}
+
+const isCommandExpanded = (id: string) => expandedCommands.value.has(id);
+
+// 结果集变化（重新搜索 / 切主机）时清掉展开态：旧命令 id 已不在列表里，
+// 留着只是无意义的内存，且新结果应回到"全部收起"的一致起点。
+watch(filteredHistory, () => {
+  expandedCommands.value = new Set();
+});
 
 async function runSearch() {
   await store.search({
@@ -253,7 +277,9 @@ const confirmWarning = computed(() => {
                 :aria-label="t('terminal.reconnect')"
                 @click="ask(term, 'reconnect')"
               >
-                <RotateCcw class="h-3.5 w-3.5" />
+                <!-- 重连用 Unplug（断开→重新接通），与"恢复归档"的 RotateCcw 区分；
+                     不用 RefreshCw 是因为详情页顶栏已用它做"刷新页面"，同屏会混。 -->
+                <Unplug class="h-3.5 w-3.5" />
               </BaseButton>
               <BaseButton
                 v-else
@@ -321,10 +347,16 @@ const confirmWarning = computed(() => {
           :key="item.id"
           class="overflow-hidden rounded-xl border border-border-base bg-surface"
         >
-          <div
-            class="flex items-center gap-2.5 border-b border-border-base px-3.5 py-2.5"
-            :class="'bg-surface-hover'"
+          <!-- 头部整行可点：折叠 / 展开输出，与终端详情页统一（问题 3）。 -->
+          <button
+            type="button"
+            class="flex w-full items-center gap-2.5 border-b border-border-base bg-surface-hover px-3.5 py-2.5 text-left"
+            @click="toggleCommand(item.id)"
           >
+            <component
+              :is="isCommandExpanded(item.id) ? ChevronDown : ChevronRight"
+              class="h-3.5 w-3.5 shrink-0 text-text-muted"
+            />
             <code class="min-w-0 flex-1 truncate font-mono text-[12.5px]">
               <span class="text-accent">$</span> {{ item.command }}
             </code>
@@ -340,9 +372,9 @@ const confirmWarning = computed(() => {
               </StatusTag>
               <StatusTag tone="neutral">{{ formatDuration(item.duration_ms) }}</StatusTag>
             </div>
-          </div>
+          </button>
           <pre
-            v-if="item.output"
+            v-if="isCommandExpanded(item.id) && item.output"
             class="max-h-52 overflow-auto bg-surface-code px-3.5 py-3 font-mono text-[12px] leading-[1.65] text-text-code"
           >{{ item.output }}</pre>
         </article>

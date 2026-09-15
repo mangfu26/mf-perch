@@ -106,7 +106,7 @@ const kindClass: Record<TokenKind, string> = {
 
 <template>
   <pre
-    class="max-h-56 overflow-auto rounded-lg bg-surface-code px-3 py-2.5 font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap break-all text-text-code"
+    class="rounded-lg bg-surface-code px-3 py-2.5 font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap break-all text-text-code"
   ><template v-if="tokens"><span
         v-for="(token, i) in tokens"
         :key="i"
