@@ -291,7 +291,7 @@ Refs: #123
 | [`docs/development-troubleshooting.md`](docs/development-troubleshooting.md) | 开发排错：真实环境问题与解决办法（持续追加） | 现行 |
 | [`docs/open-questions.md`](docs/open-questions.md) | 需求澄清清单（Q1–Q36）：问题、状态、客户答复 | 现行 |
 | [`docs/security-audit.md`](docs/security-audit.md) | 全量安全审计报告（2026-09-10）：发现的漏洞、修复与验证 | **快照** |
-| [`docs/design/mockups/`](docs/design/mockups/) | 主题选型阶段设计稿。`theme.css` 为**现行**主题令牌定义；`style-*.png` 为未采用的历史方案稿 | 混合 |
+| [`docs/design/mockups/`](docs/design/mockups/) | 主题选型阶段设计稿（**快照，只读**）。`theme.css` / `theme-preview.html` 只服务选型预览，**不是**运行时令牌；`style-*.png` 为未采用的历史方案稿 | 快照 |
 
 ### 4.3 维护规则
 
@@ -300,7 +300,8 @@ Refs: #123
    - 技术决策 → `docs/decisions.md`；
    - 需求澄清的**结论** → 以 `docs/decisions.md` 为准；`docs/open-questions.md` 只保留
      问题与状态，结论写摘要并指向对应决策，避免同一事实两处维护；
-   - 主题令牌 → `docs/design/mockups/theme.css`。
+   - 主题令牌 → **`src/styles/theme.css`**（运行时权威）；`docs/design/mockups/theme.css`
+     仅为**选型阶段快照**，改它不影响应用外观（见 D46）。
 3. **代码与文档同步**：改动若影响已记录的结论，**同一次提交内**更新对应文档；
    若推翻旧决策，**不要直接改旧条目**，而是新增一条决策说明取代关系
    （与 §2.3 的 `BREAKING CHANGE` 精神一致）。
@@ -325,7 +326,7 @@ Refs: #123
 | **ProxyJump** | ❌ **不在首发范围（D45）** | 原 D11 / Q9 曾承诺"MVP 含 ProxyJump"，**已由 D45 移出首发、列为未来新增功能**（客户评估：场景不高频、不急切）。当前只有数据管道字段（DB / 领域模型 / IPC），**前端无控件、连接层完全未使用**，无任何路径能让跳板机生效。半成品字段保留不删。对外**不得声称支持 ProxyJump**。见 [`docs/decisions.md`](docs/decisions.md) D45 |
 | **sudo 凭据边界（V2）** | ⚠️ 已缓解，**未根治** | `ask` / `auto` 模式下提权密码须经 Agent 所在用户域投递，Agent 可读取会话 nonce 并伪造协议标记。**"认证信息对 AI Agent 完全不可见"在提权链路下不成立**，对外表述需准确。见 [`docs/security-audit.md`](docs/security-audit.md) §4 |
 | **远程明文传输** | ⚠️ 已决策接受（D30） | 开启"允许远程连接"后 Token 与命令内容在网络中明文传输；局域网场景客户已接受，保留为未来工作 |
-| 未完成任务 | — | Q29（提交身份邮箱）、Q32（备份与同步需求，二期） |
+| 未完成任务 | — | Q32（备份与同步需求，二期；Q29 提交身份邮箱已按 noreply 落地，2026-09-15） |
 
 ### 4.5 当前文档债
 

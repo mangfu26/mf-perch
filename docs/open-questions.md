@@ -61,7 +61,7 @@
 | Q26 | 测试用 SSH 主机（联调与集成测试必需） | **WSL Ubuntu**（已搭建并实测通过） | 已答 |
 | Q27 | 开源许可证 | **Apache-2.0** | 已答 |
 | Q28 | 时间预期与里程碑 | 无硬性时间，稳步推进；按团队排期分阶段交付 | 已答 |
-| Q29 | 提交身份使用真实邮箱还是 GitHub noreply 邮箱 | 开源考虑，用 noreply | 待问 |
+| Q29 | 提交身份使用真实邮箱还是 GitHub noreply 邮箱 | **已按 noreply 执行**（`mangfu26 <30995646+mangfu26@users.noreply.github.com>`；仓库实测：全部历史提交仅此一个身份） | 已答 |
 | Q30 | 开放远程连接时的安全加固（是否强制 TLS、Token 是否需重新生成、是否限定来源 IP） | 客户决定**暂不做 TLS**，接受局域网风险；保留为未来工作 | 已答 |
 | Q31 | 加密主密钥的存放方式（系统钥匙串 / 用户主密码 / 本地密钥文件） | 分层：K1 系统钥匙串优先，不可用时显式降级到 K2 主密码或 K3 本地密钥文件 | 已答 |
 | Q32 | 数据备份与同步的具体需求（范围、频率、跨机器密钥迁移方式） | 二期功能，先记录需求 | 待问 |
@@ -337,7 +337,8 @@
 - 结论（详见 [`docs/design/theme-spec.md`](design/theme-spec.md)）：
   - 同一套组件结构，**CSS 变量令牌驱动**，`data-theme` 切换，不做两套独立设计。
   - 主题三态：跟随系统 / 强制暗色 / 强制亮色，默认跟随系统。
-  - 令牌定义见 `docs/design/mockups/theme.css`；可交互预览见 `theme-preview.html`。
+  - 令牌定义见 `src/styles/theme.css`（运行时权威）；`docs/design/mockups/` 下的
+    `theme.css` / `theme-preview.html` 是选型阶段快照（只读，见 D46）。
   - 无障碍要求：正文对比度 ≥ WCAG AA；状态不只用颜色区分。
 
 ### Q26 — 测试环境
