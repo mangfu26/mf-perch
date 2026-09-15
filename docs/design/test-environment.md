@@ -147,9 +147,26 @@ export MFPERCH_TEST_HOST=127.0.0.1
 export MFPERCH_TEST_PORT=2222
 export MFPERCH_TEST_USER=mfperch
 export MFPERCH_TEST_KEY=<测试私钥路径>
-cargo test --test ssh_integration -- --ignored --test-threads=1
+# -j 2：避免默认并发耗尽 Windows 页面文件、把 target 产物写坏
+#       （现象与恢复见 ../development-troubleshooting.md）
+cargo test -j 2 --test ssh_integration -- --ignored --test-threads=1
 ```
 
 > 测试私钥位于 `.tmp-test/`（已被 `.gitignore` 排除，**绝不入库**）。
 
-单元测试合计 **104 项**，覆盖协议解析、输出截断、加解密、密钥分层、仓储与配额等。
+### 5.5 测试规模与门禁（**会随开发变化**）
+
+> 下面只是**量级参考**，不保证与当前代码一致——数字会随开发漂移。
+> 需要准确值时以实际输出为准：`cd src-tauri && cargo test -j 2`、`pnpm test`。
+> 完整门禁清单见 [`AGENTS.md`](../../AGENTS.md) §5.10。
+
+| 类别 | 规模 | 说明 |
+| ---- | ---- | ---- |
+| Rust 单测 | 254 项 | 生产文件内的 `#[cfg(test)]`，默认门禁 |
+| Rust 集成测试 | 25 项 | `mcp_e2e` 6 / `ssh_integration` 5 / `sudo_e2e` 7 / `update_e2e` 7 |
+| ↑ 其中需真实 SSH | 16 项 | 默认 `#[ignore]`（运行方式见 §5.4，环境准备见 §4） |
+| 前端单测 | 21 项 | vitest，覆盖 `src/lib/` 纯逻辑 |
+| 前端契约检查 | 1 道 | `pnpm check:ipc`：命令名在 Rust 定义 / `generate_handler!` 注册 / 前端 `call()` 三处一致 |
+
+覆盖范围：协议解析、输出截断、加解密、密钥分层、仓储与配额、MCP 工具契约与鉴权、
+sudo 三模式、更新检查、跨语言 IPC 契约。
