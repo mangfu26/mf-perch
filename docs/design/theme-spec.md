@@ -14,7 +14,9 @@
 ## 2. 主题实现方式
 
 - 通过 `<html data-theme="dark|light">` 切换，CSS 变量（Custom Properties）驱动全部颜色。
-- 令牌定义见 [`docs/design/mockups/theme.css`](mockups/theme.css)。
+- 令牌定义见 **[`src/styles/theme.css`](../../src/styles/theme.css)**（运行时权威，由 `src/main.ts` 导入）。
+  `docs/design/mockups/theme.css` 是**选型阶段快照（只读）**，只服务同目录的
+  `theme-preview.html` 预览稿，**改它不影响应用外观**（见 [`decisions.md`](../decisions.md) **D46**）。
 - 前端实现：Pinia 管理主题状态 → 写入 `document.documentElement.dataset.theme` → 持久化到本地配置。
 - 主题选择支持三态：**跟随系统 / 强制暗色 / 强制亮色**，默认"跟随系统"。
 
@@ -204,6 +206,10 @@
 5. **无障碍**：正文与背景对比度不低于 WCAG AA（4.5:1）；状态不只靠颜色区分。
 
 ## 6. 预览稿
+
+> 本目录（`mockups/`）是**主题选型阶段的快照（只读）**，用于回看当时的方案对比；
+> 应用实际外观由 [`src/styles/theme.css`](../../src/styles/theme.css) 决定（D46）。
+> 如果这里的令牌与应用不一致，**以运行时那份为准**，不要反向修改快照。
 
 | 文件 | 说明 |
 | ---- | ---- |

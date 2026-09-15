@@ -333,6 +333,8 @@
 - **背景**：客户要求"简约、科技风、现代化"，无具体参考产品。设计师产出 4 套风格稿渲染成图供选择，客户选定双主题组合。
 - **影响**：
   - 主题令牌定义于 `docs/design/mockups/theme.css`，规范见 `docs/design/theme-spec.md`。
+    > **指向更正（D46，2026-09-15）**：运行时令牌的权威文件实为 `src/styles/theme.css`；
+    > 上句那个指向是选型阶段的表述遗留。原文保留以便追溯，结论以 **D46** 为准。
   - 前端用 Pinia 管理主题状态并持久化。
   - 无障碍要求：正文对比度 ≥ WCAG AA；状态需颜色 + 文字双通道。
 
@@ -861,5 +863,43 @@
   - `AGENTS.md` §4.4 已知缺口表：ProxyJump 由"承诺未实现"改注为"已决定移出首发（D45）"；
   - `docs/open-questions.md` Q7 / Q9 及未完成项段落：指向本决策，状态改为"已决定不做（转未来）"。
 - **相关**：D11（SSH 高级能力范围）、Q9（MVP 能力清单）、Q7（ProxyJump 备注）。
+
+---
+
+## D46 — 主题令牌的运行时权威文件更正为 src/styles/theme.css
+
+- **日期**：2026-09-15
+- **决策**：**运行时主题令牌的单一事实来源是 `src/styles/theme.css`**；
+  `docs/design/mockups/theme.css` 降级为**选型阶段快照（只读）**，只服务同目录的
+  `theme-preview.html` 预览稿，**改它不会影响应用外观**。
+- **背景 / 成因**（文档指向失效）：
+  1. 主题选型阶段（Q22 / Q35）先产出了 `docs/design/mockups/` 下的可视化预览稿，
+     `theme-preview.html` 以相对路径 `<link href="theme.css">` 引用同目录那份令牌文件；
+  2. 前端落地时，运行时令牌另建在 `src/styles/theme.css`，由 `src/main.ts` 导入
+     （`import "./styles/theme.css"`）；
+  3. 但"令牌定义见 `mockups/theme.css`"是**选型阶段的表述遗留**，实现落地后没有跟着更正，
+     而且被复制到了 **5 处**：`AGENTS.md` §4.2 与 §4.3.2、本文件 D24、
+     `docs/design/theme-spec.md` §2、`docs/open-questions.md` 的主题结论。
+- **为什么必须更正**（影响）：按文档去改 `mockups/theme.css` 会**改了不生效**
+  （该文件不参与构建），真令牌在 `src/styles/theme.css`——这是"文档指向错误的单一事实来源"，
+  直接导致返工。本轮 UI 优化已实际撞上该歧义：新增 `--option-bg` 等令牌时，
+  不得不在 theme-spec 里额外注明"本文指 `src/styles/theme.css`"。
+- **佐证（两份已实际分叉）**：`src/styles/theme.css` 独有运行期新增的令牌与规则
+  （`--option-bg` / `--option-fg`、根元素 `color-scheme` 等），`mockups/theme.css` 没有；
+  且后者含 `.hosts` 等**预览专用类**，本就不是应用样式表。
+  全仓库检索确认：**没有任何代码引用 `mockups/theme.css`**，唯一消费方是 `theme-preview.html`。
+- **取代关系**：
+  - 取代 **D24 影响项**中"主题令牌定义于 `docs/design/mockups/theme.css`"的**指向**
+    （D24 关于双主题、令牌驱动、无障碍的结论本身**不变**）；旧条目保留原文并在原处
+    加一行指向本决策的更正说明。
+- **影响**：
+  - `AGENTS.md` §4.2（mockups 行时效性由"混合"改为**快照**）、§4.3.2（单一事实来源指向运行时文件）；
+  - `docs/design/theme-spec.md` §2 指向、§6 预览稿章节加"快照只读"说明；
+  - `docs/open-questions.md` 主题结论中的指向；
+  - `docs/design/mockups/theme.css` 与 `theme-preview.html` 头部加"选型快照（只读）"标注。
+- **维护约定**：今后改主题令牌**只改 `src/styles/theme.css`**；`mockups/` 下的文件按
+  §4.1 的快照规则处理——**只读、不追改**，与运行时不一致时以运行时为准。
+- **相关**：D24（主题决策）、Q22 / Q35（主题选型）、`docs/design/theme-spec.md`。
+
 
 
