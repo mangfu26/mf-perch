@@ -25,7 +25,7 @@
 | Q6 | 首发平台 | Windows 优先，架构不阻断 macOS / Linux | 已答 |
 | Q7 | SSH 库选型（`russh` / `ssh2`） | `russh`（纯 Rust、异步、无 C 依赖） | 已答 |
 | Q8 | 主机密钥校验策略 | TOFU + 变更时告警并阻止连接 | 已答 |
-| Q9 | MVP 需要哪些 SSH 高级能力（ProxyJump / SFTP / 端口转发 / sudo 提权） | MVP 只做 ProxyJump；sudo 另有三模式设计（见 Q33） | 已答 |
+| Q9 | MVP 需要哪些 SSH 高级能力（ProxyJump / SFTP / 端口转发 / sudo 提权） | ~~MVP 只做 ProxyJump~~ **已由 D45 移出首发**；sudo 另有三模式设计（见 Q33） | 已答（范围经 D45 调整） |
 | Q10 | SSH Key 私钥导入方式（文件选择器 / 粘贴文本），是否支持 passphrase | 两者都支持，含 passphrase | 已答 |
 | Q11 | 终端数量与并发上限 | 每主机 5 个、全局 20 个，可配置 | 已答 |
 | Q12 | 数据存储位置与命令历史保留策略 | 按时间保留（默认 30 天，可配置，支持永久）；不设条数上限 | 已答 |
@@ -168,8 +168,11 @@
   - ❌ **连接层完全未使用**：`ssh::session::Session::connect` 直接连接
     `(host.address, host.port)`，没有任何跳板逻辑。
 
-  即：**目前没有任何路径能让 ProxyJump 生效**，属已承诺但未实现的功能，需补齐
-  （连接层 + 界面控件 + e2e）。在补齐前，不要在任何对外说明中声称支持 ProxyJump。
+  即：**目前没有任何路径能让 ProxyJump 生效**。
+
+  **处置（2026-09-15，D45）**：客户评估后决定 **ProxyJump 移出首发范围、列为未来新增功能**
+  （场景不高频、不急切）。现有半成品管道字段**保留不删**（将来实现可直接复用），
+  但在真正交付前，任何对外说明都不得声称支持 ProxyJump。详见 [`decisions.md`](decisions.md) **D45**。
 
 ### Q8 — 主机密钥校验策略
 
