@@ -35,6 +35,11 @@ pub enum SessionOutput {
     ///
     /// `token` 为该次索要的远端 askpass PID，用于定位唯一的应答 FIFO（B2）。
     SudoRequest { token: String },
+    /// 提权通道上 sudo 正在**询问密码**（D47 握手）。
+    ///
+    /// 上层据此把密码写进**该通道的 stdin**；每条通道最多写一次
+    /// （见 [`crate::ssh::protocol::SudoAuthHandshake`]）。
+    SudoPrompt,
     /// 连接已断开。
     Disconnected { reason: String },
 }
@@ -544,9 +549,10 @@ fn take_overflow_chunk(buf: &mut Vec<u8>) -> Option<String> {
 ///
 /// - 普通输出行尽力投递（`try_send`）：丢几行输出可接受，
 ///   换取"绝不因消费者变慢而卡住读取循环"。
-/// - **控制事件（结束标记、sudo 请求）不可丢弃**（V13）：
+/// - **控制事件（结束标记、sudo 请求、密码提示）不可丢弃**（V13）：
 ///   丢弃 `Finished` 会让命令永久悬挂，丢弃 `SudoRequest` 会让
-///   远端 askpass 阻塞、拖死整条串行队列。通道满时等待接收端腾出空间。
+///   远端 askpass 阻塞、拖死整条串行队列；丢弃 `SudoPrompt`（D47）会让
+///   提权通道等不到密码而超时失败。通道满时等待接收端腾出空间。
 ///
 /// 返回 `false` 表示接收端已关闭，调用方应停止读取循环。
 async fn forward_event(tx: &mpsc::Sender<SessionOutput>, ev: SessionEvent) -> bool {
@@ -563,12 +569,15 @@ async fn forward_event(tx: &mpsc::Sender<SessionOutput>, ev: SessionEvent) -> bo
             exit_code,
         },
         SessionEvent::SudoRequest { token } => SessionOutput::SudoRequest { token },
+        SessionEvent::SudoPrompt => SessionOutput::SudoPrompt,
         SessionEvent::Ready => return true,
     };
 
     let critical = matches!(
         out,
-        SessionOutput::Finished { .. } | SessionOutput::SudoRequest { .. }
+        SessionOutput::Finished { .. }
+            | SessionOutput::SudoRequest { .. }
+            | SessionOutput::SudoPrompt
     );
 
     if let Err(err) = tx.try_send(out) {

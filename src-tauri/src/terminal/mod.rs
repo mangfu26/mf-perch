@@ -944,6 +944,13 @@ fn spawn_output_pump(
                         handle_sudo_request(&entry, &token).await;
                     });
                 }
+                SessionOutput::SudoPrompt => {
+                    // D47：密码提示只应出现在**提权通道**上（由提权编排处理）。
+                    // 数据面收到它说明状态异常（例如有人在数据面上直接跑了
+                    // `sudo -S -p '<标记>'`）。这里没有任何可写的通道，
+                    // 因此**不写密码**、仅告警——宁可失败，也不要写错地方。
+                    tracing::warn!("数据面收到 sudo 密码提示（D47 仅提权通道处理），已忽略");
+                }
                 SessionOutput::Disconnected { reason } => {
                     tracing::warn!("终端连接已断开：{reason}");
                     let mut active = entry.active.lock().await;

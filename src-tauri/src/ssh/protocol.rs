@@ -16,8 +16,14 @@ use crate::error::{AppError, Result};
 pub const END_MARKER_PREFIX: &str = "__MF_PERCH_END__";
 /// 会话就绪标记（包装脚本启动完成后打印）。
 pub const READY_MARKER_PREFIX: &str = "__MF_PERCH_READY__";
-/// sudo askpass 请求标记（Q33）。**必须写 stderr**——见 [`askpass_script`]。
+/// sudo 请求标记（Q33）。**必须写 stderr**——见 [`askpass_script`]。
 pub const SUDO_REQUEST_PREFIX: &str = "__MF_SUDO_REQUEST__";
+/// 提权通道的**密码提示标记**（D47 握手）。
+///
+/// 通过 `sudo -S -p '<本标记>'` 传入，sudo 需要密码时会把它打进 stderr
+/// （实测：sudo-rs 形如 `[sudo: <标记>] Password: `，经典 sudo 就是标记本身）；
+/// **凭证缓存有效时不会出现**——应用据此决定"要不要写密码"，且不依赖 sudo 文案。
+pub const SUDO_PROMPT_PREFIX: &str = "__MF_SUDO_PROMPT__";
 /// 远端工作目录（存放 FIFO 与 askpass 脚本）。
 pub const REMOTE_DIR: &str = ".mf-perch";
 /// 远端 sudo 密码 FIFO 文件名。
@@ -41,6 +47,11 @@ pub enum SessionEvent {
     /// `token` 是该次索要的远端 askpass PID，应用用 `(nonce, token)` 定位
     /// 唯一的应答 FIFO——这是应答能精确投递给本次索要的前提（B2）。
     SudoRequest { token: String },
+    /// 提权通道上 sudo 正在**询问密码**（D47 握手）。
+    ///
+    /// 与 [`SessionEvent::SudoRequest`] 不同：后者是"旧机制（askpass + FIFO）下的索要"，
+    /// 本变体只用于**新的双通道提权**——应用收到它才把密码写进该通道的 stdin。
+    SudoPrompt,
     /// 普通输出行（命令产生的输出）。
     OutputLine(String),
 }
@@ -356,6 +367,16 @@ pub fn parse_line(line: &str, nonce: &str) -> Option<SessionEvent> {
         return Some(SessionEvent::Ready);
     }
 
+    // sudo 的密码提示（D47 握手）。
+    //
+    // 用**包含**判断而非整行匹配：sudo 会把我们传入的 `-p` 文本包进它自己的文案里
+    // （实测 sudo-rs 为 `[sudo: <标记>] Password: `，经典 sudo 就是标记本身）。
+    // nonce 是随机值，误判概率可忽略；且**握手只允许写一次密码**（见
+    // [`SudoAuthHandshake`]），所以即使标记被伪造，代价也不是密码泄露。
+    if trimmed.contains(&sudo_prompt_marker(nonce)) {
+        return Some(SessionEvent::SudoPrompt);
+    }
+
     // sudo 请求标记（来自 askpass 的 stderr）：
     // `__MF_SUDO_REQUEST__<nonce>__<token>__`（token = 远端 askpass 的 PID）。
     let sudo_req = format!("{SUDO_REQUEST_PREFIX}{nonce}__");
@@ -393,6 +414,71 @@ pub fn parse_line(line: &str, nonce: &str) -> Option<SessionEvent> {
     }
 
     Some(SessionEvent::OutputLine(trimmed.to_string()))
+}
+
+/// 提权通道传给 `sudo -p` 的密码提示标记（D47）。
+pub fn sudo_prompt_marker(nonce: &str) -> String {
+    format!("{SUDO_PROMPT_PREFIX}{nonce}__")
+}
+
+/// 探测数据面当前目录的命令（D47：cwd 自动继承）。
+///
+/// 刻意**不把 `$PWD` 编进结束标记**：路径可能含 `__` 甚至换行，而标记用 `__`
+/// 分隔、又不能用 `base64`（目标机不保证安装），纯 bash 内建做十六进制对多字节
+/// 路径不可靠。改为"发一条探测命令、按结束标记界定整段输出"——
+/// **天然容忍特殊字符**，且完全不改动标记格式。
+pub fn pwd_probe_command() -> &'static str {
+    // 用 printf 的 %s（不加换行），避免把换行算进路径。
+    "printf '%s' \"$PWD\""
+}
+
+/// 握手时"是否要写密码"的结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SudoAuthStep {
+    /// 现在写密码（**每条通道最多一次**）。
+    SendPassword,
+    /// 不写：已经决定过，或已经认证成功。
+    Ignore,
+}
+
+/// 提权通道的密码握手状态机（D47）。
+///
+/// 规则只有一条：**每条通道最多写一次密码**。
+///
+/// 为什么必须一次性：`sudo -S` 从该通道的 stdin 读密码。若允许"见到提示就写"，
+/// 那么在 sudo 已经认证成功之后再出现的提示标记（例如提权后的命令自己打印，
+/// 或伪造）会让应用把密码再写一次——这些字节会滞留在 stdin 里、**被后续命令帧
+/// 当成命令执行并随输出回传给 Agent**，反而造成泄露。
+#[derive(Debug, Default)]
+pub struct SudoAuthHandshake {
+    decided: bool,
+}
+
+impl SudoAuthHandshake {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 观察到 sudo 的密码提示标记。
+    pub fn on_prompt(&mut self) -> SudoAuthStep {
+        if self.decided {
+            return SudoAuthStep::Ignore;
+        }
+        self.decided = true;
+        SudoAuthStep::SendPassword
+    }
+
+    /// 观察到"已经认证通过"（就绪标记、命令开始产出输出、进程结束等）。
+    ///
+    /// 之后任何提示标记都不再触发写密码。
+    pub fn on_authenticated(&mut self) {
+        self.decided = true;
+    }
+
+    /// 是否已有结论（供上层判定"可以停止等待认证结果了"）。
+    pub fn is_decided(&self) -> bool {
+        self.decided
+    }
 }
 
 /// 把一条命令编码为 NUL 结尾的帧（V5）。
@@ -590,6 +676,68 @@ mod tests {
         assert_eq!(
             parse_line("", nonce),
             Some(SessionEvent::OutputLine("".into()))
+        );
+    }
+
+    /// 守的不变式：sudo 把我们的提示标记包进它自己的文案时，仍能被识别（D47 握手）。
+    ///
+    /// 实测两种实现的形态不同——sudo-rs 为 `[sudo: <标记>] Password: `，
+    /// 经典 sudo 就是标记本身——因此这里对**两种形态**都必须成立。
+    #[test]
+    fn sudo_prompt_marker_is_recognized_in_both_sudo_flavors() {
+        let nonce = "abc123";
+        let marker = sudo_prompt_marker(nonce);
+        let cases = [
+            (format!("[sudo: {marker}] Password: "), "sudo-rs 形态"),
+            (marker.clone(), "经典 sudo 形态"),
+        ];
+        for (line, why) in cases {
+            assert_eq!(
+                parse_line(&line, nonce),
+                Some(SessionEvent::SudoPrompt),
+                "{why} 下应识别出密码提示：{line:?}"
+            );
+        }
+    }
+
+    /// 提示标记不是万能的：nonce 不匹配时不得触发握手，
+    /// 否则任何输出都能诱导应用去写密码。
+    #[test]
+    fn sudo_prompt_with_other_nonce_is_not_a_prompt() {
+        let line = "[sudo: __MF_SUDO_PROMPT__othernonce__] Password: ";
+        assert_eq!(
+            parse_line(line, "realnonce"),
+            Some(SessionEvent::OutputLine(line.to_string())),
+            "nonce 不匹配的提示文本应按普通输出处理"
+        );
+    }
+
+    /// 守的不变式：**每条提权通道最多写一次密码**（D47）。
+    ///
+    /// 若允许重复写：sudo 认证成功之后再出现的提示标记（伪造，或提权后的命令自己打印）
+    /// 会让密码又一次进入该通道的 stdin，被当成命令帧执行并随输出回传给 Agent——
+    /// 本想防泄露，反而造成泄露。
+    #[test]
+    fn handshake_sends_password_at_most_once_per_channel() {
+        let mut hs = SudoAuthHandshake::new();
+        assert_eq!(hs.on_prompt(), SudoAuthStep::SendPassword, "首次提示应写密码");
+        assert!(hs.is_decided());
+        assert_eq!(
+            hs.on_prompt(),
+            SudoAuthStep::Ignore,
+            "再次提示不得重复写密码"
+        );
+    }
+
+    /// 认证成功之后，任何提示都不得再触发写密码。
+    #[test]
+    fn handshake_ignores_prompts_after_authentication() {
+        let mut hs = SudoAuthHandshake::new();
+        hs.on_authenticated();
+        assert_eq!(
+            hs.on_prompt(),
+            SudoAuthStep::Ignore,
+            "已认证成功后不得再写密码"
         );
     }
 
