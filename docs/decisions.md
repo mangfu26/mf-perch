@@ -905,8 +905,8 @@
 
 ## D47 — sudo 提权改为「双通道」：密码走应用私有通道，不再经远端文件系统
 
-- **日期**：2026-09-15
-- **状态**：**方案已定稿，待 PoC 验证后实施**（本条记录设计结论与被否路线，避免重复推导）。
+- **日期**：2026-09-15（2026-09-16 完成 PoC 验证并定稿）
+- **状态**：**方案定稿，且已通过 PoC 实测验证，可进入实施**（本条记录设计结论、被否路线与实测证据）。
 - **背景（要解决的问题）**：V2 / C1——`ask` / `auto` 模式下，提权密码须经 askpass + FIFO
   投递到远端，而 Agent 的命令与协议机制运行在**同一个 shell、同一个 UID**下，因此可以
   ①读出 nonce（shell 变量、askpass 文件名、导出的 `mfperch_askpass_path` 三条路径）
@@ -951,24 +951,55 @@
      需要额外配齐"人类可见 root 状态 + 人类可主动降权 + 超时自动降权"三件套才可用。
 - **对外表述红线（沿用并更新）**：交付前 V2 仍是"已缓解未根治"；本方案落地后方可改述为
   "提权密码不进入 Agent 的用户域"。**残余风险须如实标注**：同 UID 理论上仍可尝试经
-  `/proc/<pid>/fd/0` 读取通道②进程的 stdin，是否可行取决于 `yama/ptrace_scope`；
-  `requiretty` 主机需回退到独立 PTY 通道，隔离性降级。
-- **待 PoC 实测（决定能否实施，非细节）**：
-  1. 本机 `/dev/pts/N` 实际权限，以及同用户进程能否读到 master 注入的字符；
-  2. `-S` + 无 TTY 在 `requiretty` / `visiblepw` / `passwd_tries` 各配置下的行为；
-  3. **握手时序**：密码错误时 sudo 会继续读下一行 → 会吃掉命令帧，
-     须参照 Ansible 的 `BECOME-SUCCESS-<marker>` 用握手隔开；
-  4. `ptrace_scope` 默认值下同用户能否读应用通道进程的 fd（定残余风险等级）；
-  5. 标准 sudo 的 cwd 继承基线，与 `env_reset` 实际保留的变量清单。
+  `/proc/<pid>/fd/0` 读取通道②进程的 stdin，是否可行取决于 `yama/ptrace_scope`（**未实测**）。
+- **不做 PTY 回退（客户 2026-09-16 定稿）**：`requiretty` 主机**不支持提权**，改为
+  **明确报错 + 引导免密路径**。依据：
+  1. `-S` 本身**没有兼容问题**（经典 sudo 1.9.17 与 sudo-rs 0.2.13 实测均支持），
+     因此 PTY 回退**只服务于 `requiretty`** 一个选项；
+  2. 实测 `requiretty` **只认控制终端**：无 tty 时经典 sudo 直接拒绝
+     （`sorry, you must have a tty to run sudo`），建立了控制终端才通过；
+  3. 默认开启 `requiretty` 的是 **RHEL / CentOS ≤6**，RHEL 7+ 已从默认 sudoers 移除
+     （Debian / Ubuntu 全系默认关闭），而这些系统**均已 EOL**；
+  4. **sudo-rs 不认识 `requiretty`**（实测 `unknown setting: 'requiretty'`）——在
+     Ubuntu 26.04 上它是一处会让 sudo 报错的残留配置，更不该为它保留兼容路径；
+  5. 回退会**重新引入同 UID 抢读**（PoC ① 实测竞争 10 轮抢到 8 轮）⇒ 等于在那类主机上
+     **放弃红线**；且 pty 路径还需额外处理明文回显与提示噪声，既危险又难测试。
+  报错文案必须**可操作**：指引用户①移除 `requiretty`，或②为该主机配置 `NOPASSWD` 白名单 /
+  `pam_ssh_agent_auth` 公钥认证。
+- **PoC 实测结果（2026-09-16，WSL Ubuntu 26.04）**：
+  环境事实：本机默认 sudo 是 **sudo-rs 0.2.13**（Ubuntu 26.04 起），另装有经典 sudo
+  **1.9.17p2**（`/usr/bin/sudo.ws`）；两者差异已分别验证（文案、`requiretty` 支持等）。
+
+  | # | 验证项 | 实测结论 |
+  | ---- | ---- | ---- |
+  | 1 | `/dev/pts/N` 权限与同 UID 可读性 | **权限 `0620`、属主即登录用户**；同 UID 独立进程可打开并**完整读走** master 写入的字节（无竞争 **100%**）；与合法读取方竞争 10 轮，**攻击者抢到 8 轮**（合法方 2 轮）⇒ **TTY 路线不可能隔离，实证否掉** |
+  | 2 | 无 TTY + `-S` 投递密码 | **可行**：`setsid`（无 tty）与 **`ssh -T`（生产路径）** 下 `id -u` 均为 `0`，且**输出流中无明文密码**（输出仅 `0`） |
+  | 3 | 密码错误时的"帧吞噬" | **确认存在**：把 `WRONG_PW` 与 `echo FRAME_ONE` 一起喂给 `sudo -S`，sudo 把**第二行也当密码尝试**（stderr 两次 "Authentication failed, try again."），**命令从未收到帧**（stdout 为空）⇒ **必须先握手再发帧**；握手实测有效（先读到我们自己的 READY 标记，再发帧，帧完整到达） |
+  | 4 | 标准 sudo 的 cwd / env 基线 | cwd **继承**（`cd /tmp` → `sudo pwd` = `/tmp`，这是要复刻的基线）；`env_reset` 下变量 26 → 13，`HOME/USER/LOGNAME=root`、`PATH` 为 secure_path、**自定义变量被剥掉**；**两条独立会话不共享 cwd**（新会话回到 `$HOME`）⇒ 必须显式携带 cwd |
+  | 5 | `sudo -D <dir>` 可用性 | **被策略拒绝**（`you are not allowed to use '--chdir /tmp'`）⇒ 改用 `sudo -S … bash -c 'cd <目录> && exec <命令>'`（实测可用） |
+
+- **PoC 新增的两条协议要求（实施时必须遵守）**：
+  1. **禁止"先写密码再等 READY"的固定顺序**：凭证缓存有效时 sudo **根本不读 stdin**
+     （实测：先用对密码成功一次后，再用**错密码**仍然 `EXIT=0`），此时盲写进去的密码行会
+     **残留在管道里、被包装脚本当成一条命令帧执行**（协议级缺陷，密码还会进输出与历史）。
+     正确做法：用**我们自己的提示标记**握手 ——
+     `sudo -S -p '__MF_SUDO_PROMPT__<nonce>__'`，应用等待二选一：
+     **出现提示标记 → 才写密码**；**直接出现 READY → 一个字都不写**。
+     与 Ansible 的随机化 prompt 同理，且**完全不依赖 sudo 的文案**（实测 sudo-rs 与经典
+     sudo 的提示/报错文案不同：sudo-rs 用 "Authentication failed, try again."）。
+  2. **PTY 路径若启用，必须先关 echo 再写密码**：实测 pty 上"立刻写"会把**明文密码回显进
+     通道输出流**（而该输出会展示给 Agent）；"先关 ECHO 再写"则明文不出现（只剩 sudo-rs
+     的掩码提示 `*****…`）。**按上面"不做 PTY 回退"的决定，本条仅为记录，不应有实现路径。**
 - **业界调研结论（供后人参考）**：Ansible（`become`，默认 `-H -S -n` + 随机化提示语
   `[sudo via ansible, key=<id>]` + `BECOME-SUCCESS` 标记）、pyinfra、Fabric（pty + watcher）、
   sshpass、rsync+`--rsh` 全部把密码投进**目标机用户域**，无一处理"同 UID 恶意进程"；
   OpenSSH Bug 3875 还证明**基于提示符文案的检测很脆弱**（多路复用即失效）——
   我们"自打印带 nonce 标记"的做法应保留，不要改成匹配 prompt。
 - **影响（实施时）**：`ssh/session.rs`（新通道类型）、`ssh/protocol.rs`（结束标记带 pwd）、
-  `terminal/mod.rs`（提权编排）、`mcp/tools.rs`（`run_as_root` 工具与 schema）、
+  `terminal/mod.rs`（提权编排 + 提示标记握手）、`mcp/tools.rs`（`run_as_root` 工具与 schema）、
   `store`（`EnvSnapshot.pwd` 刷新）、`docs/mcp-tools.md`（工具数 7→8）、
-  `docs/design/sudo.md`（重写投递章节）、`AGENTS.md` §4.4（V2 行更新）。
+  `docs/design/sudo.md`（重写投递章节 + 记录"`requiretty` 主机不支持提权"）、
+  `AGENTS.md` §4.4（V2 行更新）。
 - **相关**：D11 / D37 / D44（sudo 三模式与投递机制）、`docs/security-audit.md` V2、
   `docs/design/sudo.md`、D3（状态保留）。
 
