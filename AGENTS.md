@@ -324,7 +324,7 @@ Refs: #123
 | 项 | 状态 | 说明 |
 | ---- | ---- | ---- |
 | **ProxyJump** | ❌ **不在首发范围（D45）** | 原 D11 / Q9 曾承诺"MVP 含 ProxyJump"，**已由 D45 移出首发、列为未来新增功能**（客户评估：场景不高频、不急切）。当前只有数据管道字段（DB / 领域模型 / IPC），**前端无控件、连接层完全未使用**，无任何路径能让跳板机生效。半成品字段保留不删。对外**不得声称支持 ProxyJump**。见 [`docs/decisions.md`](docs/decisions.md) D45 |
-| **sudo 凭据边界（V2）** | ⚠️ 已缓解，**未根治** | `ask` / `auto` 模式下提权密码须经 Agent 所在用户域投递，Agent 可读取会话 nonce 并伪造协议标记。**"认证信息对 AI Agent 完全不可见"在提权链路下不成立**，对外表述需准确。见 [`docs/security-audit.md`](docs/security-audit.md) §4 |
+| **sudo 凭据边界（V2）** | ⚠️ 已缓解，**未根治**；**根治方案已定稿待实施（D47）** | `ask` / `auto` 模式下提权密码须经 Agent 所在用户域投递，Agent 可读取会话 nonce 并伪造协议标记。**"认证信息对 AI Agent 完全不可见"在提权链路下不成立**，对外表述需准确。根治方向：**双通道**——普通命令走数据面（无 TTY、现有协议不变），提权由应用自建的短命通道以 `sudo -S` 投递，远端不留 askpass/FIFO/环境变量/二进制；配套 `run_as_root(command, cwd=None)`，cwd 自动继承、环境按 sudo 语义重置。**当前仍是现状（askpass + FIFO）**，落地前不得声称已解决。见 [`docs/security-audit.md`](docs/security-audit.md) §4 与 [`docs/decisions.md`](docs/decisions.md) **D47** |
 | **远程明文传输** | ⚠️ 已决策接受（D30） | 开启"允许远程连接"后 Token 与命令内容在网络中明文传输；局域网场景客户已接受，保留为未来工作 |
 | 未完成任务 | — | Q32（备份与同步需求，二期；Q29 提交身份邮箱已按 noreply 落地，2026-09-15） |
 
