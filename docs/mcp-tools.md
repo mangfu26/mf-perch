@@ -18,7 +18,7 @@
 | 结构化输出 | 未使用 MCP 的 `structuredContent` / `outputSchema`：好处是兼容性最好，代价是客户端需自行解析文本 |
 | 字段命名 | 一律 `snake_case`，并尽量把单位写进名字（`wait_seconds` 秒 / `duration_ms` 毫秒） |
 | 可空参数 | `anyOf: [{type: T}, {type: "null"}]` + `default: null`，且**不出现在 `required`** 中（D32：避免数组形式的 `type` 被部分客户端拒绝） |
-| 工具总数 | **7 个**（不含工具面之外的任何写操作；人类侧的管理能力不暴露给 Agent） |
+| 工具总数 | **8 个**（不含工具面之外的任何写操作；人类侧的管理能力不暴露给 Agent） |
 
 ---
 
@@ -32,6 +32,7 @@
 | `run_command` | 执行命令并同步等待 | ✗ | `terminal_id`、`command` |
 | `run_command_async` | 执行命令并立即返回句柄 | ✗ | `terminal_id`、`command` |
 | `get_command_status` | 查询命令状态与输出 | ✅ | `command_id` |
+| `run_as_root` | 以**特权身份**执行一条命令（D47） | ✗ | `terminal_id`、`command` |
 | `archive_terminal` | 归档终端（释放配额） | ✗ | `terminal_id` |
 
 ---
@@ -222,7 +223,69 @@
 > 归档终端的命令对它**不再可见**（V3）：会返回 `terminal_archived`，即使 Agent
 > 之前记下了 `command_id`。
 
-### 3.7 `archive_terminal`
+### 3.7 `run_as_root`
+
+> **状态：已实现（D47）。** 权限边界见 [`docs/decisions.md`](decisions.md) D47 与
+> `AGENTS.md` §4.4：提权密码由应用在**独立通道**上投递，**对 Agent 完全不可见**。
+
+**入参**
+
+| 字段 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `terminal_id` | string | ✅ | 目标终端 |
+| `command` | string | ✅ | 要以特权身份执行的**一条**命令 |
+| `cwd` | string \| null | ✗ | 绝对工作目录；省略则继承该终端数据面的当前目录 |
+
+**输出**（`PrivilegedOutcome`）
+
+| 字段 | 类型 | 说明 |
+| ---- | ---- | ---- |
+| `command_id` | string | 命令历史 ID（人类审计用；**不可轮询**，见下） |
+| `exit_code` / `duration_ms` | number | 退出码与耗时 |
+| `output` | string | 命令输出（**不含**应用内部的身份核实行） |
+| `truncated` | boolean | 输出是否因上限被截断 |
+| `actual_uid` | number \| null | 远端核实到的**实际** uid；正常情况下为 `0` |
+| `actual_user` | string \| null | 实际用户名（如 `root`）；取不到为 `null` |
+
+```json
+{ "command_id": "cmd_3c7e...", "exit_code": 0, "duration_ms": 118,
+  "output": "0\n", "truncated": false, "actual_uid": 0, "actual_user": "root" }
+```
+
+**与 `run_command` 的三处刻意差异**
+
+1. **没有异步模式，也没有轮询**：一次调用 = 建立特权通道 → 切目录 → 执行 → 收通道。
+   `command_id` 只用于人类审计，**不要**拿它去 `get_command_status`。
+2. **没有"root 模式"**：不存在"进入 root 再退出"的会话态，因此不存在"忘记退出、
+   后续命令继续以 root 执行"的风险；每条命令各自提权一次。
+3. **环境按 sudo 语义重置**（`env_reset`）：不继承数据面的环境变量，
+   `HOME` / `USER` 为提权后的身份。 **`cd` 与 `export` 都不跨命令保留**，
+   需要特定目录请用 `cwd` 参数，不要依赖上一条命令的 `cd`。
+
+**串行语义**：提权命令与普通命令**共用该终端的串行队列**——同一终端任一时刻
+只有一条命令在执行。要并行请使用不同终端。
+
+**审计**：该命令在人类侧的命令历史里以 `[特权用户(uid=0)]` 前缀显示（文本前缀，
+不改数据库结构）。若远端实际 uid 不是 0（例如 sudoers 把目标用户配成了别人），
+输出开头会带一条明确告警，且 `actual_uid` 如实返回——**不会**在审计里谎称 root。
+
+**可能失败**
+
+| 情况 | 错误码 | Agent 应做什么 |
+| ---- | ---- | ---- |
+| 该主机被人类设为"禁止提权" | `sudo_elevation_failed` | **报告人类**，不要重试；请人类在主机设置中改为"自动注入" |
+| 主机配置为 `auto` 但没有提权密码 | `sudo_elevation_failed` | 报告人类补齐密码配置 |
+| 主机配置为 `ask` 且人类拒绝 / 超时 | `sudo_elevation_failed` | 改用 `run_command` 以普通身份完成，或稍后再试 |
+| 密码被 sudo 拒绝 | `sudo_elevation_failed` | 报告人类核对提权密码 |
+| 该主机 `sudoers` 要求 TTY（`requiretty`） | `sudo_elevation_failed` | **不可恢复**：报告人类（D47 明确不做 PTY 回退） |
+| 无法确定数据面当前目录 | `sudo_elevation_failed` | 显式传 `cwd` 后重试 |
+| 提权命令超过 30 秒未结束 | `sudo_elevation_failed` | 命令可能仍在远端执行；先查历史再决定是否重试 |
+| 终端已归档 | `terminal_archived` | 另建终端 |
+
+> **`requiretty` 主机不支持提权**，这是 D47 的明确取舍（不做 PTY 回退，理由见决策记录）。
+> 报错文案会引导人类走免密路径（`NOPASSWD` 白名单 / `pam_ssh_agent_auth`）。
+
+### 3.8 `archive_terminal`
 
 **入参**：`terminal_id`（string，必填）
 
@@ -251,6 +314,7 @@
 | `terminal_quota_exceeded` | 终端配额已满 | 先 `archive_terminal` 释放槽位（`scope` 区分 per_host / global） |
 | `command_queue_full` | 该终端在途命令过多 | 等现有命令结束，或换终端 |
 | `bash_not_available` | 远端无 bash | 报告人类；该主机不可用本方案 |
+| `sudo_elevation_failed` | 提权失败（被策略禁止、无密码、密码被拒、需 TTY、取不到目录、超时） | **不要盲目重试**：按错误文案判断——多数情况需报告人类（D47） |
 | `ssh_auth_failed` | 认证失败 | 报告人类（凭据问题） |
 | `ssh_connect_failed` | 连接失败（含重连失败） | 确认主机可达后重试 |
 | `host_key_mismatch` | 主机密钥与首次记录不一致 | **停止**并报告人类（可能是中间人，D10） |

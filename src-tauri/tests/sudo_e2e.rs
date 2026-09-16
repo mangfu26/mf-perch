@@ -784,3 +784,306 @@ async fn privileged_channel_fails_fast_on_wrong_password() {
         "应因「密码被拒」快速失败，而不是等待就绪超时，实际：{err}"
     );
 }
+
+// ===================================================================
+// D47：提权双通道 —— 编排层（R3）
+// ===================================================================
+
+/// 取回某条命令在历史里的完整记录（人类审计看到的形态）。
+async fn history_record(
+    db: &mf_perch_lib::store::Db,
+    command_id: &str,
+) -> mf_perch_lib::domain::command::CommandRecord {
+    let conn = db.lock().await;
+    mf_perch_lib::store::commands::get(&conn, command_id).expect("命令应存在于历史中")
+}
+
+/// **D47 R3 回归**：提权命令自动继承数据面当前目录。
+///
+/// 这是双通道方案里最容易做错的一点：提权通道是**另一个 shell 进程**，
+/// 不共享数据面的目录。若编排漏掉"切目录"这一步，命令会在提权通道的
+/// 初始目录（家目录）下执行——命令照样成功、退出码照样为 0，
+/// 只有 `pwd` 的输出能区分对错，因此断言必须落在具体路径上。
+#[tokio::test]
+#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
+async fn run_as_root_inherits_plain_session_working_directory() {
+    let t = target();
+    let (state, key) = test_state();
+    let host_id = seed_host(&state, &key, &t, SudoPolicy::Auto).await;
+
+    let terminal = state
+        .terminals
+        .open_terminal(&state.db, &key, &host_id, None)
+        .await
+        .expect("终端应能建立");
+
+    // 先在数据面上把目录挪到一个必然不同于家目录的位置。
+    let plain = state
+        .terminals
+        .run_command(&state.db, &terminal.id, "cd /tmp && pwd", Some(Duration::from_secs(20)))
+        .await
+        .expect("普通命令应能下发");
+    let (out, code) = collect(&state.terminals, &state.db, &plain.command_id).await;
+    assert_eq!(code, Some(0), "准备步骤应成功：{out}");
+    assert!(out.contains("/tmp"), "数据面应已切到 /tmp：{out}");
+
+    let outcome = state
+        .terminals
+        .run_as_root(&state.db, &key, &terminal.id, "pwd", None)
+        .await
+        .expect("提权命令应能执行");
+
+    assert_eq!(outcome.exit_code, Some(0), "提权 pwd 应成功：{}", outcome.output);
+    assert!(
+        outcome.output.contains("/tmp"),
+        "提权命令必须继承数据面目录 /tmp，实际输出：{}",
+        outcome.output
+    );
+    assert_ne!(
+        outcome.output.trim(),
+        "/root",
+        "落在家目录/root 说明「切目录」这一步没生效（命令会成功但目录是错的）"
+    );
+
+    state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
+}
+
+/// **D47 R3 回归**：显式 `cwd` 优先于继承，且目录不存在时**拒绝执行**。
+///
+/// 两条不变式一起验：给了 `cwd` 就用它；给了一个进不去的目录时，
+/// 必须**不执行**命令（否则会在错误目录下以 root 跑了命令，是最危险的失败形态）。
+#[tokio::test]
+#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
+async fn run_as_root_honours_explicit_cwd_and_refuses_missing_dir() {
+    let t = target();
+    let (state, key) = test_state();
+    let host_id = seed_host(&state, &key, &t, SudoPolicy::Auto).await;
+
+    let terminal = state
+        .terminals
+        .open_terminal(&state.db, &key, &host_id, None)
+        .await
+        .expect("终端应能建立");
+
+    let outcome = state
+        .terminals
+        .run_as_root(&state.db, &key, &terminal.id, "pwd", Some("/etc"))
+        .await
+        .expect("显式 cwd 应能执行");
+    assert_eq!(outcome.exit_code, Some(0), "输出：{}", outcome.output);
+    assert!(
+        outcome.output.contains("/etc"),
+        "应使用显式 cwd=/etc，实际输出：{}",
+        outcome.output
+    );
+
+    // 目录不存在 → `cd` 失败 → 整条命令**不得执行**。
+    // 判据：命令体里的副作用（创建文件）绝不能发生，而不只是看退出码。
+    let missing = "/tmp/mfperch-no-such-dir-d47";
+    let outcome = state
+        .terminals
+        .run_as_root(
+            &state.db,
+            &key,
+            &terminal.id,
+            &format!("touch {missing}/should-not-exist"),
+            Some(missing),
+        )
+        .await
+        .expect("调用本身应返回结果（失败体现在退出码上）");
+    assert_ne!(
+        outcome.exit_code,
+        Some(0),
+        "目录不存在时不得执行命令，实际输出：{}",
+        outcome.output
+    );
+
+    state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
+}
+
+/// **D47 R3 回归**：返回并记录**实际** uid，且命令历史带特权前缀。
+///
+/// 只断言"命令成功"是不够的：`run_as_root` 的价值在于"确实以特权身份跑"。
+/// 这里同时验证三件事：
+/// 1. 返回结构里的 `actual_uid` 是远端核实出来的真实身份；
+/// 2. 命令历史里带 `[特权用户(uid=0)]` 前缀（客户确认的审计口径）；
+/// 3. 前缀**只**出现在提权命令上，普通命令不受影响。
+#[tokio::test]
+#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
+async fn run_as_root_reports_real_uid_and_marks_history() {
+    let t = target();
+    let (state, key) = test_state();
+    let host_id = seed_host(&state, &key, &t, SudoPolicy::Auto).await;
+
+    let terminal = state
+        .terminals
+        .open_terminal(&state.db, &key, &host_id, None)
+        .await
+        .expect("终端应能建立");
+
+    let outcome = state
+        .terminals
+        .run_as_root(&state.db, &key, &terminal.id, "id -u", None)
+        .await
+        .expect("提权命令应能执行");
+
+    assert_eq!(outcome.exit_code, Some(0), "输出：{}", outcome.output);
+    assert_eq!(
+        outcome.actual_uid,
+        Some(0),
+        "测试机 sudoers 应把目标用户配为 root；实际身份：{outcome:?}"
+    );
+    assert_eq!(outcome.actual_user.as_deref(), Some("root"));
+    // 身份核实文本必须从 Agent 看到的输出里摘掉（那是应用的动作，不是命令产出）。
+    assert!(
+        !outcome.output.contains("__MF_PERCH_UID__"),
+        "身份核实标记不得出现在命令输出里：{}",
+        outcome.output
+    );
+    assert!(
+        outcome.output.lines().any(|l| l.trim() == "0"),
+        "命令本身应输出 root 的 uid：{}",
+        outcome.output
+    );
+
+    let rec = history_record(&state.db, &outcome.command_id).await;
+    assert!(
+        rec.command.starts_with("[特权用户(uid=0)]"),
+        "提权命令历史应带特权前缀，实际：{}",
+        rec.command
+    );
+
+    // 普通命令不得带前缀。
+    let plain = state
+        .terminals
+        .run_command(&state.db, &terminal.id, "echo plain", Some(Duration::from_secs(20)))
+        .await
+        .expect("普通命令应能下发");
+    let plain_rec = history_record(&state.db, &plain.command_id).await;
+    assert!(
+        !plain_rec.command.starts_with("[特权用户"),
+        "普通命令不应带特权前缀，实际：{}",
+        plain_rec.command
+    );
+
+    state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
+}
+
+/// **D47 R3 回归**：一次提权只影响那一条命令，之后数据面仍是普通身份。
+///
+/// 这条守住双通道方案的**权力边界**：没有"进入 root 模式"这回事。
+/// 若特权通道被复用或未收掉，后续普通命令就会在 root 身份下执行——
+/// 那等于给了 Agent 一个隐形的常驻后门，且人类审计里看不出来。
+#[tokio::test]
+#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
+async fn run_as_root_does_not_leave_the_terminal_privileged() {
+    let t = target();
+    let (state, key) = test_state();
+    let host_id = seed_host(&state, &key, &t, SudoPolicy::Auto).await;
+
+    let terminal = state
+        .terminals
+        .open_terminal(&state.db, &key, &host_id, None)
+        .await
+        .expect("终端应能建立");
+
+    let before = state
+        .terminals
+        .run_command(&state.db, &terminal.id, "id -u", Some(Duration::from_secs(20)))
+        .await
+        .expect("普通命令应能下发");
+    let (uid_before, _) = collect(&state.terminals, &state.db, &before.command_id).await;
+
+    state
+        .terminals
+        .run_as_root(&state.db, &key, &terminal.id, "id -u", None)
+        .await
+        .expect("提权命令应能执行");
+
+    let after = state
+        .terminals
+        .run_command(&state.db, &terminal.id, "id -u", Some(Duration::from_secs(20)))
+        .await
+        .expect("普通命令应能下发");
+    let (uid_after, code_after) = collect(&state.terminals, &state.db, &after.command_id).await;
+
+    assert_eq!(code_after, Some(0), "提权后的普通命令仍应可用：{uid_after}");
+    assert_ne!(
+        uid_after.trim(),
+        "0",
+        "提权之后数据面必须仍是普通身份（不得留下常驻 root）"
+    );
+    assert_eq!(
+        uid_after.trim(),
+        uid_before.trim(),
+        "提权前后数据面的身份应一致"
+    );
+
+    state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
+}
+
+/// **D47 R3 回归**：取目录的探测与排队中的普通命令必须**互斥**。
+///
+/// 背景（实测踩到的真缺陷）：探测帧会在"当前命令"槽位上放自己的命令。
+/// 若它不与 `run_command` 共用执行锁，就会出现这种交错——
+/// 队列里的普通命令把槽位设成自己、帧也发出去了，紧接着探测把槽位**覆盖**掉；
+/// 那条普通命令的等待循环看到"槽位不是我"，判定为会话中断并结束，
+/// 落库成"退出码未知、输出为空"。而远端其实已经把它执行完了：
+/// **记录说失败，效果却发生了**——审计里最不能接受的一类错误。
+///
+/// 编排要点：探测发生在 `run_as_root` 内部，因此本用例只需**紧接着**
+/// 下发一条普通命令，让两条命令真正争抢同一把锁。
+#[tokio::test]
+#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
+async fn run_as_root_does_not_clobber_a_concurrent_plain_command() {
+    let t = target();
+    let (state, key) = test_state();
+    let host_id = seed_host(&state, &key, &t, SudoPolicy::Auto).await;
+
+    let terminal = state
+        .terminals
+        .open_terminal(&state.db, &key, &host_id, None)
+        .await
+        .expect("终端应能建立");
+
+    // 先跑一条普通命令，确保数据面的泵与槽位已进入正常节奏。
+    let warm = state
+        .terminals
+        .run_command(&state.db, &terminal.id, "id -u", Some(Duration::from_secs(20)))
+        .await
+        .expect("普通命令应能下发");
+    let (warm_out, warm_code) = collect(&state.terminals, &state.db, &warm.command_id).await;
+    assert_eq!(warm_code, Some(0), "预热命令应成功：{warm_out}");
+
+    state
+        .terminals
+        .run_as_root(&state.db, &key, &terminal.id, "id -u", None)
+        .await
+        .expect("提权命令应能执行");
+
+    // 紧跟一条普通命令：它必须拿到**自己**的退出码与输出，
+    // 而不是被探测覆盖成"退出码未知、输出为空"。
+    let follow = state
+        .terminals
+        .run_command(
+            &state.db,
+            &terminal.id,
+            "printf 'FOLLOWUP-OK\\n'",
+            Some(Duration::from_secs(20)),
+        )
+        .await
+        .expect("普通命令应能下发");
+    let (out, code) = collect(&state.terminals, &state.db, &follow.command_id).await;
+
+    assert_eq!(
+        code,
+        Some(0),
+        "紧跟提权之后的普通命令必须拿到真实退出码（被探测覆盖会变成 None）：{out}"
+    );
+    assert!(
+        out.contains("FOLLOWUP-OK"),
+        "普通命令的输出必须归属于它自己：{out}"
+    );
+
+    state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
+}

@@ -123,6 +123,13 @@ while IFS= read -r -d '' mfperch_frame; do
   mfperch_cmd=${{mfperch_frame#*$'\n'}}
   eval "$mfperch_cmd" < /dev/null
   mfperch_rc=$?
+  # `set -e` 会留在 shell 状态里（它本来就是合法的持久状态），随后 `mfperch_rc=$?`
+  # 这类赋值虽不会失败，但**赋值给已存在的变量**在 `set -e` 下不算命令、不触发退出，
+  # 而 `printf` 的写失败却会。为稳妥起见，打印结束标记这一步显式关掉 `set -e`：
+  # 结束标记是协议的一部分，任何用户命令留下的 shell 状态都不得让它消失——
+  # 丢了它，应用侧会一直等到超时（实测踩过：命令报 command not found，
+  # 随后 shell 因 `set -e` 直接退出，结束标记永远不来）。
+  set +e
   printf '\n{end}%s__%s__%s__\n' "$mfperch_nonce" "$mfperch_id" "$mfperch_rc"
 done
 "#,
@@ -429,7 +436,11 @@ pub fn sudo_prompt_marker(nonce: &str) -> String {
 ///
 /// 单引号内无法转义，POSIX 的标准做法是"结束单引号 → 插入 `\'` → 重新开启"：
 /// `a'b` → `'a'\''b'`。包装脚本与提示标记都要经它嵌入命令行。
-fn shell_single_quote(s: &str) -> String {
+///
+/// 对上层公开（D47）：提权编排要把数据面的**工作目录**嵌进特权通道的命令，
+/// 目录名可能含空格、引号等字符，必须走同一套转义——两处各写一份
+/// 迟早会出现"一处修了、另一处没修"的注入缺口。
+pub fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
@@ -484,6 +495,67 @@ pub fn take_sudo_prompt(buf: &mut Vec<u8>, nonce: &str) -> bool {
 pub fn pwd_probe_command() -> &'static str {
     // 用 printf 的 %s（不加换行），避免把换行算进路径。
     "printf '%s' \"$PWD\""
+}
+
+/// 提权通道上**核实实际身份**的命令（D47）。
+///
+/// 为什么不能只靠"提权成功"就标注为 root（uid=0）：
+/// sudoers 可以配置成 `user ALL=(someuser) ...`——`sudo -S ... bash` 此时
+/// **成功**，但落到的是非 0 的目标用户。若审计一律写 `uid=0`，命令历史里
+/// 就会出现一句假话（P2：降级/偏差必须显式告知）。
+///
+/// `${EUID}` 是 bash 内建变量，不依赖外部 `id` 命令；用户名用 `$(id -un ...)`
+/// 尽力而为，取不到就不写名字——数字 uid 才是审计的事实依据。
+/// 与命令**同一次提权里连着执行**，因此不需要额外往返。
+pub fn privileged_identity_command() -> &'static str {
+    "printf '__MF_PERCH_UID__%s|%s\\n' \"${EUID:-?}\" \"$(id -un 2>/dev/null)\""
+}
+
+/// 从提权通道的输出里摘出身份行，返回 `(实际 uid, 用户名)`（D47）。
+///
+/// 同时把该行从输出中**移除**：它属于应用的核实动作，不是 Agent 命令的产出，
+/// 不应混进 `run_as_root` 的返回内容里。
+pub fn take_privileged_identity(output: &mut String) -> Option<(u32, Option<String>)> {
+    const MARK: &str = "__MF_PERCH_UID__";
+    let mut found = None;
+    let mut kept = String::with_capacity(output.len());
+
+    for line in output.lines() {
+        if let Some(rest) = line.trim_end().strip_prefix(MARK) {
+            if found.is_none() {
+                let (uid, name) = match rest.split_once('|') {
+                    Some((u, n)) => (u, n),
+                    None => (rest, ""),
+                };
+                // 只接受纯数字：非数字说明输出不是我们发的那条命令产生的，
+                // 宁可当作"身份未知"，也不要把它当成 uid。
+                if let Ok(value) = uid.trim().parse::<u32>() {
+                    let name = name.trim();
+                    found = Some((
+                        value,
+                        if name.is_empty() {
+                            None
+                        } else {
+                            Some(name.to_string())
+                        },
+                    ));
+                }
+            }
+            // 无论是否解析成功，这一行都不回传给 Agent。
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+
+    if found.is_some() {
+        // 命令原本可能不以换行结尾；这里统一按行重建，仅在确实摘掉了身份行时替换。
+        while kept.ends_with('\n') {
+            kept.pop();
+        }
+        *output = kept;
+    }
+    found
 }
 
 /// 握手时"是否要写密码"的结论。
@@ -864,8 +936,77 @@ mod tests {
         assert!(!take_sudo_prompt(&mut twice, nonce), "摘完不应再摘到");
     }
 
+    /// 守的不变式：**身份核实行必须从 Agent 看到的输出里摘掉**，
+    /// 且只有本应用真的打印了那一行时才改写输出（D47）。
+    ///
+    /// 若摘不掉：`run_as_root` 的返回里会多出一条与应用无关的协议文本；
+    /// 若误摘：Agent 命令自己打印的相似文本会被吞掉。
+    #[test]
+    fn privileged_identity_is_extracted_and_stripped() {
+        // 正常形态：身份行夹在命令输出中间。
+        let mut out = "before\n__MF_PERCH_UID__0|root\nafter".to_string();
+        assert_eq!(
+            take_privileged_identity(&mut out),
+            Some((0, Some("root".to_string()))),
+            "应解析出实际 uid 与用户名"
+        );
+        assert_eq!(out, "before\nafter", "身份行必须被摘掉");
+
+        // 非 root：sudoers 把目标用户配成别人时，uid 必须如实报告（不能假装 0）。
+        let mut other = "__MF_PERCH_UID__1002|ops\ncmd".to_string();
+        assert_eq!(
+            take_privileged_identity(&mut other),
+            Some((1002, Some("ops".to_string())))
+        );
+        assert_eq!(other, "cmd");
+
+        // 用户名取不到（无 id 命令）：只报 uid，不算失败。
+        let mut noname = "__MF_PERCH_UID__0|\ncmd".to_string();
+        assert_eq!(take_privileged_identity(&mut noname), Some((0, None)));
+
+        // 非数字 uid：**不接受**，宁可"身份未知"也不要把别的东西当 uid。
+        let mut garbage = "__MF_PERCH_UID__notanumber|x\ncmd".to_string();
+        assert_eq!(take_privileged_identity(&mut garbage), None);
+
+        // 完全没有该行：输出原样返回，不得改动（否则会吞掉 Agent 的输出）。
+        let mut plain = "line1\nline2".to_string();
+        assert_eq!(take_privileged_identity(&mut plain), None);
+        assert_eq!(plain, "line1\nline2");
+    }
+
+    /// 守的不变式：**结束标记必须无条件打出来**（`set +e` 要在它之前）。
+    ///
+    /// 背景（R3 实测踩到）：Agent 的命令如果真的失败到让 shell 改变状态——
+    /// 例如命令名不存在触发 `set -e`——那么"打印结束标记"这一步会被跳过，
+    /// 于是应用侧永远等不到结束标记，命令**卡到超时**（表现为"提权命令
+    /// 30 秒未结束"，而远端其实早已返回 127）。
+    ///
+    /// 这条断言刻意检查**顺序**而不只是"脚本里出现过 set +e"：
+    /// 语句存在但位置不对（在 `eval` 之前、或在 `while` 之外）同样防不住。
+    #[test]
+    fn wrapper_always_emits_end_marker_even_after_set_e() {
+        let script = wrapper_script("nonce_x", None, false);
+
+        let eval_at = script
+            .find("eval \"$mfperch_cmd\"")
+            .expect("包装脚本应 eval 命令正文");
+        let reset_at = script[eval_at..]
+            .find("set +e")
+            .map(|i| i + eval_at)
+            .expect("打印结束标记之前必须显式关掉 set -e");
+        let marker_at = script
+            .find(&format!("printf '\\n{END_MARKER_PREFIX}"))
+            .expect("包装脚本应打印结束标记");
+
+        assert!(
+            reset_at > eval_at && reset_at < marker_at,
+            "`set +e` 必须夹在 eval 与结束标记之间（eval@{eval_at} reset@{reset_at} marker@{marker_at}）"
+        );
+    }
+
     #[test]
     fn crlf_is_normalized() {
+        // 注意：`nonce` 与 `line` 都在此处定义——它是本用例的输入。
         let nonce = "n2";
         let line = format!("{END_MARKER_PREFIX}{nonce}__cmd1__0__\r\n");
         assert_eq!(
