@@ -51,6 +51,10 @@ pub enum SessionEvent {
     ///
     /// 与 [`SessionEvent::SudoRequest`] 不同：后者是"旧机制（askpass + FIFO）下的索要"，
     /// 本变体只用于**新的双通道提权**——应用收到它才把密码写进该通道的 stdin。
+    ///
+    /// ⚠️ **握手判定不要依赖本变体**：密码提示**不带换行**，按行解析通常看不到它。
+    /// 就绪阶段的判定请用 [`take_sudo_prompt`]（直接在字节流上摘标记）；
+    /// 本变体只在提示恰好被换行终止时出现，用于让上层观察/告警。
     SudoPrompt,
     /// 普通输出行（命令产生的输出）。
     OutputLine(String),
@@ -421,6 +425,56 @@ pub fn sudo_prompt_marker(nonce: &str) -> String {
     format!("{SUDO_PROMPT_PREFIX}{nonce}__")
 }
 
+/// 把一段文本安全地包成**一个** shell 词（单引号形式）。
+///
+/// 单引号内无法转义，POSIX 的标准做法是"结束单引号 → 插入 `\'` → 重新开启"：
+/// `a'b` → `'a'\''b'`。包装脚本与提示标记都要经它嵌入命令行。
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// 构造**提权通道**的启动命令（D47）。
+///
+/// 形如：`sudo -S -p '<提示标记>' bash -c '<包装脚本>'`
+///
+/// - `-S`：密码从 **stdin** 读——本通道的 stdin 正是应用持有的私有管道，
+///   由上层按 [`SudoAuthHandshake`] 的结论写入（看到提示标记才写）；
+/// - `-p <提示标记>`：让 sudo 的提示带上**我们自己的随机标记**，
+///   应用据此判断"要不要写密码"，不依赖 sudo 的文案（实测两种实现文案不同）；
+/// - 包装脚本必须作为**单个参数**传给 `bash -c`，因此做单引号转义
+///   （脚本自身含单引号，不能直接拼接）。
+///
+/// 这样提权通道跑的是**同一套包装循环**（NUL 分帧 + nonce 结束标记），
+/// 因此提权命令的输出与退出码能和普通命令一样被精确归属。
+pub fn privileged_wrapper_command(nonce: &str, script: &str) -> String {
+    format!(
+        "sudo -S -p {} bash -c {}",
+        shell_single_quote(&sudo_prompt_marker(nonce)),
+        shell_single_quote(script)
+    )
+}
+
+/// 从原始字节流中**摘除第一个**密码提示标记，返回是否摘到（D47）。
+///
+/// 为什么不能靠按行切分：**密码提示是不带换行的**（sudo 写完提示就等输入），
+/// 按 `\n` 分行的解析永远看不到它——那会变成"应用等提示、sudo 等密码"的死锁。
+/// 因此握手判定直接在字节流上做，并把标记摘掉，避免同一次提示被重复计数
+/// （重复计数会被误判成"密码被拒"）。
+pub fn take_sudo_prompt(buf: &mut Vec<u8>, nonce: &str) -> bool {
+    let needle = sudo_prompt_marker(nonce);
+    let needle = needle.as_bytes();
+    if needle.is_empty() || buf.len() < needle.len() {
+        return false;
+    }
+    match buf.windows(needle.len()).position(|w| w == needle) {
+        Some(pos) => {
+            buf.drain(pos..pos + needle.len());
+            true
+        }
+        None => false,
+    }
+}
+
 /// 探测数据面当前目录的命令（D47：cwd 自动继承）。
 ///
 /// 刻意**不把 `$PWD` 编进结束标记**：路径可能含 `__` 甚至换行，而标记用 `__`
@@ -739,6 +793,75 @@ mod tests {
             SudoAuthStep::Ignore,
             "已认证成功后不得再写密码"
         );
+    }
+
+    /// 守的不变式：转义后的文本必须仍是**一个** shell 词，且内容原样可还原。
+    ///
+    /// 这是提权通道能启动的前提——包装脚本自身含单引号（`mfperch_nonce='…'`），
+    /// 若转义写错，脚本会被 shell 拆成多个词，远端直接报语法错误。
+    #[test]
+    fn shell_single_quote_keeps_text_as_one_word() {
+        let cases = [
+            ("abc", "'abc'"),
+            ("", "''"),
+            ("a'b", r"'a'\''b'"),
+            ("a'b'c", r"'a'\''b'\''c'"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                shell_single_quote(input),
+                expected,
+                "输入 {input:?} 的单引号转义不符"
+            );
+        }
+    }
+
+    /// 提权通道的启动命令：必须用 `-S`、带上本会话的提示标记，且包装脚本是一个参数。
+    #[test]
+    fn privileged_command_uses_stdin_and_prompt_marker() {
+        let nonce = "n1";
+        let cmd = privileged_wrapper_command(nonce, "echo hi");
+        assert!(
+            cmd.starts_with("sudo -S -p '"),
+            "必须用 `-S` 且设置提示标记：{cmd}"
+        );
+        assert!(
+            cmd.contains(&sudo_prompt_marker(nonce)),
+            "应包含本会话的提示标记：{cmd}"
+        );
+        assert!(
+            cmd.ends_with(r"bash -c 'echo hi'"),
+            "包装脚本应作为单个参数传给 bash -c：{cmd}"
+        );
+    }
+
+    /// 守的不变式：提示标记必须能从**不带换行**的字节流里摘出来（D47）。
+    ///
+    /// 若只能按行识别，就会出现"应用等提示、sudo 等密码"的死锁——
+    /// 这正是 R2 首次实现时踩到的缺陷（潜伏到 e2e 才暴露）。
+    #[test]
+    fn take_sudo_prompt_finds_marker_without_newline_and_removes_it() {
+        let nonce = "n9";
+        let marker = sudo_prompt_marker(nonce);
+
+        // sudo-rs 形态：标记被包在它自己的文案里，且**没有换行**
+        let mut buf = format!("[sudo: {marker}] Password: ").into_bytes();
+        assert!(take_sudo_prompt(&mut buf, nonce), "无换行也应能摘到标记");
+        assert!(
+            !String::from_utf8_lossy(&buf).contains(&marker),
+            "摘除后不应残留标记：{:?}",
+            String::from_utf8_lossy(&buf)
+        );
+
+        // 没有标记时不得误判
+        let mut none = b"\xe4\xb8\xad\xe6\x96\x87 output\n".to_vec();
+        assert!(!take_sudo_prompt(&mut none, nonce), "无标记时不应摘到");
+
+        // 两次提示要能数出两次（用于识别"密码被拒"），且摘完不再重复计数
+        let mut twice = format!("{marker}{marker}").into_bytes();
+        assert!(take_sudo_prompt(&mut twice, nonce), "第一次应摘到");
+        assert!(take_sudo_prompt(&mut twice, nonce), "第二次应摘到");
+        assert!(!take_sudo_prompt(&mut twice, nonce), "摘完不应再摘到");
     }
 
     #[test]

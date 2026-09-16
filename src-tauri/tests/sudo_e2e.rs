@@ -27,6 +27,8 @@ use std::time::Duration;
 
 use mf_perch_lib::domain::credential::{Credential, CredentialKind};
 use mf_perch_lib::domain::host::{Host, SudoPasswordSource, SudoPolicy};
+use mf_perch_lib::error::AppError;
+use mf_perch_lib::ssh::{AuthMethod, Session, SessionOutput};
 use mf_perch_lib::state::AppState;
 use mf_perch_lib::store::{credentials, hosts};
 use mf_perch_lib::terminal::sudo::{SudoDecision, SudoRequest};
@@ -667,4 +669,118 @@ printf 'B=%s\n' "$(cat /tmp/mfperch-b2-b.out)"
         .delete_terminal(&state.db, &terminal.id)
         .await
         .ok();
+}
+
+// ===================================================================
+// D47：提权双通道 —— 通道层（R2）
+// ===================================================================
+
+/// 造一个内存 Host + 密钥认证，供通道层用例直接建立会话。
+///
+/// 提权通道**不经过** askpass/FIFO（它本身已是 root），因此主机策略与
+/// sudo 密码配置无关——这里只需要一个可用的登录目标。
+fn privileged_target(t: &Target) -> (Host, AuthMethod) {
+    let mut host = Host::new(t.address.clone(), t.port);
+    host.name = Some("privileged e2e".into());
+    let auth = AuthMethod::Key {
+        username: t.username.clone(),
+        private_key_pem: t.key_pem.clone(),
+        passphrase: None,
+    };
+    (host, auth)
+}
+
+/// 从事件流里收集某条命令的输出，直到它的结束标记。
+///
+/// 超时**明确失败**（测试环境异常），不返回空值——否则"提权失败"与
+/// "命令根本没跑完"会得到同一种绿灯理由。
+async fn collect_session_output(
+    rx: &mut tokio::sync::mpsc::Receiver<SessionOutput>,
+    command_id: &str,
+) -> (String, Option<i32>) {
+    let mut out = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            panic!("命令 {command_id} 在 30 秒内未结束：测试环境异常，而非被测行为");
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Err(_) => panic!("命令 {command_id} 等待超时：测试环境异常"),
+            Ok(None) => panic!("会话事件流已关闭，未收到 {command_id} 的结束标记"),
+            Ok(Some(SessionOutput::Line { line })) => {
+                out.push_str(&line);
+                out.push('\n');
+            }
+            Ok(Some(SessionOutput::Finished {
+                command_id: id,
+                exit_code,
+            })) if id == command_id => return (out, Some(exit_code)),
+            Ok(Some(_)) => {}
+        }
+    }
+}
+
+/// **D47 R2 回归**：提权通道以 root 运行命令，且输出/退出码走同一套协议。
+#[tokio::test]
+#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
+async fn privileged_channel_runs_commands_as_root() {
+    let t = target();
+    let (host, auth) = privileged_target(&t);
+
+    let (session, mut rx) =
+        Session::connect_privileged("term_priv", &host, auth, &t.sudo_password)
+            .await
+            .expect("提权通道应能建立（密码经本通道 stdin 投递）");
+
+    session
+        .send_command("cmd_priv", "id -u")
+        .await
+        .expect("命令应能下发");
+
+    let (out, rc) = collect_session_output(&mut rx, "cmd_priv").await;
+    assert_eq!(rc, Some(0), "提权命令应成功。输出：{out}");
+    assert!(
+        out.lines().any(|l| l.trim() == "0"),
+        "提权通道应以 root 执行（`id -u` 整行为 0）。输出：{out}"
+    );
+}
+
+/// **D47 R2 回归**：密码错误时**明确失败**，不能挂住。
+///
+/// 交互过程：sudo 索要密码（第 1 次提示）→ 应用写入错误密码 →
+/// sudo 认证失败后**再次索要**（第 2 次提示）→ 应用判定"密码被拒"并立即报错。
+/// 若不处理第二次提示，sudo 会一直等输入（`passwd_timeout` 默认数分钟），
+/// 表现为"提权请求挂住"。
+///
+/// 注：sudo 的凭证缓存按父进程/会话记录，本用例每次都是新会话，
+/// 因此不会因缓存跳过密码（PoC 实测确认跨会话不共享）。
+#[tokio::test]
+#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
+async fn privileged_channel_fails_fast_on_wrong_password() {
+    let t = target();
+    let (host, auth) = privileged_target(&t);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(45),
+        Session::connect_privileged("term_priv_bad", &host, auth, "definitely-wrong-password"),
+    )
+    .await;
+
+    let err = match result {
+        Err(_) => panic!("密码错误时提权应快速失败，而不是挂住（45 秒超时）"),
+        Ok(Ok(_)) => panic!("错误密码不应建立提权通道"),
+        Ok(Err(e)) => e,
+    };
+    assert!(
+        matches!(err, AppError::SudoElevationFailed(_)),
+        "应以「提权失败」明确报错，实际：{err:?}"
+    );
+    // **判别性断言**：必须因"密码被拒"而失败，而不是等到就绪超时——
+    // 两者都是 SudoElevationFailed，只看类型会让"挂住到超时"也算通过
+    // （本用例初版就因此假绿灯）。
+    assert!(
+        err.to_string().contains("未接受该密码"),
+        "应因「密码被拒」快速失败，而不是等待就绪超时，实际：{err}"
+    );
 }

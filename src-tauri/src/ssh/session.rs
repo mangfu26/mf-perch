@@ -71,8 +71,51 @@ impl Session {
         auth: AuthMethod,
         sudo_enabled: bool,
     ) -> Result<(Self, mpsc::Receiver<SessionOutput>)> {
+        Self::connect_inner(terminal_id, host, auth, sudo_enabled, None).await
+    }
+
+    /// 建立**提权通道**（D47）：用 `sudo -S` 以 root 身份运行**同一套包装脚本**。
+    ///
+    /// `password` 只在 sudo **确实索要密码时**才写进本通道的 stdin，
+    /// 判定由 [`protocol::SudoAuthHandshake`] 负责：看到提示标记才写，
+    /// **每条通道最多写一次**；凭证缓存有效时一个字都不写。
+    ///
+    /// 提权通道**不部署** askpass 与 FIFO（它本身已是 root，无需拦截），
+    /// 也不做环境快照——因此比数据面少一次 setup 往返。
+    pub async fn connect_privileged(
+        terminal_id: impl Into<String>,
+        host: &Host,
+        auth: AuthMethod,
+        password: &str,
+    ) -> Result<(Self, mpsc::Receiver<SessionOutput>)> {
+        Self::connect_inner(terminal_id, host, auth, false, Some(password)).await
+    }
+
+    async fn connect_inner(
+        terminal_id: impl Into<String>,
+        host: &Host,
+        auth: AuthMethod,
+        sudo_enabled: bool,
+        privileged_password: Option<&str>,
+    ) -> Result<(Self, mpsc::Receiver<SessionOutput>)> {
         let terminal_id = terminal_id.into();
         let nonce = protocol::new_nonce();
+        let privileged = privileged_password.is_some();
+
+        /// 会话未就绪时的报错：提权通道与数据面的原因不同，提示也应不同。
+        fn not_ready_error(privileged: bool) -> AppError {
+            if privileged {
+                AppError::SudoElevationFailed(format!(
+                    "提权会话未在 {} 秒内就绪：sudo 可能被拒绝（密码不正确，或该主机不允许非交互 sudo）",
+                    READY_TIMEOUT.as_secs()
+                ))
+            } else {
+                AppError::SshConnect(format!(
+                    "远端会话未在 {} 秒内就绪；请确认目标主机已安装 bash",
+                    READY_TIMEOUT.as_secs()
+                ))
+            }
+        }
 
         // --- 连接与主机密钥校验（D10） ---
         let config = Arc::new(client::Config {
@@ -137,39 +180,45 @@ impl Session {
             ));
         }
 
-        // --- 打开 channel 并启动包装脚本（D3 / D4） ---
-        let channel = handle
-            .channel_open_session()
-            .await
-            .map_err(|e| AppError::SshConnect(format!("打开 SSH 会话通道失败：{e}")))?;
+        // --- 会话初始化：工作目录、FIFO、askpass、环境快照（Q33 / D4） ---
+        //
+        // 提权通道**跳过**这一步：它本身已是 root，不需要 sudo 拦截；
+        // 环境快照也只在数据面上有意义。跳过可省一次往返。
+        let env_snapshot = if privileged {
+            None
+        } else {
+            let channel = handle
+                .channel_open_session()
+                .await
+                .map_err(|e| AppError::SshConnect(format!("打开 SSH 会话通道失败：{e}")))?;
 
-        // 会话初始化：工作目录、FIFO、askpass、环境快照（Q33 / D4）
-        let setup = protocol::session_setup_script(&nonce, sudo_enabled);
-        channel
-            .exec(true, setup.as_bytes())
-            .await
-            .map_err(|e| AppError::SshConnect(format!("初始化远端会话失败：{e}")))?;
+            let setup = protocol::session_setup_script(&nonce, sudo_enabled);
+            channel
+                .exec(true, setup.as_bytes())
+                .await
+                .map_err(|e| AppError::SshConnect(format!("初始化远端会话失败：{e}")))?;
 
-        // setup 阶段的写入半部不再需要：后续会重新打开通道运行包装脚本。
-        let (mut reader, _writer) = channel.split();
+            // setup 阶段的写入半部不再需要：后续会重新打开通道运行包装脚本。
+            let (mut reader, _writer) = channel.split();
 
-        // 等待 setup 完成：读取直到通道关闭，这样环境快照与 FIFO 一定先就绪。
-        let mut setup_output = Vec::new();
-        loop {
-            match reader.wait().await {
-                Some(ChannelMsg::Data { data }) => setup_output.extend_from_slice(&data),
-                Some(ChannelMsg::ExtendedData { data, .. }) => {
-                    setup_output.extend_from_slice(&data)
+            // 等待 setup 完成：读取直到通道关闭，这样环境快照与 FIFO 一定先就绪。
+            let mut setup_output = Vec::new();
+            loop {
+                match reader.wait().await {
+                    Some(ChannelMsg::Data { data }) => setup_output.extend_from_slice(&data),
+                    Some(ChannelMsg::ExtendedData { data, .. }) => {
+                        setup_output.extend_from_slice(&data)
+                    }
+                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                    Some(_) => {}
                 }
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
-                Some(_) => {}
             }
-        }
 
-        // 解析环境快照（D4）：失败不影响会话建立，仅记录为空。
-        let env_snapshot = parse_env_snapshot(&setup_output, host.shell_env_mode);
+            // 解析环境快照（D4）：失败不影响会话建立，仅记录为空。
+            parse_env_snapshot(&setup_output, host.shell_env_mode)
+        };
 
-        // 重新打开 channel 运行常驻包装脚本。
+        // 打开 channel 运行常驻包装脚本。
         let channel = handle
             .channel_open_session()
             .await
@@ -178,8 +227,17 @@ impl Session {
         // sudo_enabled 决定是否注入 sudo 拦截函数（Q33 三模式）。
         let script =
             protocol::wrapper_script(&nonce, host.init_script.as_deref(), sudo_enabled);
+
+        // 提权通道：同一套包装脚本，但**以 sudo -S 启动**（D47）。
+        // 这样提权命令的输出与退出码走的是同一套 NUL 分帧 + nonce 标记协议。
+        let launch = if privileged {
+            protocol::privileged_wrapper_command(&nonce, &script)
+        } else {
+            script
+        };
+
         channel
-            .exec(true, script.as_bytes())
+            .exec(true, launch.as_bytes())
             .await
             .map_err(|e| AppError::SshConnect(format!("启动终端会话失败：{e}")))?;
 
@@ -189,41 +247,85 @@ impl Session {
         let mut ready = false;
         let mut pending: Vec<u8> = Vec::new();
 
+        // D47 握手：只在 sudo **确实索要密码**时写，且每条通道最多一次。
+        let mut handshake = protocol::SudoAuthHandshake::new();
+        let mut ask_for_password = false;
+        let mut password_rejected = false;
+
         let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
         while !ready {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err(AppError::SshConnect(format!(
-                    "远端会话未在 {} 秒内就绪；请确认目标主机已安装 bash",
-                    READY_TIMEOUT.as_secs()
-                )));
+                return Err(not_ready_error(privileged));
             }
 
             let msg = tokio::time::timeout(remaining, reader.wait())
                 .await
-                .map_err(|_| {
-                    AppError::SshConnect(format!(
-                        "远端会话未在 {} 秒内就绪；请确认目标主机已安装 bash",
-                        READY_TIMEOUT.as_secs()
-                    ))
-                })?;
+                .map_err(|_| not_ready_error(privileged))?;
 
             match msg {
                 Some(ChannelMsg::Data { data })
                 | Some(ChannelMsg::ExtendedData { data, .. }) => {
                     pending.extend_from_slice(&data);
-                    // 就绪阶段只需识别 READY 标记，其余事件（含输出）暂存到
-                    // 后台任务的起始缓冲，由它继续处理。
+
+                    // 1) 密码提示**不带换行**，不能等按行切分（否则死锁：
+                    //    应用等提示、sudo 等密码）。直接在字节流里摘标记，
+                    //    摘掉即计数一次，避免同一次提示被重复判定。
+                    while protocol::take_sudo_prompt(&mut pending, &nonce) {
+                        if handshake.on_prompt() == protocol::SudoAuthStep::SendPassword {
+                            ask_for_password = true;
+                        } else {
+                            // 第二次索要 ⇒ 上一次写进去的密码没被接受
+                            password_rejected = true;
+                        }
+                    }
+
+                    // 2) 再按行解析就绪标记（其余事件暂存给后台任务）。
                     consume_lines(&mut pending, &nonce, |ev| {
                         if matches!(ev, SessionEvent::Ready) {
                             ready = true;
                         }
                     });
+
+                    if password_rejected {
+                        return Err(AppError::SudoElevationFailed(
+                            "sudo 未接受该密码：请检查该主机配置的提权密码，\
+                             或该主机是否允许非交互 sudo"
+                                .into(),
+                        ));
+                    }
+
+                    if ask_for_password {
+                        ask_for_password = false;
+                        let Some(pw) = privileged_password else {
+                            // 数据面不该出现密码提示（数据面不跑 `sudo -S`）。
+                            // 宁可失败也不要把密码写到别处。
+                            return Err(AppError::SudoElevationFailed(
+                                "数据面通道收到 sudo 密码提示，已拒绝写入密码".into(),
+                            ));
+                        };
+                        // 密码经**本通道的 stdin** 交给 sudo：不落盘、不进命令行、
+                        // 不经过 Agent 可枚举的任何路径（D47）。
+                        writer
+                            .data(format!("{pw}\n").as_bytes())
+                            .await
+                            .map_err(|e| {
+                                AppError::SudoElevationFailed(format!("写入 sudo 密码失败：{e}"))
+                            })?;
+                    }
                 }
                 Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                    return Err(AppError::SshConnect(
-                        "远端会话在就绪前即已关闭，请确认目标主机已安装 bash".into(),
-                    ));
+                    return Err(if privileged {
+                        AppError::SudoElevationFailed(
+                            "提权会话在就绪前即已关闭：sudo 可能被拒绝\
+                             （密码不正确，或该主机不允许非交互 sudo）"
+                                .into(),
+                        )
+                    } else {
+                        AppError::SshConnect(
+                            "远端会话在就绪前即已关闭，请确认目标主机已安装 bash".into(),
+                        )
+                    });
                 }
                 Some(_) => {}
             }
