@@ -123,13 +123,37 @@ done
 }
 
 
-/// 启动包装脚本时使用的 bash 参数。
+/// 启动包装脚本时使用的 bash 参数（D4）。
+///
+/// - `LoginThenTask`：`bash -l -c '<脚本>'` —— 登录 shell，加载 `/etc/profile`
+///   与 `~/.bash_profile`，最接近人类 SSH 登录；
+/// - `CleanThenTask`：`bash --noprofile --norc -c '<脚本>'` —— 干净环境。
+///
+/// **必须真正接到远端启动路径上**：这一对参数曾经只被自身单测引用，
+/// 生产代码直接把脚本原样交给 `channel.exec`（等价于 `bash -s`，**既不是**
+/// 登录 shell 也不是显式干净模式），结果是设置页里"环境加载方式"这个
+/// 用户可见的开关**完全没有效果**（实测：登录模式下 `~/.bash_profile` 里加的
+/// `/opt/...` 不会出现在 PATH 中）。现在由 [`wrapper_launch_command`] 使用。
+///
+/// **privileged 通道刻意只用这一对参数、不额外包登录 shell**：那条通道上
+/// 命令以 `sudo` 的 `env_reset` 语义运行，登录 shell 加载的 PATH 会被 sudo
+/// 重置（见 D47 的 PoC 结论），包了也等于没包，只会多一层难排查的嵌套。
 pub fn shell_invocation(env_mode: crate::domain::host::ShellEnvMode) -> (&'static str, &'static [&'static str]) {
     use crate::domain::host::ShellEnvMode;
     match env_mode {
-        ShellEnvMode::LoginThenTask => ("bash", &["-l", "-s"]),
-        ShellEnvMode::CleanThenTask => ("bash", &["--noprofile", "--norc", "-s"]),
+        ShellEnvMode::LoginThenTask => ("bash", &["-l", "-c"]),
+        ShellEnvMode::CleanThenTask => ("bash", &["--noprofile", "--norc", "-c"]),
     }
+}
+
+/// 构造**数据面**包装脚本的启动命令（D4 + D47）。
+///
+/// 脚本作为 `-c` 的**单个参数**传入并做单引号转义：内容不被外层 shell 展开，
+/// 因此脚本里的 `$`、引号、换行都原样到达，NUL 分帧协议不受影响。
+pub fn wrapper_launch_command(env_mode: crate::domain::host::ShellEnvMode, script: &str) -> String {
+    let (program, args) = shell_invocation(env_mode);
+    // 参数全是静态字面量（`-l` / `-c` 等），无需转义；脚本必须转义。
+    format!("{program} {} {}", args.join(" "), shell_single_quote(script))
 }
 
 /// 数据面的 sudo 垫片：**明确拒绝**并给出可操作指引（D47 / D48）。

@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mf_perch_lib::domain::credential::{Credential, CredentialKind};
-use mf_perch_lib::domain::host::{Host, SudoPasswordSource, SudoPolicy};
+use mf_perch_lib::domain::host::{Host, ShellEnvMode, SudoPasswordSource, SudoPolicy};
 use mf_perch_lib::error::AppError;
 use mf_perch_lib::ssh::{AuthMethod, Session, SessionOutput};
 use mf_perch_lib::state::AppState;
@@ -69,6 +69,17 @@ async fn seed_host(
     t: &Target,
     policy: SudoPolicy,
 ) -> String {
+    seed_host_with_env_mode(state, key, t, policy, ShellEnvMode::LoginThenTask).await
+}
+
+/// 同上，但显式指定"环境加载方式"（D4）——用于验证该设置真的生效。
+async fn seed_host_with_env_mode(
+    state: &AppState,
+    key: &[u8; 32],
+    t: &Target,
+    policy: SudoPolicy,
+    env_mode: ShellEnvMode,
+) -> String {
     let conn = state.db.lock().await;
 
     let cred = Credential::new(t.username.clone(), CredentialKind::Key, t.key_pem.clone());
@@ -79,6 +90,7 @@ async fn seed_host(
     host.name = Some("sudo e2e".into());
     host.credential_id = Some(cred_id);
     host.sudo_policy = policy;
+    host.shell_env_mode = env_mode;
     // 登录用密钥，无法复用登录密码，故必须单独配置 sudo 密码。
     host.sudo_password_source = SudoPasswordSource::Own;
     let host_id = host.id.clone();
@@ -707,6 +719,74 @@ async fn run_as_root_does_not_leave_the_terminal_privileged() {
     );
 
     state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
+}
+
+/// **D4 回归**："环境加载方式"（登录 / 干净）必须真正生效。
+///
+/// 背景（收网审计发现）：`protocol::shell_invocation` 这对参数**曾完全没有调用方**——
+/// 数据面直接把脚本原样交给 `channel.exec`（等价于 `bash -s`，既不是登录 shell
+/// 也不是显式干净模式）。于是设置页里这个用户可见的开关**没有任何效果**：
+/// 实测登录模式下 `~/.bash_profile` 里加的目录不会出现在 PATH 中。
+///
+/// 判据刻意用"**只有 profile 才会有**的东西"：本机 `~/.bash_profile` 会把
+/// `/opt/mfperch-test-bin` 加进 PATH（见 `docs/design/test-environment.md` 的测试用户配置）。
+/// 因此：
+/// - 登录模式 → PATH 含该目录（profile 生效）；
+/// - 干净模式 → PATH 不含该目录（profile 未加载）。
+///
+/// 两种模式都必须**至少**正确工作：只断言其中一个方向时，
+/// "两种模式都走同一条命令"这种缺陷照样全绿。
+#[tokio::test]
+#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
+async fn shell_env_mode_actually_changes_the_remote_environment() {
+    let t = target();
+
+    // profile 专属目录：只应出现在登录模式下。
+    const PROFILE_ONLY_DIR: &str = "/opt/mfperch-test-bin";
+
+    for (mode, expected_label) in [
+        (ShellEnvMode::LoginThenTask, "登录模式应加载 profile"),
+        (ShellEnvMode::CleanThenTask, "干净模式不应加载 profile"),
+    ] {
+        let (state, key) = test_state();
+        let host_id = seed_host_with_env_mode(&state, &key, &t, SudoPolicy::Auto, mode).await;
+
+        let terminal = state
+            .terminals
+            .open_terminal(&state.db, &key, &host_id, None)
+            .await
+            .expect("终端应能建立");
+
+        // 注意：命令里**不能**出现 `##`——多行命令的每一行都会被 `#` 截断
+        // （`OutputAccumulator` 的行为，模拟 shell 注释）。这里用 case 判断，
+        // 既不含 `##` 也不含 `${...}`，避免被误截。
+        let probe = format!(
+            r#"case ":$PATH:" in *":{PROFILE_ONLY_DIR}:"*) echo HAS_PROFILE_DIR=yes;; *) echo HAS_PROFILE_DIR=no;; esac"#
+        );
+        let outcome = state
+            .terminals
+            .run_command(&state.db, &terminal.id, &probe, Some(Duration::from_secs(20)))
+            .await
+            .expect("命令应能下发");
+        let (out, code) = collect(&state.terminals, &state.db, &outcome.command_id).await;
+        assert_eq!(code, Some(0), "读取 PATH 应成功：{out}");
+
+        let has_profile_dir = out.contains("HAS_PROFILE_DIR=yes");
+        match mode {
+            ShellEnvMode::LoginThenTask => assert!(
+                has_profile_dir,
+                "{expected_label}：PATH 里应出现 {PROFILE_ONLY_DIR}（该目录只由 ~/.bash_profile 添加）。\
+                 实际输出：{out}"
+            ),
+            ShellEnvMode::CleanThenTask => assert!(
+                !has_profile_dir,
+                "{expected_label}：PATH 里不应出现 {PROFILE_ONLY_DIR}（它只由 profile 添加）。\
+                 实际输出：{out}"
+            ),
+        }
+
+        state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
+    }
 }
 
 /// **D47 R3 回归**：取目录的探测与排队中的普通命令必须**互斥**。

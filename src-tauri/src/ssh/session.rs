@@ -104,7 +104,12 @@ impl Session {
         fn not_ready_error(privileged: bool) -> AppError {
             if privileged {
                 AppError::SudoElevationFailed(format!(
-                    "提权会话未在 {} 秒内就绪：sudo 可能被拒绝（密码不正确，或该主机不允许非交互 sudo）",
+                    "提权会话未在 {} 秒内就绪：sudo 可能被拒绝。\
+                     常见原因：①该主机配置的提权密码不正确；\
+                     ②该主机的 sudoers 要求 TTY（`Defaults requiretty`，老 RHEL/CentOS 默认开），\
+                     而非交互提权不申请 TTY。\
+                     若是②：请由人类移除该选项，或为该主机配置免密路径\
+                     （`NOPASSWD` 白名单 / `pam_ssh_agent_auth` 公钥认证）后重试",
                     READY_TIMEOUT.as_secs()
                 ))
             } else {
@@ -222,16 +227,20 @@ impl Session {
             .await
             .map_err(|e| AppError::SshConnect(format!("打开 SSH 会话通道失败：{e}")))?;
 
-        // elevation_allowed 决定是否注入 sudo 拦截函数（Q33 三模式）。
+        // elevation_allowed 决定数据面 sudo 垫片给出的指引（D48）。
         let script =
             protocol::wrapper_script(&nonce, host.init_script.as_deref(), elevation_allowed);
 
-        // 提权通道：同一套包装脚本，但**以 sudo -S 启动**（D47）。
-        // 这样提权命令的输出与退出码走的是同一套 NUL 分帧 + nonce 标记协议。
+        // 数据面：按该主机的"环境加载方式"启动（D4）——登录模式带 `-l`，
+        // 干净模式带 `--noprofile --norc`。脚本作为 `-c` 的单个参数传入，
+        // 因此 NUL 分帧协议与脚本内容都不受影响。
+        //
+        // 提权通道：同一套包装脚本，但**以 sudo -S 启动**（D47），
+        // 这样提权命令的输出与退出码走同一套 NUL 分帧 + nonce 标记协议。
         let launch = if privileged {
             protocol::privileged_wrapper_command(&nonce, &script)
         } else {
-            script
+            protocol::wrapper_launch_command(host.shell_env_mode, &script)
         };
 
         channel
@@ -315,8 +324,13 @@ impl Session {
                 Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
                     return Err(if privileged {
                         AppError::SudoElevationFailed(
-                            "提权会话在就绪前即已关闭：sudo 可能被拒绝\
-                             （密码不正确，或该主机不允许非交互 sudo）"
+                            "提权会话在就绪前即已关闭：sudo 拒绝了本次提权。\
+                             最常见的原因是该主机的 sudoers 要求 TTY\
+                             （`Defaults requiretty`，老 RHEL/CentOS 默认开），\
+                             而非交互提权不申请 TTY——这条路径通常会立刻失败。\
+                             请由人类移除该选项，或为该主机配置免密路径\
+                             （`NOPASSWD` 白名单 / `pam_ssh_agent_auth` 公钥认证）后重试；\
+                             若密码可能不正确，也请一并核对"
                                 .into(),
                         )
                     } else {
