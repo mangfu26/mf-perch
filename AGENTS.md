@@ -498,22 +498,36 @@ Refs: #123
 ### 5.10 运行方式（速查）
 
 ```bash
-# 本地测试（单元 + 不依赖真实环境的集成），日常与提交前必跑
+# 【开发中】只跑受影响模块——秒级反馈，这是日常主力
+# 模块名就是测试路径前缀，例如 store::db / domain::command / final_status
+cd src-tauri && cargo test -j 2 --lib <模块名>
+
+# 【开发中】只跑某一条真实环境用例
+cd src-tauri && cargo test -j 2 --test sudo_e2e -- --ignored <用例名> --test-threads=1
+
+# 【提交前】全量：单元 + 不依赖真实环境的集成。**一次提交只跑一次**
 # -j 2：并发过高会耗尽 Windows 页面文件、把 target 产物写坏（E0463/E0462），
-#      现象、根因与恢复步骤见 docs/development-troubleshooting.md
+#      现象、根因与恢复步骤见 docs/development-troubleshooting.md。
+#      **不要**为了"跑快点"把 -j 调大：本机 7.9 GB 内存、target 在机械盘上，
+#      并行链接会同时打爆内存与磁盘随机读（评估过程见该 troubleshooting 文档）。
+# 判读以 **cargo 自己的输出**为准（每个 target 的 test result: ok 才算绿；出现 FAILED /
+# error: test failed 才是红）。PowerShell 会把 cargo 的 stderr 警告当成错误，
+# 造成"全绿却退出码 1"；需要机器判读时写文件日志，别用 Select-Object -Last N 截断：
+#   cargo test -j 2 *> ..\.tmp-test\full-test.log; "exit=$LASTEXITCODE"
 cd src-tauri && cargo test -j 2
 
-# 真实环境端到端（需先导出 MFPERCH_TEST_*，见 docs/design/test-environment.md）
+# 【提交前】涉及真实环境行为时，加跑对应的 e2e target
 # 每个文件是独立的 test target，按需选一个；--ignored 只跑该 target 下的 #[ignore] 用例
-cd src-tauri && cargo test --test ssh_integration -- --ignored --test-threads=1
+cd src-tauri && cargo test -j 2 --test ssh_integration -- --ignored --test-threads=1
 
 # 提权双通道的核心用例（13 条，含数据面拒绝 / 提权通道 / cwd 继承 / 身份核实）
 # 需要额外的 MFPERCH_TEST_SUDO_PW；mcp 是默认特性，无需再写 --features mcp
-cd src-tauri && cargo test --test sudo_e2e -- --ignored --test-threads=1
+cd src-tauri && cargo test -j 2 --test sudo_e2e -- --ignored --test-threads=1
 
-# 一次跑完全部真实环境用例（22 条 #[ignore]：sudo_e2e 13 / ssh_integration 5 /
-# mcp_e2e 4，其中 1 条只等空闲超时、不需要 MFPERCH_TEST_*）
-cd src-tauri && cargo test -- --ignored --test-threads=1
+# 【推送 / 并入 main 前】全量 + 全部真实环境用例（22 条 #[ignore]：
+# sudo_e2e 13 / ssh_integration 5 / mcp_e2e 4，其中 1 条只等空闲超时、
+# 不需要 MFPERCH_TEST_*）
+cd src-tauri && cargo test -j 2 -- --ignored --test-threads=1
 
 # 前端三道门禁（都不需要真实环境，与 §5.9 的分工一致）
 pnpm test        # src/lib 纯逻辑单测（vitest）
@@ -523,3 +537,26 @@ pnpm check:ipc   # 跨语言命令名契约：Rust 定义 / generate_handler! �
 # 提交前安全自检（§2.6 红线；纯 node 实现，跨平台、不依赖 bash）
 pnpm check:secrets
 ```
+
+### 5.11 测试节奏（客户 2026-09-16 定）
+
+**目的：日常秒级反馈，提交有保证，发布前有把关。** 三层，各司其职：
+
+| 时机 | 跑什么 | 为什么 |
+| ---- | ---- | ---- |
+| **开发中（每改一处）** | **只跑受影响模块**：`cargo test -j 2 --lib <模块>`；真实环境行为跑单条 e2e | 反馈是**秒级**（实测 0.02–4 秒）。全量的价值在"没有遗漏"，不在"改这一处对不对" |
+| **每次提交前** | **全量**：`cargo test -j 2`（+ 涉及真实环境时加跑对应 e2e target） | 编译已缓存时**只要 20–50 秒**。保证"**每一个提交都是绿的**"——否则中间提交全是未验证状态，出问题只能二分查找 |
+| **推送 / 并入 `main` 前** | **全量 + 全部真实环境 e2e** | 发布前的最终把关（客户原话："正式推送到稳定分支前再跑全量测试"） |
+
+配套的三条纪律：
+
+1. **不为同一件事重复跑全量**：需要二次确认时，跑**上一次失败的那一条**用例即可。
+2. **"改了代码但结果没变"时，先怀疑产物陈旧**：执行
+   `cargo clean -p mf-perch` 强制作废候选产物**再下结论**。
+   **禁止**用"再跑一次全量"撞运气——它既慢又证明不了什么（本项目已被这个问题误导过两次，
+   其中一次差点得出相反的设计结论）。
+3. **长编译不要干等**：编译期间去做不依赖它的工作（改文档、写用例、查证据），
+   或把它放进后台 job。
+
+> **提交后才发现的问题，就地修一个 `fix` 提交，不要另开分支**——
+> 历史里能清楚看出"哪次改动引入了什么、怎么修的"；另开分支反而把因果拆散了。
