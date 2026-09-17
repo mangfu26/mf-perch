@@ -16,14 +16,12 @@ use crate::error::{AppError, Result};
 pub const END_MARKER_PREFIX: &str = "__MF_PERCH_END__";
 /// 会话就绪标记（包装脚本启动完成后打印）。
 pub const READY_MARKER_PREFIX: &str = "__MF_PERCH_READY__";
-/// sudo askpass 请求标记（Q33）。**必须写 stderr**——见 [`askpass_script`]。
-pub const SUDO_REQUEST_PREFIX: &str = "__MF_SUDO_REQUEST__";
-/// 远端工作目录（存放 FIFO 与 askpass 脚本）。
-pub const REMOTE_DIR: &str = ".mf-perch";
-/// 远端 sudo 密码 FIFO 文件名。
-pub const SUDO_FIFO_NAME: &str = "sudopw.fifo";
-/// 远端 askpass 脚本文件名。
-pub const ASKPASS_NAME: &str = "askpass";
+/// 提权通道的**密码提示标记**（D47 握手）。
+///
+/// 通过 `sudo -S -p '<本标记>'` 传入，sudo 需要密码时会把它打进 stderr
+/// （实测：sudo-rs 形如 `[sudo: <标记>] Password: `，经典 sudo 就是标记本身）；
+/// **凭证缓存有效时不会出现**——应用据此决定"要不要写密码"，且不依赖 sudo 文案。
+pub const SUDO_PROMPT_PREFIX: &str = "__MF_SUDO_PROMPT__";
 
 /// 解析出的会话事件。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,11 +34,15 @@ pub enum SessionEvent {
     /// 远端序号在会话内从 1 开始，应用侧序号是数据库历史累加，
     /// 两者在恢复终端等场景下必然错位，会导致命令永远等不到结束标记。
     CommandFinished { command_id: String, exit_code: i32 },
-    /// 有 sudo 正在索要密码（Q33 `ask` / `auto` 模式据此决定是否注入）。
+    /// 提权通道上 sudo 正在**询问密码**（D47 握手）。
     ///
-    /// `token` 是该次索要的远端 askpass PID，应用用 `(nonce, token)` 定位
-    /// 唯一的应答 FIFO——这是应答能精确投递给本次索要的前提（B2）。
-    SudoRequest { token: String },
+    /// 应用收到它才把密码写进**该通道的 stdin**。数据面**不会有**这个事件：
+    /// 数据面的 sudo 已被 [`sudo_reject_shim`] 明确拒绝（D48）。
+    ///
+    /// ⚠️ **握手判定不要依赖本变体**：密码提示**不带换行**，按行解析通常看不到它。
+    /// 就绪阶段的判定请用 [`take_sudo_prompt`]（直接在字节流上摘标记）；
+    /// 本变体只在提示恰好被换行终止时出现，用于让上层观察/告警。
+    SudoPrompt,
     /// 普通输出行（命令产生的输出）。
     OutputLine(String),
 }
@@ -71,32 +73,22 @@ pub fn new_nonce() -> String {
 /// - `< /dev/null` 断开每条命令的 stdin，防止交互式命令吃掉后续命令帧；
 /// - 序号由脚本自增，无需客户端下发。
 ///
-/// `sudo_enabled` 为真时，在读取循环**之前**注入 sudo 拦截函数
-/// （见 [`sudo_function_def`]）。必须放在循环前，否则第一条命令就用不上拦截。
-/// 为假时完全不注入，使 sudo 因无密码而失败——这正是"禁止注入"的天然实现。
+/// `elevation_allowed` 决定垫片给出的指引：为真时告诉 Agent 改用 `run_as_root`
+/// 工具，为假时说明该主机已禁用提权。两种情况**都拒绝执行**——数据面没有
+/// 任何拿到密码的途径，放行只会让 Agent 收到一句难以理解的 sudo 报错。
 ///
 /// 启动方式（登录 shell / 干净模式）由 [`shell_invocation`] 决定，
 /// 脚本本身不含该差异——保证两种模式下协议行为完全一致。
-pub fn wrapper_script(nonce: &str, init_script: Option<&str>, sudo_enabled: bool) -> String {
+pub fn wrapper_script(nonce: &str, init_script: Option<&str>, elevation_allowed: bool) -> String {
     // 初始化脚本在包装循环之前执行一次，用于 nvm / conda 等显式加载（D4）。
     let init = match init_script {
         Some(s) if !s.trim().is_empty() => format!("# 主机配置的初始化脚本\n{}\n", s.trim()),
         _ => String::new(),
     };
 
-    // sudo 拦截函数：必须在循环之前定义并导出，
-    // 这样循环里 eval 的每条命令（含 bash 子进程）都会命中该函数。
-    let sudo_setup = if sudo_enabled {
-        let askpass = remote_askpass_path(nonce);
-        format!(
-            "# sudo 透明拦截（Q33）：不依赖命令改写，语义级拦截\n{}",
-            sudo_function_def(&askpass)
-        )
-    } else {
-        // 安全默认（fail-closed）：不注入拦截，
-        // sudo 因无 TTY 且无密码而失败，命令不会被提权执行。
-        String::new()
-    };
+    // 数据面 sudo 拦截（D47/D48）：提权已改为**独立的特权通道**，
+    // 数据面不再具备任何提权能力，因此这里装的是"明确拒绝"而非密码注入。
+    let sudo_setup = sudo_reject_shim(elevation_allowed);
 
     format!(
         r#"set +e
@@ -108,6 +100,17 @@ while IFS= read -r -d '' mfperch_frame; do
   mfperch_cmd=${{mfperch_frame#*$'\n'}}
   eval "$mfperch_cmd" < /dev/null
   mfperch_rc=$?
+  # `set -e` 会**跨帧**留在 shell 状态里（它本来就是合法的持久状态）：
+  # Agent 先用一条命令打开它，**下一条**命令只要失败，整个包装脚本就当场退出。
+  # 打印结束标记这一步因此必须显式 `set +e`，否则结束标记永远不来、
+  # 应用侧只能干等到超时。实测形态（WSL Ubuntu，两帧：`set -e` → `/nonexistent`）：
+  #   无 `set +e`：只回第一帧的 END，包装脚本退出码 127，第二帧的 END 永不出现；
+  #   有 `set +e`：两帧 END 都回，退出码 0。
+  # 注意**不能**写成"eval 之后 set -e 就立刻生效"——errexit 在 eval 整串结束后才生效，
+  # 所以同一帧里写 `set -e; <失败命令>` 不会触发（这也是初版回归用例假绿的原因）。
+  # 守住它的是 `wrapper_always_emits_end_marker_even_after_set_e`（单测，查顺序）
+  # 与 `run_as_root_returns_when_command_enables_set_e`（真实环境 e2e，查"是否超时"）。
+  set +e
   printf '\n{end}%s__%s__%s__\n' "$mfperch_nonce" "$mfperch_id" "$mfperch_rc"
 done
 "#,
@@ -119,17 +122,6 @@ done
     )
 }
 
-/// 远端 askpass 脚本的绝对路径。
-///
-/// 用 `$HOME/...` 而非硬编码家目录：不同用户家目录不同，
-/// 且 `$HOME` 在包装脚本的 shell 中一定可用。
-///
-/// **按会话唯一命名**（含 nonce）：askpass 脚本内容包含本会话的 FIFO 路径，
-/// 若多个会话共用同一个文件名，后建立的会话会覆盖先建立会话的脚本，
-/// 导致先建立的会话在 sudo 时读到**别的会话的 FIFO 路径**而失败或串扰。
-pub fn remote_askpass_path(nonce: &str) -> String {
-    format!("$HOME/{REMOTE_DIR}/{ASKPASS_NAME}.{nonce}")
-}
 
 /// 启动包装脚本时使用的 bash 参数。
 pub fn shell_invocation(env_mode: crate::domain::host::ShellEnvMode) -> (&'static str, &'static [&'static str]) {
@@ -140,208 +132,41 @@ pub fn shell_invocation(env_mode: crate::domain::host::ShellEnvMode) -> (&'stati
     }
 }
 
-/// 构造 askpass 脚本（Q33）。
-///
-/// **实现要点（端到端测试实测发现）**：
-///
-/// 1. **标记必须写 stderr**（`>&2`）：`sudo -A` 会把 askpass 程序的
-///    **stdout 第一行当作密码**。若标记误走 stdout，sudo 会把标记当密码，
-///    认证必然失败。
-///
-/// 2. **必须先用 `exec 3<>fifo` 以 O_RDWR 打开，再打印标记**。
-///    这是避免死锁的关键：以 O_RDWR 打开 FIFO **永不阻塞**（POSIX 保证），
-///    因此在打印标记时，FIFO 已存在读者。若改成先打印标记、再由
-///    应用去 `cat > fifo`（O_WRONLY），一旦读者尚未就绪，写端会
-///    **永久阻塞**在 open 上，把命令串行队列彻底卡死。
-///
-/// 3. **每次索要用一条独立 FIFO，名字带本进程 PID**（B2）。
-///    共用一条 FIFO 时，FIFO 上会同时存在多个阻塞读者，而一次写入只会被
-///    **其中任意一个**读者取走（POSIX），于是"用户批准 A"的密码可能被
-///    B 的 askpass 读走——应答无法定向，approve 与拒绝都可能错配。
-///    按 PID 分道后，一条 FIFO 上永远只有一个读者，路由无歧义。
-///
-/// 4. **用后即删**：读走应答后立即 `rm -f`，本 FIFO 只服务这一次索要。
-///    这同时消除了 V1 一类"残留节点"的成因——FIFO 本身不留存任何数据。
-///
-/// 5. shebang 用 `bash` 而非 `sh`：兜底超时依赖 `read -t`，
-///    而 Debian/Ubuntu 的 `/bin/sh`（dash）不支持 `-t`，会直接报错使 sudo
-///    永远失败。远端本来就要求有 bash（见 [`wrapper_script`]）。
-pub fn askpass_script(nonce: &str) -> String {
-    format!(
-        r#"#!/bin/bash
-# 每次索要一条独立 FIFO，名字带本进程 PID（B2）：一条 FIFO 只有一个读者，
-# 应用据此把应答精确投递给本次索要，不会被其它并发索要抢走。
-mfperch_dir="$HOME/{dir}"
-mfperch_fifo="$mfperch_dir/{fifo_prefix}.{nonce}.$$"
-umask 077
-rm -f "$mfperch_fifo" 2>/dev/null
-if ! mkfifo "$mfperch_fifo" 2>/dev/null; then
-  printf 'MFPERCH_SUDO_FIFO_ERROR\n' >&2
-  exit 1
-fi
-# O_RDWR 打开 FIFO：永不阻塞，确保应用侧写入时一定找得到读者
-exec 3<>"$mfperch_fifo"
-# 令牌 = 本进程 PID；应用据它算出该往哪条 FIFO 写。
-# 标记必须走 stderr：sudo 把 stdout 第一行当密码。
-printf '{prefix}{nonce}__%s__\n' "$$" >&2
-# 兜底超时（O4）：应用侧的确认超时是 60 秒，这里留一倍余量。
-# 正常路径永远由应用应答（注入或空密码拒绝）；只有应用侧异常
-# （会话中断、进程崩溃）才会走到超时，读超时得到空密码 → sudo 失败，
-# 命令照常结束，不会把串行队列永久挂死。
-IFS= read -r -t 120 mfperch_pw <&3
-rm -f "$mfperch_fifo" 2>/dev/null
-printf '%s\n' "$mfperch_pw"
-"#,
-        dir = REMOTE_DIR,
-        fifo_prefix = SUDO_FIFO_NAME,
-        prefix = SUDO_REQUEST_PREFIX,
-        nonce = nonce,
-    )
-}
+/// 数据面的 sudo 垫片：**明确拒绝**并给出可操作指引（D47 / D48）。
 
-/// 某次 sudo 索要专属的 FIFO 文件名。
 ///
-/// **按会话 + 索要双重唯一命名**：
+/// ## 为什么数据面上必须拒绝，而不是"让它自然失败"
 ///
-/// - 会话维度（`nonce`）：固定名称下，后续会话的 `rm -f` + `mkfifo` 会替换
-///   文件节点，使已在阻塞的读写方落在**不同 inode** 上，各自永久挂起（§7.4）；
-/// - 索要维度（`token` = 远端 askpass 的 PID）：同一会话内并发索要时，
-///   共用一条 FIFO 会让应答被任意一个读者取走，导致应答错配（B2）。
-pub fn sudo_fifo_name(nonce: &str, token: &str) -> String {
-    format!("{SUDO_FIFO_NAME}.{nonce}.{token}")
-}
-
-/// 校验 sudo 索要令牌是否可信。
+/// 提权已改为应用自建的**特权通道**（`run_as_root`）：数据面不再部署 askpass、
+/// 不建 FIFO、也没有任何环境变量携带密码。若不在数据面拦下 `sudo`，Agent
+/// 得到的会是 sudo 自己的一句难懂报错（`no tty present` / `a password is
+/// required` / `sorry, you must have a tty`），它极可能反复重试或误判为环境问题。
 ///
-/// 令牌由远端 askpass 打印、经协议标记回传，随后会被应用**拼进下发的 shell
-/// 命令**（作为 FIFO 路径的一部分）。因此必须严格限制字符集：只接受
-/// 1–10 位 ASCII 数字。若放过 `;`、`$()`、空格、`/` 等字符，被 Agent 伪造的
-/// 标记就可能变成命令注入（V2 风险的延伸）。非法令牌一律当作普通输出丢弃。
-pub fn is_valid_sudo_token(token: &str) -> bool {
-    !token.is_empty() && token.len() <= 10 && token.bytes().all(|b| b.is_ascii_digit())
-}
-
-/// 构造会话初始化命令：建立工作目录、askpass 脚本，并输出环境快照（D4）。
+/// 拦下之后 Agent 收到的是**可操作**的一句话：改用 `run_as_root` 工具。
+/// 这并没有新增权限限制——数据面本来就已经没有任何提权能力。
 ///
-/// `enable_sudo` 为 `false` 时（`deny` 模式）不创建 askpass——
-/// sudo 因拿不到密码而失败，这正是"禁止注入"的天然实现（fail-closed）。
-///
-/// 注意：**索要用的 FIFO 不在这里创建**，由 askpass 在 sudo 执行时按 PID
-/// 自行创建与删除（B2）。setup 阶段的删除动作全部限定 `-type f`，
-/// 绝不触碰任何会话正在使用的 FIFO。
-///
-/// **路径必须用双引号包裹**：脚本里的 `$HOME` 需要由 shell 展开。
-/// 若用单引号（`'$HOME/...'`），shell 不做展开，会创建名为 `$HOME`
-/// 的字面量目录，askpass 也就不在预期位置，sudo 会报
-/// `Failed to run askpass program ... No such file or directory`
-/// （此为端到端测试实测发现的缺陷）。
-pub fn session_setup_script(nonce: &str, enable_sudo: bool) -> String {
-    let dir = format!("$HOME/{REMOTE_DIR}");
-    let askpass = remote_askpass_path(nonce);
-
-    let sudo_part = if enable_sudo {
-        format!(
-            r#"
-# sudo askpass 与 FIFO（Q33）：密码经 FIFO 在内存中传递，不落盘。
-#
-# 注意执行顺序：**先清理历史遗留，再写入本会话的 askpass**。
-# 曾经在此处先 mkfifo、后执行 `rm -f "$dir"/{prefix}.*`，结果把刚创建的
-# FIFO 一并删除，使后续 `cat > fifo` 退化为"创建普通文件并写入"，
-# sudo 密码以明文落盘（该缺陷已由回归测试覆盖）。
-# 这里只清理**普通文件**（-type f），既清掉上述缺陷的残留，又绝不触碰
-# 任何会话正在使用的 FIFO 节点（FIFO 是 -type p）。
-#
-# 本会话的 FIFO **不再在 setup 阶段创建**：每次索要的 FIFO 由 askpass
-# 自己在 sudo 执行时按 PID 创建、读走应答后立即删除（B2）。
-# 因此这里没有 mkfifo，也就不会再发生"自己删掉自己的 FIFO"。
-#
-# askpass 脚本按会话唯一命名（askpass.<nonce>）。会话异常退出时
-# session_cleanup_script 来不及执行，若不在此处回收，远端会永久累积
-# 一批含各会话 nonce 的可执行脚本（同机用户可枚举）。
-find "{dir}" -maxdepth 1 -type f -name '{askpass_prefix}.*' -delete 2>/dev/null || true
-find "{dir}" -maxdepth 1 -type f -name '{prefix}.*' -delete 2>/dev/null || true
-"#,
-            dir = dir,
-            prefix = SUDO_FIFO_NAME,
-            askpass_prefix = ASKPASS_NAME,
-        )
+/// 用 shell 函数而非 PATH 上的可执行文件：不落任何远端文件、不依赖远端工具、
+/// 随会话消失；`export -f` 之后对 `bash -c` 子进程同样生效（Agent 的命令
+/// 常常在自己的 bash 里跑）。
+pub fn sudo_reject_shim(elevation_allowed: bool) -> String {
+    let reason = if elevation_allowed {
+        "数据面不允许提权；请改用 run_as_root 工具以特权身份执行该命令"
     } else {
-        // deny 模式：不设置 askpass，sudo 将因无密码而失败。
-        String::new()
+        "该主机已禁用提权（sudo 策略为「禁止注入」）；如需提权请由人类在主机设置中开启"
     };
-
-    let askpass_write = if enable_sudo {
-        let script = askpass_script(nonce);
-        // 用带引号的 heredoc 写入 askpass 脚本：内容不做任何展开，
-        // 因此脚本里可以安全地保留 $HOME（由 askpass 自己在运行时展开）。
-        // 写入后立即收紧权限；**不要**在此处做通配删除（见上）。
-        format!(
-            "umask 077; cat > \"{askpass}\" <<'MFPERCH_ASKPASS'\n{script}MFPERCH_ASKPASS\nchmod 700 \"{askpass}\"\n",
-            askpass = askpass,
-            script = script,
-        )
-    } else {
-        String::new()
-    };
-
     format!(
-        r#"mkdir -p "{dir}"
-{sudo_part}{askpass_write}
-# 环境快照，便于排查"命令找不到"类问题（D4）
-printf 'MFPERCH_PATH=%s\n' "$PATH" >&2
-printf 'MFPERCH_PWD=%s\n' "$PWD" >&2
-printf 'MFPERCH_BASH=%s\n' "$BASH_VERSION" >&2
-"#,
-        dir = dir,
-        sudo_part = sudo_part,
-        askpass_write = askpass_write,
+        "sudo() {{\n  printf '%s\\n' '[mf-perch] {reason}' >&2\n  return 1\n}}\nexport -f sudo\n"
     )
 }
 
-/// 构造会话清理命令：删除本会话的 askpass 脚本与索要 FIFO。
+/// 环境快照命令（D4）：只输出三项，供人类排查"命令找不到"类问题。
 ///
-/// 会话结束时调用（归档 / 删除 / 断开），避免在远端留下残留节点。
-/// 只影响**本会话 nonce** 对应的节点，不触碰其它并发会话。
+/// 会话初始化阶段曾额外部署 askpass 脚本与 FIFO（Q33 的旧投递机制）；
+/// 那部分已随 D47/D48 移除，因此这里只剩快照。
 ///
-/// FIFO 按 PID 命名（B2），无法逐个枚举，因此按本会话 nonce 前缀清扫。
-/// 这里不存在 §7.4 那类"误删**别的**会话正在使用的节点"的风险：
-/// 前缀已把范围限定在本会话，而本会话此刻正在关闭。
-pub fn session_cleanup_script(nonce: &str) -> String {
-    let dir = format!("$HOME/{REMOTE_DIR}");
-    let askpass = format!("{ASKPASS_NAME}.{nonce}");
-    format!(
-        r#"rm -f "{dir}/{askpass}" 2>/dev/null || true
-find "{dir}" -maxdepth 1 -type p -name '{prefix}.{nonce}.*' -delete 2>/dev/null || true
-"#,
-        dir = dir,
-        askpass = askpass,
-        prefix = SUDO_FIFO_NAME,
-        nonce = nonce,
-    )
-}
-
-/// 生成 sudo 拦截函数定义（Q33）。
-///
-/// 用 shell 函数而非改写命令：函数是**语义级**拦截，
-/// `sh -c 'sudo x'`、变量拼接等情况不会像文本匹配那样漏判。
-/// `command` 关键字跳过函数查找，避免无限递归。
-///
-/// **必须先用变量把 `$HOME` 展开成绝对路径**：sudo 会直接检查
-/// `SUDO_ASKPASS` 的值是否为绝对路径，且**不做 shell 展开**。
-/// 若直接写 `SUDO_ASKPASS='$HOME/...'`，sudo 会报
-/// `Askpass program '$HOME/...' is not an absolute path` 而失败
-/// （此为端到端测试实测发现）。
-///
-/// 变量名带前缀以免与用户环境冲突；同时导出，
-/// 使 `bash script.sh` 这类子进程中的 sudo 调用也能取到路径。
-pub fn sudo_function_def(askpass_path: &str) -> String {
-    format!(
-        "mfperch_askpass_path=\"{askpass}\"\n\
-         sudo() {{ SUDO_ASKPASS=\"$mfperch_askpass_path\" command sudo -A -p '' \"$@\"; }}\n\
-         export -f sudo\n\
-         export mfperch_askpass_path\n",
-        askpass = askpass_path
-    )
+/// 输出走 stderr，与包装脚本的协议标记一致，便于上层按同一个通道解析。
+pub fn env_snapshot_script() -> &'static str {
+    "printf 'MFPERCH_PATH=%s\\n' \"$PATH\" >&2\nprintf 'MFPERCH_PWD=%s\\n' \"$PWD\" >&2\nprintf 'MFPERCH_BASH=%s\\n' \"$BASH_VERSION\" >&2\n"
 }
 
 /// 从一行输出中解析会话事件。
@@ -356,19 +181,14 @@ pub fn parse_line(line: &str, nonce: &str) -> Option<SessionEvent> {
         return Some(SessionEvent::Ready);
     }
 
-    // sudo 请求标记（来自 askpass 的 stderr）：
-    // `__MF_SUDO_REQUEST__<nonce>__<token>__`（token = 远端 askpass 的 PID）。
-    let sudo_req = format!("{SUDO_REQUEST_PREFIX}{nonce}__");
-    if let Some(rest) = trimmed.strip_prefix(&sudo_req) {
-        let token = rest.trim_end_matches('_');
-        // 令牌会被拼进应用下发的命令，必须严格校验（见 is_valid_sudo_token）。
-        if is_valid_sudo_token(token) {
-            return Some(SessionEvent::SudoRequest {
-                token: token.to_string(),
-            });
-        }
-        // 令牌非法或缺失：不可信，**不产生索要**，落到下面按普通输出处理，
-        // 让人在审计里能看到这行可疑文本。
+    // sudo 的密码提示（D47 握手）。
+    //
+    // 用**包含**判断而非整行匹配：sudo 会把我们传入的 `-p` 文本包进它自己的文案里
+    // （实测 sudo-rs 为 `[sudo: <标记>] Password: `，经典 sudo 就是标记本身）。
+    // nonce 是随机值，误判概率可忽略；且**握手只允许写一次密码**（见
+    // [`SudoAuthHandshake`]），所以即使标记被伪造，代价也不是密码泄露。
+    if trimmed.contains(&sudo_prompt_marker(nonce)) {
+        return Some(SessionEvent::SudoPrompt);
     }
 
     // 结束标记：__MF_PERCH_END__<nonce>__<command_id>__<rc>__
@@ -393,6 +213,186 @@ pub fn parse_line(line: &str, nonce: &str) -> Option<SessionEvent> {
     }
 
     Some(SessionEvent::OutputLine(trimmed.to_string()))
+}
+
+/// 提权通道传给 `sudo -p` 的密码提示标记（D47）。
+pub fn sudo_prompt_marker(nonce: &str) -> String {
+    format!("{SUDO_PROMPT_PREFIX}{nonce}__")
+}
+
+/// 把一段文本安全地包成**一个** shell 词（单引号形式）。
+///
+/// 单引号内无法转义，POSIX 的标准做法是"结束单引号 → 插入 `\'` → 重新开启"：
+/// `a'b` → `'a'\''b'`。包装脚本与提示标记都要经它嵌入命令行。
+///
+/// 对上层公开（D47）：提权编排要把数据面的**工作目录**嵌进特权通道的命令，
+/// 目录名可能含空格、引号等字符，必须走同一套转义——两处各写一份
+/// 迟早会出现"一处修了、另一处没修"的注入缺口。
+pub fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// 构造**提权通道**的启动命令（D47）。
+///
+/// 形如：`sudo -S -p '<提示标记>' bash -c '<包装脚本>'`
+///
+/// - `-S`：密码从 **stdin** 读——本通道的 stdin 正是应用持有的私有管道，
+///   由上层按 [`SudoAuthHandshake`] 的结论写入（看到提示标记才写）；
+/// - `-p <提示标记>`：让 sudo 的提示带上**我们自己的随机标记**，
+///   应用据此判断"要不要写密码"，不依赖 sudo 的文案（实测两种实现文案不同）；
+/// - 包装脚本必须作为**单个参数**传给 `bash -c`，因此做单引号转义
+///   （脚本自身含单引号，不能直接拼接）。
+///
+/// 这样提权通道跑的是**同一套包装循环**（NUL 分帧 + nonce 结束标记），
+/// 因此提权命令的输出与退出码能和普通命令一样被精确归属。
+pub fn privileged_wrapper_command(nonce: &str, script: &str) -> String {
+    format!(
+        "sudo -S -p {} bash -c {}",
+        shell_single_quote(&sudo_prompt_marker(nonce)),
+        shell_single_quote(script)
+    )
+}
+
+/// 从原始字节流中**摘除第一个**密码提示标记，返回是否摘到（D47）。
+///
+/// 为什么不能靠按行切分：**密码提示是不带换行的**（sudo 写完提示就等输入），
+/// 按 `\n` 分行的解析永远看不到它——那会变成"应用等提示、sudo 等密码"的死锁。
+/// 因此握手判定直接在字节流上做，并把标记摘掉，避免同一次提示被重复计数
+/// （重复计数会被误判成"密码被拒"）。
+pub fn take_sudo_prompt(buf: &mut Vec<u8>, nonce: &str) -> bool {
+    let needle = sudo_prompt_marker(nonce);
+    let needle = needle.as_bytes();
+    if needle.is_empty() || buf.len() < needle.len() {
+        return false;
+    }
+    match buf.windows(needle.len()).position(|w| w == needle) {
+        Some(pos) => {
+            buf.drain(pos..pos + needle.len());
+            true
+        }
+        None => false,
+    }
+}
+
+/// 探测数据面当前目录的命令（D47：cwd 自动继承）。
+///
+/// 刻意**不把 `$PWD` 编进结束标记**：路径可能含 `__` 甚至换行，而标记用 `__`
+/// 分隔、又不能用 `base64`（目标机不保证安装），纯 bash 内建做十六进制对多字节
+/// 路径不可靠。改为"发一条探测命令、按结束标记界定整段输出"——
+/// **天然容忍特殊字符**，且完全不改动标记格式。
+pub fn pwd_probe_command() -> &'static str {
+    // 用 printf 的 %s（不加换行），避免把换行算进路径。
+    "printf '%s' \"$PWD\""
+}
+
+/// 提权通道上**核实实际身份**的命令（D47）。
+///
+/// 为什么不能只靠"提权成功"就标注为 root（uid=0）：
+/// sudoers 可以配置成 `user ALL=(someuser) ...`——`sudo -S ... bash` 此时
+/// **成功**，但落到的是非 0 的目标用户。若审计一律写 `uid=0`，命令历史里
+/// 就会出现一句假话（P2：降级/偏差必须显式告知）。
+///
+/// `${EUID}` 是 bash 内建变量，不依赖外部 `id` 命令；用户名用 `$(id -un ...)`
+/// 尽力而为，取不到就不写名字——数字 uid 才是审计的事实依据。
+/// 与命令**同一次提权里连着执行**，因此不需要额外往返。
+pub fn privileged_identity_command() -> &'static str {
+    "printf '__MF_PERCH_UID__%s|%s\\n' \"${EUID:-?}\" \"$(id -un 2>/dev/null)\""
+}
+
+/// 从提权通道的输出里摘出身份行，返回 `(实际 uid, 用户名)`（D47）。
+///
+/// 同时把该行从输出中**移除**：它属于应用的核实动作，不是 Agent 命令的产出，
+/// 不应混进 `run_as_root` 的返回内容里。
+pub fn take_privileged_identity(output: &mut String) -> Option<(u32, Option<String>)> {
+    const MARK: &str = "__MF_PERCH_UID__";
+    let mut found = None;
+    let mut kept = String::with_capacity(output.len());
+
+    for line in output.lines() {
+        if let Some(rest) = line.trim_end().strip_prefix(MARK) {
+            if found.is_none() {
+                let (uid, name) = match rest.split_once('|') {
+                    Some((u, n)) => (u, n),
+                    None => (rest, ""),
+                };
+                // 只接受纯数字：非数字说明输出不是我们发的那条命令产生的，
+                // 宁可当作"身份未知"，也不要把它当成 uid。
+                if let Ok(value) = uid.trim().parse::<u32>() {
+                    let name = name.trim();
+                    found = Some((
+                        value,
+                        if name.is_empty() {
+                            None
+                        } else {
+                            Some(name.to_string())
+                        },
+                    ));
+                }
+            }
+            // 无论是否解析成功，这一行都不回传给 Agent。
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+
+    if found.is_some() {
+        // 命令原本可能不以换行结尾；这里统一按行重建，仅在确实摘掉了身份行时替换。
+        while kept.ends_with('\n') {
+            kept.pop();
+        }
+        *output = kept;
+    }
+    found
+}
+
+/// 握手时"是否要写密码"的结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SudoAuthStep {
+    /// 现在写密码（**每条通道最多一次**）。
+    SendPassword,
+    /// 不写：已经决定过，或已经认证成功。
+    Ignore,
+}
+
+/// 提权通道的密码握手状态机（D47）。
+///
+/// 规则只有一条：**每条通道最多写一次密码**。
+///
+/// 为什么必须一次性：`sudo -S` 从该通道的 stdin 读密码。若允许"见到提示就写"，
+/// 那么在 sudo 已经认证成功之后再出现的提示标记（例如提权后的命令自己打印，
+/// 或伪造）会让应用把密码再写一次——这些字节会滞留在 stdin 里、**被后续命令帧
+/// 当成命令执行并随输出回传给 Agent**，反而造成泄露。
+#[derive(Debug, Default)]
+pub struct SudoAuthHandshake {
+    decided: bool,
+}
+
+impl SudoAuthHandshake {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 观察到 sudo 的密码提示标记。
+    pub fn on_prompt(&mut self) -> SudoAuthStep {
+        if self.decided {
+            return SudoAuthStep::Ignore;
+        }
+        self.decided = true;
+        SudoAuthStep::SendPassword
+    }
+
+    /// 观察到"已经认证通过"（就绪标记、命令开始产出输出、进程结束等）。
+    ///
+    /// 之后任何提示标记都不再触发写密码。
+    pub fn on_authenticated(&mut self) {
+        self.decided = true;
+    }
+
+    /// 是否已有结论（供上层判定"可以停止等待认证结果了"）。
+    pub fn is_decided(&self) -> bool {
+        self.decided
+    }
 }
 
 /// 把一条命令编码为 NUL 结尾的帧（V5）。
@@ -473,66 +473,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_sudo_request_marker() {
-        let nonce = "abc123";
-        let line = format!("{SUDO_REQUEST_PREFIX}{nonce}__4242__");
-        assert_eq!(
-            parse_line(&line, nonce),
-            Some(SessionEvent::SudoRequest {
-                token: "4242".into()
-            })
-        );
-    }
-
-    #[test]
-    fn sudo_marker_without_token_is_not_accepted() {
-        // B2 之前的标记格式（无令牌）不再成立：没有令牌就无法定位应答 FIFO，
-        // 必须当作普通输出丢弃，而不是产生一次无法应答的索要。
-        let nonce = "abc123";
-        let line = format!("{SUDO_REQUEST_PREFIX}{nonce}__");
-        assert_eq!(
-            parse_line(&line, nonce),
-            Some(SessionEvent::OutputLine(line.clone())),
-            "缺令牌的索要标记不得被接受"
-        );
-    }
-
-    #[test]
-    fn sudo_marker_with_non_numeric_token_is_rejected() {
-        // 令牌会被拼进应用下发的命令（FIFO 路径），必须严格限制为数字。
-        // 被 Agent 伪造的标记若能把 `;`、`$()` 带进来就是命令注入（V2 延伸）。
-        let nonce = "abc123";
-        for bad in [
-            "1;rm -rf ~",
-            "$(id)",
-            "1 2",
-            "1/../2",
-            "abc",
-            "",
-            "12345678901", // 超过 10 位
-        ] {
-            let line = format!("{SUDO_REQUEST_PREFIX}{nonce}__{bad}__");
-            assert_eq!(
-                parse_line(&line, nonce),
-                Some(SessionEvent::OutputLine(line.clone())),
-                "非法令牌必须被拒绝：{bad:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn sudo_token_validation_rules() {
-        assert!(is_valid_sudo_token("1"));
-        assert!(is_valid_sudo_token("4242"));
-        assert!(is_valid_sudo_token("1234567890"));
-        assert!(!is_valid_sudo_token(""));
-        assert!(!is_valid_sudo_token("12345678901"));
-        assert!(!is_valid_sudo_token("12a"));
-        assert!(!is_valid_sudo_token("-1"));
-        assert!(!is_valid_sudo_token("1;2"));
-    }
-
-    #[test]
     fn parse_command_finished_marker() {
         let nonce = "deadbeef";
         let line = format!("{END_MARKER_PREFIX}{nonce}__cmd3__0__");
@@ -593,8 +533,208 @@ mod tests {
         );
     }
 
+    /// 守的不变式：sudo 把我们的提示标记包进它自己的文案时，仍能被识别（D47 握手）。
+    ///
+    /// 实测两种实现的形态不同——sudo-rs 为 `[sudo: <标记>] Password: `，
+    /// 经典 sudo 就是标记本身——因此这里对**两种形态**都必须成立。
+    #[test]
+    fn sudo_prompt_marker_is_recognized_in_both_sudo_flavors() {
+        let nonce = "abc123";
+        let marker = sudo_prompt_marker(nonce);
+        let cases = [
+            (format!("[sudo: {marker}] Password: "), "sudo-rs 形态"),
+            (marker.clone(), "经典 sudo 形态"),
+        ];
+        for (line, why) in cases {
+            assert_eq!(
+                parse_line(&line, nonce),
+                Some(SessionEvent::SudoPrompt),
+                "{why} 下应识别出密码提示：{line:?}"
+            );
+        }
+    }
+
+    /// 提示标记不是万能的：nonce 不匹配时不得触发握手，
+    /// 否则任何输出都能诱导应用去写密码。
+    #[test]
+    fn sudo_prompt_with_other_nonce_is_not_a_prompt() {
+        let line = "[sudo: __MF_SUDO_PROMPT__othernonce__] Password: ";
+        assert_eq!(
+            parse_line(line, "realnonce"),
+            Some(SessionEvent::OutputLine(line.to_string())),
+            "nonce 不匹配的提示文本应按普通输出处理"
+        );
+    }
+
+    /// 守的不变式：**每条提权通道最多写一次密码**（D47）。
+    ///
+    /// 若允许重复写：sudo 认证成功之后再出现的提示标记（伪造，或提权后的命令自己打印）
+    /// 会让密码又一次进入该通道的 stdin，被当成命令帧执行并随输出回传给 Agent——
+    /// 本想防泄露，反而造成泄露。
+    #[test]
+    fn handshake_sends_password_at_most_once_per_channel() {
+        let mut hs = SudoAuthHandshake::new();
+        assert_eq!(hs.on_prompt(), SudoAuthStep::SendPassword, "首次提示应写密码");
+        assert!(hs.is_decided());
+        assert_eq!(
+            hs.on_prompt(),
+            SudoAuthStep::Ignore,
+            "再次提示不得重复写密码"
+        );
+    }
+
+    /// 认证成功之后，任何提示都不得再触发写密码。
+    #[test]
+    fn handshake_ignores_prompts_after_authentication() {
+        let mut hs = SudoAuthHandshake::new();
+        hs.on_authenticated();
+        assert_eq!(
+            hs.on_prompt(),
+            SudoAuthStep::Ignore,
+            "已认证成功后不得再写密码"
+        );
+    }
+
+    /// 守的不变式：转义后的文本必须仍是**一个** shell 词，且内容原样可还原。
+    ///
+    /// 这是提权通道能启动的前提——包装脚本自身含单引号（`mfperch_nonce='…'`），
+    /// 若转义写错，脚本会被 shell 拆成多个词，远端直接报语法错误。
+    #[test]
+    fn shell_single_quote_keeps_text_as_one_word() {
+        let cases = [
+            ("abc", "'abc'"),
+            ("", "''"),
+            ("a'b", r"'a'\''b'"),
+            ("a'b'c", r"'a'\''b'\''c'"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                shell_single_quote(input),
+                expected,
+                "输入 {input:?} 的单引号转义不符"
+            );
+        }
+    }
+
+    /// 提权通道的启动命令：必须用 `-S`、带上本会话的提示标记，且包装脚本是一个参数。
+    #[test]
+    fn privileged_command_uses_stdin_and_prompt_marker() {
+        let nonce = "n1";
+        let cmd = privileged_wrapper_command(nonce, "echo hi");
+        assert!(
+            cmd.starts_with("sudo -S -p '"),
+            "必须用 `-S` 且设置提示标记：{cmd}"
+        );
+        assert!(
+            cmd.contains(&sudo_prompt_marker(nonce)),
+            "应包含本会话的提示标记：{cmd}"
+        );
+        assert!(
+            cmd.ends_with(r"bash -c 'echo hi'"),
+            "包装脚本应作为单个参数传给 bash -c：{cmd}"
+        );
+    }
+
+    /// 守的不变式：提示标记必须能从**不带换行**的字节流里摘出来（D47）。
+    ///
+    /// 若只能按行识别，就会出现"应用等提示、sudo 等密码"的死锁——
+    /// 这正是 R2 首次实现时踩到的缺陷（潜伏到 e2e 才暴露）。
+    #[test]
+    fn take_sudo_prompt_finds_marker_without_newline_and_removes_it() {
+        let nonce = "n9";
+        let marker = sudo_prompt_marker(nonce);
+
+        // sudo-rs 形态：标记被包在它自己的文案里，且**没有换行**
+        let mut buf = format!("[sudo: {marker}] Password: ").into_bytes();
+        assert!(take_sudo_prompt(&mut buf, nonce), "无换行也应能摘到标记");
+        assert!(
+            !String::from_utf8_lossy(&buf).contains(&marker),
+            "摘除后不应残留标记：{:?}",
+            String::from_utf8_lossy(&buf)
+        );
+
+        // 没有标记时不得误判
+        let mut none = b"\xe4\xb8\xad\xe6\x96\x87 output\n".to_vec();
+        assert!(!take_sudo_prompt(&mut none, nonce), "无标记时不应摘到");
+
+        // 两次提示要能数出两次（用于识别"密码被拒"），且摘完不再重复计数
+        let mut twice = format!("{marker}{marker}").into_bytes();
+        assert!(take_sudo_prompt(&mut twice, nonce), "第一次应摘到");
+        assert!(take_sudo_prompt(&mut twice, nonce), "第二次应摘到");
+        assert!(!take_sudo_prompt(&mut twice, nonce), "摘完不应再摘到");
+    }
+
+    /// 守的不变式：**身份核实行必须从 Agent 看到的输出里摘掉**，
+    /// 且只有本应用真的打印了那一行时才改写输出（D47）。
+    ///
+    /// 若摘不掉：`run_as_root` 的返回里会多出一条与应用无关的协议文本；
+    /// 若误摘：Agent 命令自己打印的相似文本会被吞掉。
+    #[test]
+    fn privileged_identity_is_extracted_and_stripped() {
+        // 正常形态：身份行夹在命令输出中间。
+        let mut out = "before\n__MF_PERCH_UID__0|root\nafter".to_string();
+        assert_eq!(
+            take_privileged_identity(&mut out),
+            Some((0, Some("root".to_string()))),
+            "应解析出实际 uid 与用户名"
+        );
+        assert_eq!(out, "before\nafter", "身份行必须被摘掉");
+
+        // 非 root：sudoers 把目标用户配成别人时，uid 必须如实报告（不能假装 0）。
+        let mut other = "__MF_PERCH_UID__1002|ops\ncmd".to_string();
+        assert_eq!(
+            take_privileged_identity(&mut other),
+            Some((1002, Some("ops".to_string())))
+        );
+        assert_eq!(other, "cmd");
+
+        // 用户名取不到（无 id 命令）：只报 uid，不算失败。
+        let mut noname = "__MF_PERCH_UID__0|\ncmd".to_string();
+        assert_eq!(take_privileged_identity(&mut noname), Some((0, None)));
+
+        // 非数字 uid：**不接受**，宁可"身份未知"也不要把别的东西当 uid。
+        let mut garbage = "__MF_PERCH_UID__notanumber|x\ncmd".to_string();
+        assert_eq!(take_privileged_identity(&mut garbage), None);
+
+        // 完全没有该行：输出原样返回，不得改动（否则会吞掉 Agent 的输出）。
+        let mut plain = "line1\nline2".to_string();
+        assert_eq!(take_privileged_identity(&mut plain), None);
+        assert_eq!(plain, "line1\nline2");
+    }
+
+    /// 守的不变式：**结束标记必须无条件打出来**（`set +e` 要在它之前）。
+    ///
+    /// 背景（R3 实测踩到）：Agent 的命令如果真的失败到让 shell 改变状态——
+    /// 例如命令名不存在触发 `set -e`——那么"打印结束标记"这一步会被跳过，
+    /// 于是应用侧永远等不到结束标记，命令**卡到超时**（表现为"提权命令
+    /// 30 秒未结束"，而远端其实早已返回 127）。
+    ///
+    /// 这条断言刻意检查**顺序**而不只是"脚本里出现过 set +e"：
+    /// 语句存在但位置不对（在 `eval` 之前、或在 `while` 之外）同样防不住。
+    #[test]
+    fn wrapper_always_emits_end_marker_even_after_set_e() {
+        let script = wrapper_script("nonce_x", None, false);
+
+        let eval_at = script
+            .find("eval \"$mfperch_cmd\"")
+            .expect("包装脚本应 eval 命令正文");
+        let reset_at = script[eval_at..]
+            .find("set +e")
+            .map(|i| i + eval_at)
+            .expect("打印结束标记之前必须显式关掉 set -e");
+        let marker_at = script
+            .find(&format!("printf '\\n{END_MARKER_PREFIX}"))
+            .expect("包装脚本应打印结束标记");
+
+        assert!(
+            reset_at > eval_at && reset_at < marker_at,
+            "`set +e` 必须夹在 eval 与结束标记之间（eval@{eval_at} reset@{reset_at} marker@{marker_at}）"
+        );
+    }
+
     #[test]
     fn crlf_is_normalized() {
+        // 注意：`nonce` 与 `line` 都在此处定义——它是本用例的输入。
         let nonce = "n2";
         let line = format!("{END_MARKER_PREFIX}{nonce}__cmd1__0__\r\n");
         assert_eq!(
@@ -641,372 +781,60 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_script_injects_sudo_interception_when_enabled() {
-        // Q33 核心：启用时必须在脚本里定义并导出 sudo 函数，
-        // 否则 ask/auto 模式的密码注入无从触发。
-        let script = wrapper_script("n", None, true);
-
-        assert!(script.contains("sudo()"), "应定义 sudo 函数");
-        assert!(script.contains("command sudo -A"), "应转发到 sudo -A");
-        assert!(script.contains("export -f sudo"), "应导出给子 bash 进程");
-        assert!(script.contains("SUDO_ASKPASS"), "应设置 askpass 路径");
-        assert!(script.contains(ASKPASS_NAME), "应指向 askpass 脚本");
-    }
-
-    #[test]
-    fn wrapper_script_omits_sudo_interception_when_disabled() {
-        // deny 模式必须**完全不注入**，让 sudo 自然失败（fail-closed）。
-        let script = wrapper_script("n", None, false);
-        assert!(!script.contains("sudo()"), "deny 模式下不应定义 sudo 函数");
-        assert!(!script.contains("SUDO_ASKPASS"), "deny 模式下不应设置 askpass");
-    }
-
-    #[test]
-    fn sudo_function_is_defined_before_read_loop() {
-        // 顺序很关键：拦截函数必须先于读取循环，否则第一条命令就用不上。
-        let script = wrapper_script("n", None, true);
-        let sudo_pos = script.find("export -f sudo").expect("应包含 sudo 定义");
-        let loop_pos = script.find("while IFS= read").expect("应包含读取循环");
-        assert!(
-            sudo_pos < loop_pos,
-            "sudo 拦截必须在读取循环之前定义，否则首条命令不生效"
-        );
-    }
-
-    #[test]
-    fn askpass_path_uses_home_variable() {
-        // 不能用硬编码家目录：不同用户名家目录不同。
-        let p = remote_askpass_path("n1");
-        assert!(p.starts_with("$HOME/"), "应基于 $HOME：{p}");
-        assert!(p.contains(ASKPASS_NAME), "应指向 askpass 脚本：{p}");
-    }
-
-    #[test]
-    fn askpass_path_is_session_unique() {
-        // 共用同一文件名会让并发会话互相覆盖 askpass 脚本，
-        // 先建立的会话会读到别的会话的 FIFO 路径而失败。
-        let a = remote_askpass_path("nonce_a");
-        let b = remote_askpass_path("nonce_b");
-        assert_ne!(a, b, "不同会话的 askpass 路径必须不同");
-        assert!(a.ends_with("nonce_a"));
-    }
-
-    #[test]
-    fn askpass_script_writes_marker_to_stderr() {
-        // 实测发现的缺陷修正：标记必须走 stderr，否则 sudo 会把标记当密码。
-        let script = askpass_script("nonce1");
-        assert!(
-            script.contains(">&2"),
-            "请求标记必须写 stderr，否则 sudo 会把标记当密码"
-        );
-        assert!(script.contains(SUDO_REQUEST_PREFIX));
-        assert!(
-            script.contains(&format!("{SUDO_FIFO_NAME}.nonce1.$$")),
-            "FIFO 路径应含会话 nonce 与本次索要 PID：{script}"
-        );
-        // 令牌（PID）必须随标记回传，应用才能定位应答 FIFO。
-        assert!(
-            script.contains("'$$'") || script.contains("\"$$\""),
-            "标记必须携带令牌：{script}"
-        );
-        // 密码走 stdout。
-        assert!(script.contains("printf '%s\\n' \"$mfperch_pw\""));
-    }
-
-    #[test]
-    fn askpass_opens_fifo_readwrite_before_marking() {
-        // 关键防死锁设计：先以 O_RDWR 打开 FIFO（永不阻塞），再打印标记。
-        // 这样应用侧 `cat > fifo` 一定能找到读者，不会永久阻塞把队列拖死。
-        let script = askpass_script("n1");
-        let open_pos = script.find("exec 3<>").expect("应以 O_RDWR 打开 FIFO");
-        let marker_pos = script.find(SUDO_REQUEST_PREFIX).expect("应打印标记");
-        assert!(
-            open_pos < marker_pos,
-            "必须先打开 FIFO 再打印标记，否则写端可能先启动而永久阻塞"
-        );
-        // 密码从已打开的 fd 读取，而不是再次打开路径。
-        assert!(
-            script.contains("read -r -t 120 mfperch_pw <&3"),
-            "应从已打开的 fd 3 读取，并带兜底超时：{script}"
-        );
-    }
-
-    #[test]
-    fn askpass_creates_and_removes_its_own_fifo() {
-        // B2 核心：每次索要一条独立 FIFO，由 askpass 自己创建、用后即删。
-        let script = askpass_script("n1");
-        let mkfifo_pos = script.find("mkfifo").expect("askpass 应自行创建 FIFO");
-        let open_pos = script.find("exec 3<>").expect("应以 O_RDWR 打开");
-        let marker_pos = script.find(SUDO_REQUEST_PREFIX).expect("应打印标记");
-        assert!(
-            mkfifo_pos < open_pos && open_pos < marker_pos,
-            "顺序必须是 mkfifo → 打开 → 打印标记：\n{script}"
-        );
-        // 用后即删：不留残留节点。
-        let read_pos = script.find("read -r -t 120").expect("应读取密码");
-        let rm_after_read = script[read_pos..]
-            .find("rm -f \"$mfperch_fifo\"")
-            .is_some();
-        assert!(rm_after_read, "读走应答后必须删除自己的 FIFO：\n{script}");
-    }
-
-    #[test]
-    fn askpass_uses_bash_for_read_timeout() {
-        // 兜底超时依赖 `read -t`，而 Debian/Ubuntu 的 /bin/sh（dash）不支持，
-        // 会直接报错使 sudo 永远失败。因此 shebang 必须是 bash。
-        let script = askpass_script("n1");
-        assert!(
-            script.starts_with("#!/bin/bash"),
-            "askpass 必须用 bash 解释（read -t）：{script}"
-        );
-    }
-
-    #[test]
-    fn sudo_fifo_name_is_session_and_request_unique() {
-        // 会话维度：固定名称会让后续会话替换同名 FIFO 的 inode，
-        // 使已在阻塞的读写方落到不同 inode 上各自挂起。
-        let a = sudo_fifo_name("nonce_a", "111");
-        let b = sudo_fifo_name("nonce_b", "111");
-        assert_ne!(a, b, "不同会话的 FIFO 名必须不同");
-        assert!(a.starts_with(SUDO_FIFO_NAME));
-        assert!(a.contains("nonce_a"));
-
-        // 索要维度（B2）：同一会话内两次索要必须落在不同 FIFO 上，
-        // 否则应答会被"任意一个"读者取走，导致密码/拒绝错配。
-        let c = sudo_fifo_name("nonce_a", "222");
-        assert_ne!(a, c, "同一会话内不同索要的 FIFO 名必须不同");
-        assert!(a.ends_with(".111"));
-        assert!(c.ends_with(".222"));
-    }
-
-    #[test]
-    fn session_setup_writes_askpass_only_when_sudo_enabled() {
-        let enabled = session_setup_script("n", true);
-        assert!(enabled.contains("chmod 700"));
-        assert!(enabled.contains(ASKPASS_NAME), "应写入 askpass 脚本");
-        // FIFO 改为运行时由 askpass 创建，setup 自身不再建 FIFO：
-        // 这样也就不存在"setup 删掉自己刚建的 FIFO"的形态。
-        // 注意：askpass 脚本体（heredoc 内容）里当然有 mkfifo，
-        // 这里只看 heredoc 之前的 setup 正文。
-        assert!(
-            !setup_preamble(&enabled).contains("mkfifo"),
-            "setup 正文不应创建 FIFO（改由 askpass 按需创建）：\n{enabled}"
-        );
-
-        let disabled = session_setup_script("n", false);
-        assert!(
-            !disabled.contains("mkfifo"),
-            "deny 模式下不应创建 FIFO（fail-closed）"
-        );
-        assert!(
-            !disabled.contains(ASKPASS_NAME),
-            "deny 模式下不应写入 askpass 脚本"
-        );
-    }
-
-    /// setup 脚本中 askpass 写入（heredoc）之前的**执行语句**正文。
-    ///
-    /// 注释里也会出现 `mkfifo`、`cat > fifo` 等字样（V1 的说明），
-    /// 因此这里既按 heredoc 起点截断，也剔除注释行。
-    fn setup_preamble(script: &str) -> String {
-        let end = script
-            .find("<<'MFPERCH_ASKPASS'")
-            .unwrap_or(script.len());
-        code_lines(&script[..end])
-    }
-
-    #[test]
-    fn session_setup_deletes_leave_no_window_for_plaintext() {
-        // 严重缺陷回归（V1）：曾经 askpass 写入串末尾带通配删除，
-        // 把刚创建的 FIFO 删掉，随后 `cat > fifo` 退化为"创建普通文件并写入"，
-        // sudo 密码以明文落盘。
-        //
-        // 现设计下 setup 完全不创建 FIFO（由 askpass 运行时创建），
-        // 因此该形态在结构上不可能出现。需要守住两条不变式：
-        // ① 所有删除都限定普通文件，绝不触碰 FIFO（-type f）；
-        // ② 删除动作全部排在本会话 askpass 写入之前，不会自删。
-        let s = session_setup_script("deadbeef", true);
-        let preamble = setup_preamble(&s);
-
-        assert!(
-            !preamble.contains("mkfifo"),
-            "setup 正文不应创建 FIFO：\n{s}"
-        );
-
-        // 顺序断言针对完整脚本（含 heredoc，其结束标记在断言里用作定位点）。
-        let full = code_lines(&s);
-        let write_pos = full
-            .find("<<'MFPERCH_ASKPASS'")
-            .expect("应写入本会话 askpass");
-        let mut search_from = 0;
-        let mut deletes = 0;
-        while let Some(rel) = full[search_from..].find("-delete") {
-            let pos = search_from + rel;
-            let before = &full[..pos];
-            let stmt_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-            let stmt = &full[stmt_start..pos];
-            assert!(
-                stmt.contains("-type f"),
-                "删除必须限定 -type f，避免误删 FIFO：{stmt}"
-            );
-            assert!(pos < write_pos, "删除必须早于本会话 askpass 写入：\n{s}");
-            deletes += 1;
-            search_from = pos + 1;
+    fn wrapper_script_always_installs_reject_shim() {
+        // D47/D48 核心：数据面**不许提权**——不论主机策略如何，都必须装上垫片，
+        // 让 `sudo` 明确失败并告诉 Agent 改用 run_as_root。
+        for allowed in [true, false] {
+            let script = wrapper_script("n", None, allowed);
+            assert!(script.contains("sudo()"), "应定义 sudo 垫片：{allowed}");
+            assert!(script.contains("export -f sudo"), "应导出给子 bash 进程");
         }
-        assert!(deletes >= 2, "应有 askpass 与 FIFO 残留两类回收：\n{s}");
+        // 旧机制的任何痕迹都不得残留（它们会重新引入密码投递面）。
+        let script = wrapper_script("n", None, true);
+        for forbidden in ["SUDO_ASKPASS", "askpass", "sudo -A", "mkfifo", ".mf-perch"] {
+            assert!(
+                !script.contains(forbidden),
+                "数据面不得再出现旧投递机制的痕迹 {forbidden:?}：\n{script}"
+            );
+        }
+    }
 
-        // 不得出现"删除所有 fifo.* 文件"的通配 rm（明文落盘缺陷的成因）。
-        let bad_glob = format!("rm -f \"$HOME/{REMOTE_DIR}\"/{SUDO_FIFO_NAME}.*");
+    /// 守的不变式：垫片必须**真的拒绝**（非 0 返回），并给出可操作指引。
+    ///
+    /// 只断言"含有某句话"是不够的：Agent 需要的是"这条命令不会被执行"。
+    /// 因此这里同时检查返回码与两种策略下的文案差异。
+    #[test]
+    fn reject_shim_refuses_and_guides_to_the_tool() {
+        let allowed = sudo_reject_shim(true);
+        assert!(allowed.contains("return 1"), "垫片必须以非 0 返回：{allowed}");
         assert!(
-            !s.contains(&bad_glob),
-            "不得用通配 rm 删除会话 FIFO：\n{s}"
+            allowed.contains("run_as_root"),
+            "策略允许提权时应指引改用 run_as_root：{allowed}"
         );
+        assert!(allowed.contains(">&2"), "拒绝说明应走 stderr，不污染命令输出");
+
+        let denied = sudo_reject_shim(false);
+        assert!(denied.contains("return 1"), "垫片必须以非 0 返回：{denied}");
+        assert!(
+            denied.contains("已禁用提权"),
+            "策略禁止提权时应说明原因：{denied}"
+        );
+        // 禁止时不得给出"改用 run_as_root"的指引——那条路同样会被拒绝，
+        // 指引它只会让 Agent 白试一次。
+        assert!(
+            !denied.contains("run_as_root"),
+            "禁用提权时不应引导去用一个也会失败的入口：{denied}"
+        );
+        assert_ne!(allowed, denied, "两种策略的文案必须不同");
     }
 
     #[test]
-    fn session_setup_reclaims_stale_askpass_scripts() {
-        // 缺陷回归（B1）：askpass 脚本按会话唯一命名（askpass.<nonce>），
-        // 但遗留清理原先只回收 sudopw.fifo.*。会话异常退出时
-        // session_cleanup_script 不执行，于是远端永久累积一批含各会话
-        // nonce 与 FIFO 路径的可执行脚本，同机用户可枚举。
-        let s = session_setup_script("deadbeef", true);
-        let code = code_lines(&s);
-
-        assert!(
-            code.contains(&format!("-name '{ASKPASS_NAME}.*' -delete")),
-            "setup 必须回收历史遗留的 askpass 脚本：\n{s}"
-        );
-        // 与 FIFO 清理同样受 -type f 保护：不得删到任何会话正在使用的节点。
-        let ix = code
-            .find(&format!("-name '{ASKPASS_NAME}.*' -delete"))
-            .expect("应有 askpass 遗留清理");
-        let prefix = &code[..ix];
-        assert!(
-            prefix.contains("-type f"),
-            "askpass 清理必须限定普通文件（-type f）：\n{prefix}"
-        );
-        // 顺序不变式：askpass 遗留清理排在本会话 askpass 写入之前，
-        // 因此不会自删（setup 已不再创建 FIFO，故无需与 mkfifo 比时序）。
-        let write_pos = code
-            .find("MFPERCH_ASKPASS")
-            .expect("应写入本会话 askpass");
-        assert!(
-            ix < write_pos,
-            "askpass 遗留清理必须在写入本会话脚本之前，否则会删掉自己：\n{s}"
-        );
-    }
-
-    /// 去掉以 `#` 开头的注释行，便于对脚本的**实际执行语句**做顺序断言。
-    fn code_lines(script: &str) -> String {
-        script
-            .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    #[test]
-    fn cleanup_script_removes_only_this_session_files() {
-        let s = session_cleanup_script("nonce_x");
-        assert!(s.contains(&format!("{ASKPASS_NAME}.nonce_x")), "{s}");
-        // FIFO 按 PID 命名，只能按"本会话 nonce"前缀清扫。
-        assert!(
-            s.contains(&format!("-name '{SUDO_FIFO_NAME}.nonce_x.*'")),
-            "FIFO 清扫必须限定在本会话 nonce 前缀内：{s}"
-        );
-        // 关键：不得用**不含 nonce 的通配**去删 FIFO。
-        // 那是 §7.4 的教训——会删掉别的会话正在使用的节点，使其永久挂起。
-        assert!(
-            !s.contains(&format!("\"{SUDO_FIFO_NAME}.*\"")),
-            "不得用不带 nonce 的通配删除 FIFO：{s}"
-        );
-        // FIFO 是管道，清扫必须限定 -type p，避免误删同名普通文件。
-        let ix = s.find("-delete").expect("应有 FIFO 清扫");
-        assert!(s[..ix].contains("-type p"), "FIFO 清扫应限定 -type p：{s}");
-    }
-
-    #[test]
-    fn session_setup_paths_are_double_quoted_so_home_expands() {
-        // 端到端实测发现的缺陷：单引号会阻止 $HOME 展开，
-        // 导致创建出名为 "$HOME" 的字面量目录，
-        // 之后 sudo 报 "Failed to run askpass program ... No such file or directory"。
-        let s = session_setup_script("n", true);
-
-        assert!(
-            s.contains("mkdir -p \"$HOME/"),
-            "目录路径必须用双引号让 $HOME 展开：{s}"
-        );
-        assert!(
-            !s.contains("mkdir -p '$HOME"),
-            "不得用单引号包裹含 $HOME 的路径"
-        );
-        // askpass 的写入与授权同样需要展开。
-        assert!(s.contains("cat > \"$HOME/"));
-        assert!(s.contains("chmod 700 \"$HOME/"));
-    }
-
-    #[test]
-    fn askpass_script_keeps_home_for_runtime_expansion() {
-        // heredoc 用带引号的标记，因此脚本内容不被展开，
-        // $HOME 会保留到 askpass 运行时由 /bin/sh 展开——这是有意为之。
-        let s = session_setup_script("n", true);
-        assert!(
-            s.contains("<<'MFPERCH_ASKPASS'"),
-            "heredoc 标记需带引号以避免写入时展开：{s}"
-        );
-    }
-
-    #[test]
-    fn session_setup_emits_env_snapshot() {
-        let s = session_setup_script("n", false);
+    fn env_snapshot_script_emits_the_three_variables() {
+        // D4：这三项是人类排查"命令找不到"类问题的依据。
+        let s = env_snapshot_script();
         assert!(s.contains("MFPERCH_PATH="));
         assert!(s.contains("MFPERCH_PWD="));
         assert!(s.contains("MFPERCH_BASH="));
-    }
-
-    #[test]
-    fn sudo_function_uses_command_and_askpass() {
-        let d = sudo_function_def("/home/u/.mf-perch/askpass");
-        // command 避免无限递归。
-        assert!(d.contains("command sudo"));
-        assert!(d.contains("-A"));
-        assert!(d.contains("SUDO_ASKPASS"));
-        // 空提示语，避免污染输出解析。
-        assert!(d.contains("-p ''"));
-        // 函数需导出给子 bash 进程。
-        assert!(d.contains("export -f sudo"));
-    }
-
-    #[test]
-    fn sudo_function_resolves_home_to_absolute_path() {
-        // 端到端实测发现的缺陷：sudo 不展开 shell 变量，
-        // 因此 SUDO_ASKPASS 必须是通过变量赋值得来的绝对路径，
-        // 不能把 '$HOME/...' 字面量直接塞给它，否则报
-        // "Askpass program '$HOME/...' is not an absolute path"。
-        let d = sudo_function_def(&remote_askpass_path("nonce1"));
-
-        // 赋值语句里出现 $HOME —— 这行由 bash 执行，会展开成绝对路径。
-        assert!(
-            d.contains("mfperch_askpass_path=\"$HOME/"),
-            "应在赋值时展开 $HOME：{d}"
-        );
-
-        // 而传给 sudo 的必须是变量引用，不能是含 $HOME 的字面量。
-        let askpass_line = d
-            .lines()
-            .find(|l| l.contains("SUDO_ASKPASS"))
-            .expect("应有 SUDO_ASKPASS 设置");
-        assert!(
-            askpass_line.contains("\"$mfperch_askpass_path\""),
-            "SUDO_ASKPASS 应引用已展开的变量：{askpass_line}"
-        );
-        assert!(
-            !askpass_line.contains("$HOME/"),
-            "不得把 $HOME 字面量直接交给 sudo：{askpass_line}"
-        );
-
-        // 变量需导出，供子 bash 进程（如 bash script.sh）使用。
-        assert!(d.contains("export mfperch_askpass_path"));
     }
 
     #[test]

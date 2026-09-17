@@ -44,6 +44,13 @@ pub enum AppError {
     #[error("远端未安装 bash，无法建立终端。请在该主机安装 bash 后重试")]
     BashNotAvailable,
 
+    /// 提权失败（D47）：sudo 未接受应用投递的密码，或该主机不允许非交互 sudo。
+    ///
+    /// 与 [`AppError::SshAuth`] 刻意区分：SSH 登录本身是成功的，
+    /// 失败发生在**提权**这一步——Agent 需要据此区分"认证信息错"与"提权配置/密码错"。
+    #[error("提权失败：{0}")]
+    SudoElevationFailed(String),
+
     #[error("凭据无法解密：{0}。请检查密钥提供方式是否可用")]
     CredentialUndecryptable(String),
 
@@ -85,6 +92,7 @@ impl AppError {
             AppError::TerminalQuotaExceeded { .. } => "terminal_quota_exceeded",
             AppError::CommandQueueFull { .. } => "command_queue_full",
             AppError::BashNotAvailable => "bash_not_available",
+            AppError::SudoElevationFailed(_) => "sudo_elevation_failed",
             AppError::SshAuth(_) => "ssh_auth_failed",
             AppError::SshConnect(_) => "ssh_connect_failed",
             AppError::HostKeyMismatch(_) => "host_key_mismatch",

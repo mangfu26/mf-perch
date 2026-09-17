@@ -171,6 +171,23 @@ pub struct CommandStatusParams {
     pub tail_lines: Option<usize>,
 }
 
+/// 提权执行的入参（D47 的第 8 个工具）。
+///
+/// 只有**单条命令**形式，没有"进入 / 退出 root 模式"：提权通道按需建立、
+/// 一条命令用完即收，因此不存在"忘了退出"而把后续命令都留在特权身份下的风险。
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunAsRootParams {
+    /// Terminal ID to run the command on.
+    pub terminal_id: String,
+    /// The shell command to execute with elevated privileges.
+    pub command: String,
+    /// Optional absolute working directory. Omit to inherit the terminal's
+    /// current working directory (the same directory the plain commands run in).
+    #[serde(default)]
+    #[schemars(with = "Nullable<String>")]
+    pub cwd: Option<String>,
+}
+
 // ============================ 工具返回 ============================
 
 #[derive(Debug, Serialize)]
@@ -374,6 +391,37 @@ impl McpService {
         }
     }
 
+    /// Run one command with elevated privileges (as root).
+    ///
+    /// A separate, short-lived privileged channel is used; the password is
+    /// delivered only on that channel and is never exposed to the agent.
+    /// The command inherits the terminal's current working directory unless
+    /// `cwd` is given. Per-host policy applies: if the human disabled
+    /// elevation the call fails with `sudo_elevation_failed`.
+    #[tool(
+        name = "run_as_root",
+        description = "Run ONE command with elevated privileges (as root) on a terminal. \
+                       Use only when the task truly needs root; prefer run_command otherwise. \
+                       The command runs on a separate, short-lived privileged channel: the \
+                       elevation password is handled by the app and is never sent to the agent. \
+                       The working directory is the same as for run_command unless `cwd` is \
+                       given explicitly. Elevation depends on the host's sudo policy set by the \
+                       human user; if it is disabled the call fails with code \
+                       'sudo_elevation_failed'. There is no interactive root session: each call \
+                       elevates, runs one command and closes. Result includes the effective uid \
+                       that actually ran the command.",
+        annotations(title = "Run as root", read_only_hint = false)
+    )]
+    async fn run_as_root(
+        &self,
+        Parameters(p): Parameters<RunAsRootParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.run_as_root_impl(p).await {
+            Ok(v) => json_result(&v),
+            Err(e) => Ok(error_result(&e)),
+        }
+    }
+
     /// Get the current status of a command started earlier.
     ///
     /// Returns status (queued/running/completed/failed), exit code, duration
@@ -532,6 +580,49 @@ impl McpService {
         // 明确告知 Agent：这条命令跑在**全新**的 shell 上，状态已重置。
         outcome.session_reconnected = reconnected.is_some();
         Ok(outcome)
+    }
+
+    /// 提权执行一条命令（D47 第 8 个工具）。
+    ///
+    /// 与 `run_command_impl` 的三处刻意差异：
+    ///
+    /// 1. **不返回可轮询的句柄**：提权命令没有异步模式，调用即等待到底；
+    /// 2. **`cwd` 语义**：不给就继承数据面当前目录，给了就以 `cwd` 为准；
+    /// 3. **归档终端同样拒绝**：与普通命令保持同一条边界（D20）。
+    async fn run_as_root_impl(
+        &self,
+        p: RunAsRootParams,
+    ) -> Result<crate::terminal::PrivilegedOutcome, AppError> {
+        {
+            let conn = self.state.db.lock().await;
+            let t = terminals::get(&conn, &p.terminal_id)?;
+            if t.status == TerminalStatus::Archived {
+                return Err(AppError::TerminalArchived(p.terminal_id.clone()));
+            }
+        }
+
+        // 会话已断开时按需重建（D39），与普通命令一致——否则 Agent 会先
+        // 收到一个"终端已断开"的错误，而它本可以自动恢复。
+        self.state
+            .ensure_terminal_session(&p.terminal_id)
+            .await?;
+
+        // 只克隆主密钥后立即释放锁：建立提权通道期间不占主密钥锁。
+        let key = {
+            let mk = self.state.master_key.lock().await;
+            *mk.get()?
+        };
+
+        self.state
+            .terminals
+            .run_as_root(
+                &self.state.db,
+                &key,
+                &p.terminal_id,
+                &p.command,
+                p.cwd.as_deref(),
+            )
+            .await
     }
 
     async fn get_command_status_impl(
@@ -926,5 +1017,69 @@ mod tests {
             );
         }
         assert!(hits.is_empty(), "schema 中不应出现 $defs / $ref：{hits:#?}");
+    }
+
+    /// 工具面必须**恰好**是这 8 个（D47 新增 `run_as_root`）。
+    ///
+    /// 这条守的是权限边界（AGENTS.md §0.1）：Agent 的能力面一旦被无意扩大
+    /// （例如把"删除终端"这类人类侧管理操作加进来），只靠逐个工具的单测
+    /// 是发现不了的——它们各自都是对的。工具的**集合**才是契约。
+    #[test]
+    fn tool_surface_is_exactly_the_documented_eight() {
+        let router = McpService::tool_router();
+        let mut names: Vec<String> = router.list_all().iter().map(|t| t.name.to_string()).collect();
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec![
+                "archive_terminal",
+                "create_terminal",
+                "get_command_status",
+                "list_hosts",
+                "list_terminals",
+                "run_as_root",
+                "run_command",
+                "run_command_async",
+            ],
+            "工具集合变化时必须同步 docs/mcp-tools.md §2/§3 并复核权限边界"
+        );
+    }
+
+    /// `run_as_root` 的契约（D47）：三个入参、`cwd` 可空且非必填。
+    ///
+    /// 特别守住"**没有** root 模式"这条设计决定：入参里不得出现
+    /// `enter` / `mode` / `keep_alive` 之类会把授权粒度从"一条命令"
+    /// 放大成"一段时间"的字段。
+    #[test]
+    fn run_as_root_schema_is_single_command_only() {
+        assert_nullable_anyof("run_as_root", "cwd", "string");
+
+        let router = McpService::tool_router();
+        let def = router.get("run_as_root").expect("应有 run_as_root");
+
+        let required: Vec<String> = def.input_schema["required"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            required,
+            vec!["terminal_id".to_string(), "command".to_string()],
+            "提权工具只应要求 terminal_id 与 command（cwd 可空）"
+        );
+
+        let props = def.input_schema["properties"]
+            .as_object()
+            .expect("应有 properties");
+        assert_eq!(
+            props.len(),
+            3,
+            "提权工具只应有 terminal_id / command / cwd，实际：{:?}",
+            props.keys().collect::<Vec<_>>()
+        );
     }
 }
