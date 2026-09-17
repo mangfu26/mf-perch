@@ -524,8 +524,8 @@ cd src-tauri && cargo test -j 2 --test ssh_integration -- --ignored --test-threa
 # 需要额外的 MFPERCH_TEST_SUDO_PW；mcp 是默认特性，无需再写 --features mcp
 cd src-tauri && cargo test -j 2 --test sudo_e2e -- --ignored --test-threads=1
 
-# 【推送 / 并入 main 前】全量 + 全部真实环境用例（22 条 #[ignore]：
-# sudo_e2e 13 / ssh_integration 5 / mcp_e2e 4，其中 1 条只等空闲超时、
+# 【推送 / 并入 main 前】全量 + 全部真实环境用例（23 条 #[ignore]：
+# sudo_e2e 13 / ssh_integration 6 / mcp_e2e 4，其中 1 条只等空闲超时、
 # 不需要 MFPERCH_TEST_*）
 cd src-tauri && cargo test -j 2 -- --ignored --test-threads=1
 

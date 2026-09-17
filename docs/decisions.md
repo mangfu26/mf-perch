@@ -160,6 +160,14 @@
   - 主机密钥存入本地数据库，随主机记录管理。
   - 人类界面需展示主机密钥指纹，并提供"确认新密钥"入口。
   - MVP 不实现严格模式，但保留策略字段以便二期扩展。
+  - **错误码（2026-09-16 落地）**：密钥不一致返回**独立**错误码 `host_key_mismatch`——
+    此前只返回通用的 `ssh_connect_failed`，Agent 分不出"疑似中间人"与网络故障，可能去重试；
+    而本决策要求的是**停止并报告人类**。文案同时给出**已记录**与**本次出示**两个指纹，
+    供人类用 `ssh-keygen -lf` 在目标主机上独立核对。证书形式的密钥同样按此码拒绝
+    （本产品不管理 CA，无法核对）。实现见 `src/ssh/auth.rs` 的
+    `host_key_mismatch_message` / `classify_connect_error` 与 `src/ssh/session.rs`
+    的连接错误映射；差分验证：把映射改回通用连接失败时，
+    单测与真实环境用例（`tests/ssh_integration.rs::host_key_mismatch_has_its_own_error_code`）都会红灯。
 
 ---
 

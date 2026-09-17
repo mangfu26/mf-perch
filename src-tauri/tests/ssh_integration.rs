@@ -198,6 +198,36 @@ async fn session_handles_quoting_and_special_chars() {
     session.disconnect().await.ok();
 }
 
+/// 主机密钥与记录不一致时，必须返回**独立**的错误码 `host_key_mismatch`（D10）。
+///
+/// 守的是一条**安全信号的可判读性**：密钥变更可能意味着中间人，Agent 必须
+/// "停止并报告人类"，而不是当成普通连接失败去重试（`docs/mcp-tools.md` 的错误码表）。
+/// 因此断言的是**错误码**，不是"连接失败了"——后者在实现退化成
+/// `ssh_connect_failed` 时同样成立，区分不出对错实现（P3）。
+#[tokio::test]
+#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 环境变量后以 --ignored 运行"]
+async fn host_key_mismatch_has_its_own_error_code() {
+    let (mut host, auth) = test_target();
+
+    // 预置一把**合法但不是本机**的 ed25519 公钥，模拟"主机换了密钥"。
+    // 该公钥非机密，只用于触发比对分支（与 `src/ssh/auth.rs` 单测里的测试密钥同源）。
+    host.host_key = Some(
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINiIsvulZy36SSkIjC1O05QrsH5BESNWTPFIDzkZ6CZt testB"
+            .into(),
+    );
+
+    let err = match Session::connect("term_tofu", &host, auth, false).await {
+        Ok(_) => panic!("主机密钥与记录不一致时必须拒绝连接，实际却连接成功"),
+        Err(e) => e,
+    };
+
+    assert_eq!(
+        err.code(),
+        "host_key_mismatch",
+        "密钥不一致必须是独立错误码（可能意味着中间人），实际错误：{err:?}"
+    );
+}
+
 /// 验证命令输出中若出现与结束标记相似的文本，不会造成误判（nonce 防误判）。
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 环境变量后以 --ignored 运行"]

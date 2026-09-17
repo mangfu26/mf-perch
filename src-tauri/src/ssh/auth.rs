@@ -183,15 +183,52 @@ pub fn describe_connect_error(e: &russh::Error) -> String {
     }
 }
 
+/// 主机密钥不一致时的人类可读说明。
+///
+/// **两个指纹都要给出**：人类才能拿它与目标主机上 `ssh-keygen -lf` 的输出独立核对，
+/// 判断是主机真的换了密钥，还是有人在中间（D10）。
+pub fn host_key_mismatch_message(
+    expected_fingerprint: &str,
+    presented_fingerprint: &str,
+) -> String {
+    format!(
+        "服务器出示的主机密钥与已记录的不一致，连接已被阻止（可能是中间人攻击）。\
+         已记录：{expected_fingerprint}；本次出示：{presented_fingerprint}。\
+         请人类在目标主机上用 `ssh-keygen -lf` 独立核对新指纹，确认无误后再更新记录"
+    )
+}
+
+/// 把 russh 的连接错误**分类**为应用错误（D10）。
+///
+/// 守的是一条**安全信号的可判读性**：主机密钥不可信必须是与普通连接失败
+/// **不同的、机器可判读的错误码**——它可能意味着中间人，Agent 的应对是
+/// "停止并报告人类"，而不是当成网络抖动去重试（`docs/mcp-tools.md` 的
+/// `host_key_mismatch` 行）。
+///
+/// 依据：russh 在 `check_server_key` 返回 `false` 时抛出 `Error::UnknownKey`
+/// （russh 0.63 `src/client/mod.rs:1895`）。
+pub fn classify_connect_error(e: &russh::Error) -> AppError {
+    match e {
+        russh::Error::UnknownKey | russh::Error::KeyChanged { .. } => {
+            AppError::HostKeyMismatch(describe_connect_error(e))
+        }
+        other => AppError::SshConnect(describe_connect_error(other)),
+    }
+}
+
 /// TOFU 策略下的客户端处理器。
 ///
 /// `recorded_host_key` 为数据库中已记录的密钥；
-/// `captured` 用于把首次连接的密钥回传给调用方以便持久化。
+/// `captured` 用于把首次连接的密钥回传给调用方以便持久化；
+/// `rejection` 记录**拒绝握手的原因**（密钥不一致 / 证书形式），
+/// 供调用方把通用连接失败细化为 [`AppError::HostKeyMismatch`]（D10）。
 #[derive(Clone)]
 pub struct TofuHandler {
     pub recorded_host_key: Option<String>,
     /// 首次连接时捕获到的密钥（供调用方写入数据库）。
     pub captured: std::sync::Arc<std::sync::Mutex<Option<(String, String)>>>,
+    /// 拒绝握手时的人类可读原因（含两个指纹，便于独立核对）。
+    pub rejection: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl TofuHandler {
@@ -199,12 +236,27 @@ impl TofuHandler {
         Self {
             recorded_host_key,
             captured: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            rejection: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
     /// 取回本次连接捕获的新密钥（若有）。
     pub fn take_captured(&self) -> Option<(String, String)> {
         self.captured.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// 取回本次连接**被拒绝**的原因（若有）。
+    ///
+    /// 与 [`Self::take_captured`] 一样是"取走"语义：一次连接只应被归类一次。
+    pub fn take_rejection(&self) -> Option<String> {
+        self.rejection.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// 记录拒绝握手的原因（只由 [`client::Handler::check_server_key`] 写入）。
+    fn record_rejection(&self, reason: String) {
+        if let Ok(mut g) = self.rejection.lock() {
+            *g = Some(reason);
+        }
     }
 }
 
@@ -225,6 +277,11 @@ impl client::Handler for TofuHandler {
             // 证书形式：本产品不管理 CA，拒绝以避免误信。
             russh::keys::PublicKeyOrCertificate::Certificate(_) => {
                 tracing::warn!("服务端出示证书形式的密钥，当前不支持证书校验，已拒绝连接");
+                self.record_rejection(
+                    "服务端出示的是证书形式的密钥，本产品不管理 CA，无法核对，已拒绝连接。\
+                     请让人类改用普通主机密钥，或在主机详情中确认该主机的接入方式"
+                        .to_string(),
+                );
                 return Ok(false);
             }
         };
@@ -238,8 +295,15 @@ impl client::Handler for TofuHandler {
                 }
                 Ok(true)
             }
-            HostKeyCheck::Mismatch { .. } => {
+            HostKeyCheck::Mismatch {
+                expected_fingerprint,
+                presented_fingerprint,
+            } => {
                 // 关键安全行为：密钥变更时**拒绝连接**，由人类确认后再更新。
+                self.record_rejection(host_key_mismatch_message(
+                    &expected_fingerprint,
+                    &presented_fingerprint,
+                ));
                 Ok(false)
             }
         }
@@ -375,5 +439,89 @@ mod tests {
             }
             other => panic!("无记录时应按 TOFU 信任，实际 {other:?}"),
         }
+    }
+
+    /// 拒绝握手时必须记下**含两个指纹**的原因（D10）。
+    ///
+    /// 守的不变式：密钥不一致时人类拿到的不能只有一句"连接失败"——
+    /// 必须能直接看到"已记录"与"本次出示"两个指纹，拿去独立核对。
+    #[tokio::test]
+    async fn handler_records_mismatch_with_both_fingerprints() {
+        use russh::client::Handler as _;
+
+        let mut handler = TofuHandler::new(Some(ED25519_A.to_string()));
+        let presented = PublicKey::from_openssh(ED25519_B).expect("测试公钥 B 应可解析");
+        let expected_fp = fingerprint(&PublicKey::from_openssh(ED25519_A).unwrap());
+        let presented_fp = fingerprint(&presented);
+
+        let accepted = handler
+            .check_server_key(&presented.into())
+            .await
+            .expect("check_server_key 本身不应报错");
+
+        assert!(!accepted, "密钥不一致时必须拒绝握手（fail-closed）");
+        let reason = handler.take_rejection().expect("拒绝必须留下可读原因");
+        assert!(
+            reason.contains(&expected_fp),
+            "原因应包含已记录指纹 {expected_fp}，实际：{reason}"
+        );
+        assert!(
+            reason.contains(&presented_fp),
+            "原因应包含本次出示指纹 {presented_fp}，实际：{reason}"
+        );
+        assert!(handler.take_rejection().is_none(), "原因只应被取走一次");
+    }
+
+    /// 密钥一致时不得留下任何"拒绝"痕迹。
+    ///
+    /// 否则正常连接会被误报成疑似中间人——与漏报同样是缺陷。
+    #[tokio::test]
+    async fn handler_records_no_rejection_when_key_matches() {
+        use russh::client::Handler as _;
+
+        let mut handler = TofuHandler::new(Some(ED25519_A.to_string()));
+        let presented = PublicKey::from_openssh(ED25519_A).expect("测试公钥 A 应可解析");
+
+        let accepted = handler.check_server_key(&presented.into()).await.unwrap();
+
+        assert!(accepted, "密钥一致时应接受握手");
+        assert!(handler.take_rejection().is_none(), "一致时不应记录拒绝原因");
+        assert!(handler.take_captured().is_none(), "一致时不应误走 TOFU 捕获");
+    }
+
+    /// 连接错误分类：**主机密钥不可信必须与普通连接失败分开**（D10）。
+    ///
+    /// 若有人把两者都归成 `ssh_connect_failed`，Agent 会把"疑似中间人"当成网络抖动
+    /// 去重试，而不是停止并报告人类——这条用例就是那种改法的红灯。
+    #[test]
+    fn classify_connect_error_separates_host_key_failures() {
+        let cases: [(russh::Error, &str); 4] = [
+            (russh::Error::UnknownKey, "host_key_mismatch"),
+            (russh::Error::KeyChanged { line: 1 }, "host_key_mismatch"),
+            (russh::Error::ConnectionTimeout, "ssh_connect_failed"),
+            (
+                russh::Error::IO(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "refused",
+                )),
+                "ssh_connect_failed",
+            ),
+        ];
+
+        for (err, expected_code) in cases {
+            assert_eq!(
+                classify_connect_error(&err).code(),
+                expected_code,
+                "{err:?} 应归类为 {expected_code}"
+            );
+        }
+    }
+
+    /// 不一致的说明必须同时给出两个指纹——这是人类的核对依据。
+    #[test]
+    fn host_key_mismatch_message_carries_both_fingerprints() {
+        let msg = host_key_mismatch_message("SHA256:AAA", "SHA256:BBB");
+        assert!(msg.contains("SHA256:AAA"), "应含已记录指纹，实际：{msg}");
+        assert!(msg.contains("SHA256:BBB"), "应含本次出示指纹，实际：{msg}");
     }
 }

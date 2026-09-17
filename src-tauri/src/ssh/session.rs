@@ -130,6 +130,7 @@ impl Session {
 
         let handler = TofuHandler::new(host.host_key.clone());
         let captured = handler.captured.clone();
+        let rejection = handler.rejection.clone();
 
         let addr = (host.address.clone(), host.port);
         let mut handle = tokio::time::timeout(
@@ -145,7 +146,15 @@ impl Session {
                 CONNECT_TIMEOUT.as_secs()
             ))
         })?
-        .map_err(|e| AppError::SshConnect(super::auth::describe_connect_error(&e)))?;
+        .map_err(|e| {
+            // D10：主机密钥不可信是**独立**的错误码，不能并进通用连接失败——
+            // Agent 据此"停止并报告人类"，而不是当网络抖动重试。
+            // 优先用处理器记下的具体原因（含两个指纹），它比 russh 的通用错误更有用。
+            if let Some(reason) = rejection.lock().ok().and_then(|mut g| g.take()) {
+                return AppError::HostKeyMismatch(reason);
+            }
+            super::auth::classify_connect_error(&e)
+        })?;
 
         // --- 认证 ---
         let authenticated = match &auth {
