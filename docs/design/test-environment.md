@@ -181,7 +181,7 @@ cargo test -j 2 --test ssh_integration -- --ignored --test-threads=1
 
 | 类别 | 规模 | 说明 |
 | ---- | ---- | ---- |
-| Rust 单测 | 240 项 | 生产文件内的 `#[cfg(test)]`（`src/` 内 `#[test]` 210 + `#[tokio::test]` 30），默认门禁 |
+| Rust 单测 | 246 项 | 生产文件内的 `#[cfg(test)]`，默认门禁（`cargo test --lib -- --list` 实测） |
 | Rust 集成测试 | 31 项 | `mcp_e2e` 6 / `ssh_integration` 5 / `sudo_e2e` 13 / `update_e2e` 7 |
 | ↑ 其中 `#[ignore]`（默认门禁不跑） | 22 项 | `mcp_e2e` 4 / `ssh_integration` 5 / `sudo_e2e` 13；其中 **21 项需真实 SSH**，`mcp_e2e` 另 1 项是耗时的本地用例（空闲 310 秒）。`update_e2e` 7 项不依赖真实环境，默认就跑 |
 | 前端单测 | 21 项 | vitest，覆盖 `src/lib/` 纯逻辑 |

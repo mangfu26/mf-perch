@@ -45,7 +45,7 @@
 | ---- | ---- | ---- | ---- |
 | `run_command` | `terminal_id`, `command`, `wait_seconds?` | 完成：`status=completed`、`exit_code`、`output`、`duration_ms`；超时：`status=running`、`command_id`、部分输出 | 同步模式，默认等待 30 秒（可配置，上限 50 秒） |
 | `run_command_async` | `terminal_id`, `command` | `status=running`、`command_id` | 异步模式，立即返回；等价于 `wait_seconds=0` |
-| `get_command_status` | `command_id`, `tail_lines?` | `status`（queued/running/completed/failed）、`exit_code`、`duration_ms`、部分或完整输出 | 轮询用，对两种模式发起的命令都有效 |
+| `get_command_status` | `command_id`, `tail_lines?` | `status`（queued/running/completed/failed/connection_lost）、`exit_code`、`duration_ms`、部分或完整输出 | 轮询用，对两种模式发起的命令都有效 |
 | `run_as_root` | `terminal_id`, `command`, `cwd?` | 独立结构 `PrivilegedOutcome`：`command_id`、`exit_code`、`duration_ms`、`output`、`truncated`、`actual_uid`、`actual_user` | 以**特权身份**执行一条命令（D47），走应用自建的短命特权通道；**没有异步、没有轮询** |
 
 补充说明：
@@ -102,7 +102,11 @@
 | **A. 排队**（建议） | 命令进入队列，等待前一条结束后自动执行；同步调用超时后返回 `status=queued` + `command_id` | 与人类在 shell 里连续敲命令的直觉一致；Agent 不会因为"终端忙"而失败 | 队列需要上限（建议 10 条），超出则拒绝，防止无限堆积 |
 | B. 拒绝 | 立即返回错误 `terminal busy`，Agent 需自行换终端或稍后重试 | 行为更显式 | Agent 需处理错误分支，且容易误判为命令执行失败 |
 
-状态取值相应扩展：`queued`（排队中）、`running`（执行中）、`completed`（已完成）、`failed`（执行出错）——命令状态**只有这四个**（`CommandStatus`，见 `src-tauri/src/domain/command.rs`）。`broken` 是**终端**状态，不是命令状态（`TerminalStatus`，见 `src-tauri/src/domain/terminal.rs`）：会话断开时标记为 `broken` 的是终端本身；其遗留的未完成命令在终端归档或应用重启时由 `fail_pending_for_terminal` / `fail_all_pending_on_startup` 收尾为 `failed`（`src-tauri/src/store/commands.rs`）。
+状态取值相应扩展：`queued`（排队中）、`running`（执行中）、`completed`（已完成）、`failed`（执行出错）、`connection_lost`（**连接断开、结局未知**）——命令状态是这**五个**（`CommandStatus`，见 `src-tauri/src/domain/command.rs`）。
+
+`failed` 与 `connection_lost` **刻意分开**（D50）：前者是"命令跑过并失败"（结果已知），后者是"连接断了、结局未知"（可能已执行完、也可能只跑了一半）。混成一个状态会让审计得出错误结论——把"不知道"写成"执行完成"或"命令失败"都是误导。
+
+`broken` 是**终端**状态，不是命令状态（`TerminalStatus`，见 `src-tauri/src/domain/terminal.rs`）：会话断开时标记为 `broken` 的是终端本身；其遗留的未完成命令在终端归档或应用重启时由 `fail_pending_for_terminal` / `fail_all_pending_on_startup` 收尾为 `failed`（`src-tauri/src/store/commands.rs`）。
 
 跨终端当然可以并行。
 
@@ -118,4 +122,4 @@
 2. **采纳**同步超时降级为异步：超时返回 `command_id` + `status: running`，不报错、不中断远端命令。
 3. 同步默认等待 **30 秒**、上限 **50 秒**，客户确认可以。
 4. **同一终端串行**已接受；终端忙时采用 **A. 排队**，队列上限建议 10 条，超出则拒绝。
-5. 状态取值：`queued` / `running` / `completed` / `failed`（**不含 `broken`**——那是终端状态，不是命令状态；终端遗留的未完成命令在归档 / 应用重启时收尾为 `failed`）。
+5. 状态取值：`queued` / `running` / `completed` / `failed` / `connection_lost`（**不含 `broken`**——那是终端状态，不是命令状态）。`failed` 与 `connection_lost` **刻意分开**：前者是"命令跑过并失败"，后者是"连接断了、结局未知"（见 D50）。终端遗留的未完成命令在归档 / 应用重启时收尾为 `failed`。

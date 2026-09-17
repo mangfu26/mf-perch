@@ -720,7 +720,6 @@ async fn run_as_root_does_not_leave_the_terminal_privileged() {
 
     state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
 }
-
 /// **D4 回归**："环境加载方式"（登录 / 干净）必须真正生效。
 ///
 /// 背景（收网审计发现）：`protocol::shell_invocation` 这对参数**曾完全没有调用方**——

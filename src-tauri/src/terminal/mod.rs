@@ -775,9 +775,16 @@ impl TerminalRuntime {
             };
 
             // 落库终态：同步与异步两条路径都会执行到这里。
+            //
+            // **终止原因决定状态**（客户 2026-09-16 要求）：连接断开时这条命令的
+            // 结局是**未知**的（可能已执行完、可能只跑了一半），因此它既不是
+            // `completed` 也不是 `failed`，而是 `connection_lost`。
+            // 判定规则与理由见 [`final_command_status`]。
+            let final_status = final_command_status(entry_for_task.finished.is_disconnected());
+
             {
                 let mut final_record = record;
-                final_record.status = CommandStatus::Completed;
+                final_record.status = final_status;
                 final_record.exit_code = exit_code;
                 final_record.duration_ms = Some(duration);
                 final_record.truncated = truncated;
@@ -799,14 +806,14 @@ impl TerminalRuntime {
             entry_for_task.emit_event(TerminalEvent::CommandFinished {
                 terminal_id: entry_for_task.session.terminal_id().to_string(),
                 command_id: command_id_for_task.clone(),
-                status: CommandStatus::Completed.as_str().to_string(),
+                status: final_status.as_str().to_string(),
                 exit_code,
                 duration_ms: Some(duration),
             });
 
             RunOutcome {
                 command_id: command_id_for_task,
-                status: CommandStatus::Completed,
+                status: final_status,
                 exit_code,
                 duration_ms: Some(duration),
                 output,
@@ -1036,6 +1043,26 @@ impl TerminalRuntime {
         // 已结束（或内存中已无记录）：取数据库。
         let conn = db.lock().await;
         cmd_store::status_view(&conn, command_id, true, tail_lines)
+    }
+}
+
+/// 由**终止原因**决定命令终态（客户 2026-09-16 要求）。
+///
+/// 抽成纯函数是为了能被直接单测：这段判定的价值全在"断线 ≠ 失败"这一条区分上，
+/// 而它在真实环境里极难构造（要精确掐断一条 SSH 连接）。纯函数让这条语义
+/// 有确定性的回归防线，不依赖能否搭出真实断线。
+///
+/// 判定规则（只有一条）：
+/// - 会话已断开 ⇒ `ConnectionLost`：命令的**结局未知**（可能已执行完、可能跑了一半），
+///   这与"命令执行过并失败"在审计上是两件事，不能混。
+/// - 否则 ⇒ `Completed`：注意"完成"不等于"成功"，退出码可能是非零。
+///   命令**自己跑失败**仍记 `Completed` + 非零退出码——这是既有的语义
+///   （见 `CommandStatus::Completed` 的注释），本次不改。
+fn final_command_status(disconnected: bool) -> CommandStatus {
+    if disconnected {
+        CommandStatus::ConnectionLost
+    } else {
+        CommandStatus::Completed
     }
 }
 
@@ -1496,12 +1523,18 @@ async fn run_root_locked(
     }
 
     // --- 第 7 步：落库终态（人类审计） ---
+    //
+    // 与数据面同一条口径：**终止原因决定状态**。提权通道断开时，这条提权命令的
+    // 结局同样未知（可能已经以 root 执行完），因此写 `connection_lost` 而不是
+    // `completed`——把"传输断了、结果未知"写成"执行完成"会误导审计。
+    // 判定规则与理由见 [`final_command_status`]。
+    let final_status = final_command_status(privileged_finished.is_disconnected());
     {
         let mut final_record = {
             let conn = db.lock().await;
             cmd_store::get(&conn, &command_id)?
         };
-        final_record.status = CommandStatus::Completed;
+        final_record.status = final_status;
         final_record.exit_code = exit_code;
         final_record.duration_ms = Some(duration);
         final_record.truncated = truncated;
@@ -1516,7 +1549,7 @@ async fn run_root_locked(
     entry.emit_event(TerminalEvent::CommandFinished {
         terminal_id: entry.session.terminal_id().to_string(),
         command_id: command_id.clone(),
-        status: CommandStatus::Completed.as_str().to_string(),
+        status: final_status.as_str().to_string(),
         exit_code,
         duration_ms: Some(duration),
     });
@@ -1736,6 +1769,34 @@ mod tests {
         assert_eq!(tail(text, 2), "4\n5");
         assert_eq!(tail(text, 10), text);
         assert_eq!(tail(text, 0), "");
+    }
+
+    /// **终止原因决定状态**（客户 2026-09-16 要求）。
+    ///
+    /// 判别性：把两个分支合并成任一种写法（断线也写 `Completed`——这正是修复前的
+    /// 行为；或把普通完成也写 `ConnectionLost`）都会让这条断言失败。
+    ///
+    /// 之所以用纯函数守而不用真实断线用例：要在测试里精确掐断一条 SSH 连接，
+    /// 依赖宿主环境能否杀掉该会话的 sshd 进程——在本项目的 WSL 测试环境里
+    /// sshd 是单进程（`sshd: /usr/sbin/sshd -D`，没有每会话子进程），构造不出来。
+    /// 与其写一条跑不起来、或跑起来也证明不了什么的用例，不如把判定抽出来直接测。
+    #[test]
+    fn final_status_distinguishes_connection_loss_from_completion() {
+        assert_eq!(
+            final_command_status(true),
+            CommandStatus::ConnectionLost,
+            "会话断开时命令结局未知，必须与「执行完成」区分开"
+        );
+        assert_eq!(
+            final_command_status(false),
+            CommandStatus::Completed,
+            "正常结束仍是 completed（完成不等于成功，退出码可能非零）"
+        );
+        assert_ne!(
+            final_command_status(true),
+            final_command_status(false),
+            "两种情况必须有不同状态，否则等于没区分"
+        );
     }
 
     #[tokio::test]

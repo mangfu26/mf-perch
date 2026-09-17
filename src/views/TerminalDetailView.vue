@@ -83,6 +83,8 @@ const isExpanded = (id: string) => expanded.value.has(id);
 
 function commandStatusTone(status: string) {
   if (status === "completed") return "success";
+  // 连接断开：命令结局未知，不能混进 danger（那会被读成"命令失败"）。
+  if (status === "connection_lost") return "warning";
   if (status === "running") return "info";
   if (status === "queued") return "neutral";
   return "danger";
@@ -92,6 +94,7 @@ function commandStatusLabel(status: string) {
   if (status === "queued") return t("command.statusQueued");
   if (status === "running") return t("command.statusRunning");
   if (status === "failed") return t("command.statusFailed");
+  if (status === "connection_lost") return t("command.statusConnectionLost");
   return t("command.statusCompleted");
 }
 

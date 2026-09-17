@@ -512,7 +512,7 @@ cd src-tauri && cargo test --test ssh_integration -- --ignored --test-threads=1
 cd src-tauri && cargo test --test sudo_e2e -- --ignored --test-threads=1
 
 # 一次跑完全部真实环境用例（22 条 #[ignore]：sudo_e2e 13 / ssh_integration 5 /
-# mcp_e2e 4，其中 mcp_e2e 有 1 条只等空闲超时、不需要 MFPERCH_TEST_*）
+# mcp_e2e 4，其中 1 条只等空闲超时、不需要 MFPERCH_TEST_*）
 cd src-tauri && cargo test -- --ignored --test-threads=1
 
 # 前端三道门禁（都不需要真实环境，与 §5.9 的分工一致）

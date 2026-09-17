@@ -4,8 +4,16 @@ use super::new_id;
 
 /// 命令执行状态机（Q4）。
 ///
-/// `queued` → `running` → `completed` | `failed`
-/// 终端断开时处于 `running` 的命令转为 `failed`。
+/// `queued` → `running` → `completed` | `failed` | `connection_lost`
+///
+/// **`failed` 与 `connection_lost` 刻意分开**（客户 2026-09-16 要求）：
+/// 两者对审计的含义完全不同——
+/// - `failed`：命令**跑过并自己失败**（退出码非零），结果已知；
+/// - `connection_lost`：**连接断了，命令结局未知**（可能已执行完、可能跑了一半），
+///   人类需要据此决定"要不要上去核对"。
+///
+/// 混为一谈会让审计出现最坏的一种误导：把"没跑完/不知道"写成"执行完成"，
+/// 或者把"传输中断"写成"命令失败"。两者都会让人类得出错误结论。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandStatus {
@@ -15,8 +23,13 @@ pub enum CommandStatus {
     Running,
     /// 执行完成。注意：完成不等于成功，退出码可能非零。
     Completed,
-    /// 因终端断开或内部错误未能正常完成。
+    /// 命令**执行过并失败**（退出码非零，或发送/内部错误）。
     Failed,
+    /// **连接断开导致结局未知**（命令可能已执行完、也可能只跑了一半）。
+    ///
+    /// 与 `Failed` 的区别是审计语义，不是严重程度：这里没有"命令失败"的证据，
+    /// 只有"我们不知道结果"的事实。
+    ConnectionLost,
 }
 
 impl CommandStatus {
@@ -26,6 +39,7 @@ impl CommandStatus {
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::ConnectionLost => "connection_lost",
         }
     }
 
@@ -35,6 +49,7 @@ impl CommandStatus {
             "running" => Some(Self::Running),
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
+            "connection_lost" => Some(Self::ConnectionLost),
             _ => None,
         }
     }
@@ -89,6 +104,67 @@ impl CommandRecord {
     /// 命令是否成功（已完成且退出码为 0）。
     pub fn is_success(&self) -> bool {
         self.status == CommandStatus::Completed && self.exit_code == Some(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `connection_lost` 是**前后端共享的字符串契约**：前端按 `status` 上色与显示标签，
+    /// 数据库 CHECK 约束也认这个值。三处必须一致，改动时不能只改一边。
+    #[test]
+    fn status_strings_round_trip() {
+        let all = [
+            CommandStatus::Queued,
+            CommandStatus::Running,
+            CommandStatus::Completed,
+            CommandStatus::Failed,
+            CommandStatus::ConnectionLost,
+        ];
+        for s in all {
+            assert_eq!(
+                CommandStatus::parse(s.as_str()),
+                Some(s),
+                "{s:?} 的字符串往返失败（值为 {}）",
+                s.as_str()
+            );
+        }
+        assert_eq!(CommandStatus::ConnectionLost.as_str(), "connection_lost");
+        // 未知字符串不得被猜成某个状态——否则库里出现脏值时会静默显示成"已完成"。
+        assert_eq!(CommandStatus::parse("unknown"), None);
+    }
+
+    /// **区分"命令失败"与"因断线而未完成"**（客户 2026-09-16 要求）。
+    ///
+    /// 判别性：把 `connection_lost` 当成 `failed`（或反过来当成 `completed`）
+    /// 都会让这条断言失败——而这两类混淆正是审计里最要命的误导。
+    #[test]
+    fn connection_lost_is_distinct_from_failed_and_completed() {
+        assert_ne!(CommandStatus::ConnectionLost, CommandStatus::Failed);
+        assert_ne!(CommandStatus::ConnectionLost, CommandStatus::Completed);
+        assert_ne!(CommandStatus::ConnectionLost.as_str(), CommandStatus::Failed.as_str());
+    }
+
+    /// 只有 `queued` / `running` 算"进行中"：`connection_lost` 是**终态**
+    /// （连接断了就不会再有结果），否则轮询会永远等下去。
+    #[test]
+    fn connection_lost_is_terminal_not_pending() {
+        assert!(!CommandStatus::ConnectionLost.is_pending());
+        assert!(CommandStatus::Queued.is_pending());
+        assert!(CommandStatus::Running.is_pending());
+    }
+
+    /// 断线的命令**不算成功**——即便它的退出码恰好是 0 也不能算。
+    #[test]
+    fn connection_lost_is_never_success() {
+        let mut rec = CommandRecord::new("term_1", 1, "ls");
+        rec.status = CommandStatus::ConnectionLost;
+        rec.exit_code = Some(0);
+        assert!(
+            !rec.is_success(),
+            "连接断开的命令结局未知，不得显示为成功"
+        );
     }
 }
 

@@ -159,6 +159,7 @@ export default {
     statusRunning: "执行中",
     statusCompleted: "已完成",
     statusFailed: "失败",
+    statusConnectionLost: "连接断开（结局未知）",
     sudoInjected: "sudo 自动注入",
     sudoAsked: "sudo 已询问",
     sudoDenied: "sudo 被拒绝",

@@ -1162,6 +1162,51 @@
 - **相关**：D47（双通道）、D48（提权取数）、D11 / Q33（三模式来源）、
   `docs/security-audit.md` V1 / V2、`docs/design/sudo.md`。
 
+---
+
+## D50 — 命令状态新增 `connection_lost`：把"因断线而结局未知"与"命令失败"分开
+
+- **日期**：2026-09-16
+- **状态**：**已实施**。
+- **背景（收网审计发现）**：连接断开时正在运行的命令，`exit_code` 被置为 -1
+  （输出泵写入一行 `[mf-perch] 连接已断开：…`），但 runner **无条件**把终态落库为
+  `completed`。前端 `commandStatusTone()` 按 `status` 上色 → 这条命令在审计界面
+  显示为**绿色「已完成」**，退出码 -1 只藏在展开的详情里。
+  这会让人类审计得出错误结论——而"人类靠审计核对 Agent 做了什么"正是本产品的核心场景。
+- **决策（客户拍板）**：**设立独立状态**，而不是把断线并进 `failed` 或 `completed`：
+  - `failed`：命令**跑过并自己失败**（结果已知，退出码非零）；
+  - **`connection_lost`（新）**：**连接断了、结局未知**（可能已执行完、也可能只跑了一半）。
+  两者对审计的含义完全不同；混成一个状态，"不知道"就会被写成"完成"或"失败"。
+- **判定规则（唯一一条）**：由**终止原因**决定，而不是由退出码猜——
+  会话已断开（`FinishSignal::Disconnected`）⇒ `connection_lost`；否则 `completed`。
+  刻意不用"退出码是否为 -1"当判据：那是以值代义，且日后若有命令真的返回 -1 会误判。
+  实现抽成纯函数 `terminal::final_command_status(disconnected)`，数据面与提权通道共用。
+- **连带变更**：
+  1. **数据库迁移 V2**（`SCHEMA_VERSION` 1→2）：`commands.status` 的 CHECK 约束
+     原本只认四个旧值。**必须走迁移而非只改建表语句**——已装用户的表早已建好，
+     `CREATE TABLE IF NOT EXISTS` 不会重建，新状态会被旧约束拒绝写入
+     （`CHECK constraint failed`），表现为"命令结束时落库失败"，而全新安装却正常。
+     SQLite 不能改 CHECK，只能重建表；重建时同时重建三个索引、三个 FTS 同步触发器，
+     并 `VALUES('rebuild')` 重建两套 FTS 索引，迁移期间临时关闭外键
+     （否则 `DROP TABLE commands` 会经 `ON DELETE CASCADE` 把输出删光）。
+  2. **前端**：两个视图的状态映射新增该状态，色调取 `warning`（不是 `danger`——
+     那会被读成"命令失败"），文案「连接断开（结局未知）」。
+  3. **文档**：`docs/mcp-tools.md`（`status` 取值）、`docs/design/command-execution.md`
+     （状态机与两状态的区别）。
+- **测试（能区分对错）**：
+  - `final_status_distinguishes_connection_loss_from_completion`（纯函数，两种分支
+    都必须成立；把两者合并成任一写法立刻变红）；
+  - `connection_lost_is_distinct_from_failed_and_completed`、
+    `connection_lost_is_terminal_not_pending`、`connection_lost_is_never_success`
+    （领域契约：字符串往返、终态性、不得算成功）；
+  - `v2_migration_allows_connection_lost_status`（先造成"旧版库"并证明旧约束**确实
+    拒绝**新值，再跑迁移证明可写，且旧记录、输出与两套 FTS 都还活着）。
+  - **未做真实断线 e2e**：要在测试里精确掐断一条 SSH 连接，需要杀掉该会话的 sshd
+    进程，而本项目 WSL 测试环境的 sshd 是**单进程**（`sshd: /usr/sbin/sshd -D`，
+    没有每会话子进程），构造不出来。与其留一条跑不起来、或跑起来也证明不了什么的
+    用例，不如把判定抽成纯函数直接测——这也是把它抽出来的原因。
+- **相关**：D3（会话模型）、D39（断线自动重连）、`docs/design/command-execution.md`。
+
 
 
 

@@ -133,7 +133,7 @@
 | 字段 | 类型 | 说明 |
 | ---- | ---- | ---- |
 | `command_id` | string | 后续 `get_command_status` 用 |
-| `status` | string | `queued` / `running` / `completed` / `failed` |
+| `status` | string | `queued` / `running` / `completed` / `failed` / `connection_lost`（**连接断开、结局未知**，与「命令失败」区分；见 D50） |
 | `exit_code` | number \| null | 已结束时为退出码（被信号终止可能为负） |
 | `duration_ms` | number \| null | 耗时（毫秒） |
 | `output` | string | 已累积的输出；未结束时可能只是部分 |
@@ -206,7 +206,7 @@
 | 字段 | 类型 | 说明 |
 | ---- | ---- | ---- |
 | `command_id` / `terminal_id` / `command` | string | 命令归属信息 |
-| `status` | string | `queued` / `running` / `completed` / `failed` |
+| `status` | string | `queued` / `running` / `completed` / `failed` / `connection_lost`（**连接断开、结局未知**，与「命令失败」区分；见 D50） |
 | `exit_code` / `duration_ms` | number \| null | 结束前为 `null` |
 | `truncated` | boolean | 输出是否被上限截断 |
 | `output` | string \| null | 轮询中为**部分**输出，结束时为完整输出 |
