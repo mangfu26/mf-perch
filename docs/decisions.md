@@ -1182,13 +1182,15 @@
   刻意不用"退出码是否为 -1"当判据：那是以值代义，且日后若有命令真的返回 -1 会误判。
   实现抽成纯函数 `terminal::final_command_status(disconnected)`，数据面与提权通道共用。
 - **连带变更**：
-  1. **数据库迁移 V2**（`SCHEMA_VERSION` 1→2）：`commands.status` 的 CHECK 约束
-     原本只认四个旧值。**必须走迁移而非只改建表语句**——已装用户的表早已建好，
-     `CREATE TABLE IF NOT EXISTS` 不会重建，新状态会被旧约束拒绝写入
-     （`CHECK constraint failed`），表现为"命令结束时落库失败"，而全新安装却正常。
-     SQLite 不能改 CHECK，只能重建表；重建时同时重建三个索引、三个 FTS 同步触发器，
-     并 `VALUES('rebuild')` 重建两套 FTS 索引，迁移期间临时关闭外键
-     （否则 `DROP TABLE commands` 会经 `ON DELETE CASCADE` 把输出删光）。
+  1. **建表语句**（`V1_SCHEMA` 的 `commands.status` CHECK）加入新状态。
+     **刻意不做数据库迁移**（客户 2026-09-16 决定，**取代**本条的初版做法）：
+     产品尚未发布、`main` 也未推送，所有变动只影响开发机本地数据——
+     **"只有已发布版本才需要考虑不兼容迁移"**，未发布就背迁移成本不划算。
+     初版实现过一版 V2 迁移（重建表 + 重建索引/FTS/触发器 + 临时关外键），
+     现按客户决定**整体移除**（将来真发布后若再改状态取值，可从 git 历史取回）。
+     代价与规避：本机**旧**的 dev 库约束仍是四态，写入新状态会
+     `CHECK constraint failed` → 删掉 `%APPDATA%/mf-perch/mf-perch.db` 即可
+     （dev 数据无保留价值）。**首发前若已存在用户库，则必须改回迁移方案。**
   2. **前端**：两个视图的状态映射新增该状态，色调取 `warning`（不是 `danger`——
      那会被读成"命令失败"），文案「连接断开（结局未知）」。
   3. **文档**：`docs/mcp-tools.md`（`status` 取值）、`docs/design/command-execution.md`
@@ -1199,8 +1201,8 @@
   - `connection_lost_is_distinct_from_failed_and_completed`、
     `connection_lost_is_terminal_not_pending`、`connection_lost_is_never_success`
     （领域契约：字符串往返、终态性、不得算成功）；
-  - `v2_migration_allows_connection_lost_status`（先造成"旧版库"并证明旧约束**确实
-    拒绝**新值，再跑迁移证明可写，且旧记录、输出与两套 FTS 都还活着）。
+  - `connection_lost_is_accepted_by_the_schema`（建表语句必须认这个新值——
+    只改枚举而忘了改建表语句时，这条写入会以 `CHECK constraint failed` 失败）。
   - **未做真实断线 e2e**：要在测试里精确掐断一条 SSH 连接，需要杀掉该会话的 sshd
     进程，而本项目 WSL 测试环境的 sshd 是**单进程**（`sshd: /usr/sbin/sshd -D`，
     没有每会话子进程），构造不出来。与其留一条跑不起来、或跑起来也证明不了什么的

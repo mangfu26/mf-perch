@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{AppError, Result};
 
 /// 数据库 schema 版本。每次结构变更递增，并在 `migrate` 中补迁移步骤。
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 1;
 
 /// 打开（或创建）数据库并完成迁移。
 ///
@@ -50,87 +50,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             .map_err(|e| AppError::Database(e))?;
     }
 
-    if current < 2 {
-        conn.execute_batch(V2_COMMAND_STATUS)
-            .map_err(|e| AppError::Database(e))?;
-    }
-
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
-
-/// V2：`commands.status` 允许新状态 `connection_lost`（2026-09-16）。
-///
-/// 背景：断线时正在运行的命令原本被写成 `completed`（界面显示绿色"已完成"），
-/// 而"连接断了、结局未知"与"命令跑过并失败"在审计上是两件事。客户要求单列状态。
-///
-/// **必须用迁移而不能只改建表语句**：已装用户的 `commands` 表早已建好，
-/// `CREATE TABLE IF NOT EXISTS` 不会重建它，新状态会被旧 CHECK 约束拒绝写入
-/// （SQLite 报 CHECK constraint failed），表现为"命令结束时落库失败"。
-///
-/// SQLite 不支持修改 CHECK，只能重建表。重建时必须同时补齐三件容易漏掉的事：
-///
-/// 1. **索引**：`DROP TABLE` 会连索引一起删，三个索引必须重建（否则列表/搜索变慢）；
-/// 2. **FTS 与触发器**：`commands_fts` 是**外部内容表**（`content='commands'`），
-///    三个同步触发器挂在 `commands` 上，删表会一并删掉——必须重建触发器，
-///    并用 `VALUES('rebuild')` 让 FTS 按新表的 rowid 重建索引；
-/// 3. **外键**：`command_outputs` 以 `ON DELETE CASCADE` 挂在 `commands` 上，
-///    若开着外键，`DROP TABLE commands` 会把输出**级联删光**。
-///    因此迁移期间临时关闭外键（迁移结束再打开）。
-///
-/// 整个过程在 `execute_batch` 里执行，SQLite 会隐式包一层事务：任一步失败则全部回滚，
-/// 不会留下"表重建了一半"的中间状态。
-const V2_COMMAND_STATUS: &str = r#"
-PRAGMA foreign_keys = OFF;
-
-CREATE TABLE commands_new (
-    id           TEXT PRIMARY KEY,
-    terminal_id  TEXT NOT NULL REFERENCES terminals(id) ON DELETE CASCADE,
-    seq          INTEGER NOT NULL,
-    command      TEXT NOT NULL,
-    status       TEXT NOT NULL DEFAULT 'queued'
-                 CHECK (status IN ('queued', 'running', 'completed', 'failed', 'connection_lost')),
-    exit_code    INTEGER,
-    duration_ms  INTEGER,
-    truncated    INTEGER NOT NULL DEFAULT 0,
-    output_bytes INTEGER,
-    created_at   TEXT NOT NULL,
-    started_at   TEXT,
-    finished_at  TEXT
-);
-
-INSERT INTO commands_new
-    SELECT id, terminal_id, seq, command, status, exit_code, duration_ms,
-           truncated, output_bytes, created_at, started_at, finished_at
-      FROM commands;
-
-DROP TABLE commands;
-ALTER TABLE commands_new RENAME TO commands;
-
-CREATE INDEX IF NOT EXISTS idx_commands_terminal ON commands(terminal_id, seq);
-CREATE INDEX IF NOT EXISTS idx_commands_created  ON commands(created_at);
-CREATE INDEX IF NOT EXISTS idx_commands_status   ON commands(status);
-
-CREATE TRIGGER IF NOT EXISTS commands_ai AFTER INSERT ON commands BEGIN
-    INSERT INTO commands_fts(rowid, command) VALUES (new.rowid, new.command);
-END;
-
-CREATE TRIGGER IF NOT EXISTS commands_ad AFTER DELETE ON commands BEGIN
-    INSERT INTO commands_fts(commands_fts, rowid, command) VALUES ('delete', old.rowid, old.command);
-END;
-
-CREATE TRIGGER IF NOT EXISTS commands_au AFTER UPDATE ON commands BEGIN
-    INSERT INTO commands_fts(commands_fts, rowid, command) VALUES ('delete', old.rowid, old.command);
-    INSERT INTO commands_fts(rowid, command) VALUES (new.rowid, new.command);
-END;
-
--- 重建两套 FTS 索引：commands 的 rowid 可能变化，command_outputs 的 rowid
--- 也可能因主键类型（TEXT）在表重建后重排。'rebuild' 幂等，重跑无副作用。
-INSERT INTO commands_fts(commands_fts) VALUES('rebuild');
-INSERT INTO command_outputs_fts(command_outputs_fts) VALUES('rebuild');
-
-PRAGMA foreign_keys = ON;
-"#;
 
 /// 应用数据目录（D6 / Q12）：`%APPDATA%/mf-perch`（Windows）、
 /// macOS 为 `~/Library/Application Support/mf-perch`，Linux 为 `~/.local/share/mf-perch`。
@@ -245,7 +167,7 @@ CREATE TABLE IF NOT EXISTS commands (
     seq          INTEGER NOT NULL,
     command      TEXT NOT NULL,
     status       TEXT NOT NULL DEFAULT 'queued'
-                 CHECK (status IN ('queued', 'running', 'completed', 'failed')),
+                 CHECK (status IN ('queued', 'running', 'completed', 'failed', 'connection_lost')),
     exit_code    INTEGER,
     duration_ms  INTEGER,
     truncated    INTEGER NOT NULL DEFAULT 0,
@@ -312,112 +234,36 @@ END;
 mod tests {
     use super::*;
 
-    /// **V2 迁移回归**：`connection_lost` 必须能被真正写进库（客户 2026-09-16 要求）。
+    /// `connection_lost` 必须能被真正写进库（客户 2026-09-16 要求）。
     ///
-    /// 判别性：`commands.status` 上有 CHECK 约束。若只改 `V1_SCHEMA` 而不加迁移，
-    /// **已装用户的旧表**仍会拒绝这个新值（`CHECK constraint failed`），
-    /// 表现为"命令结束时落库失败"——而全新库却一切正常，属于极难在开发机上发现的缺陷。
-    /// 本用例先造一个"旧版库"（把 status 约束改回四态），再跑迁移，然后写入新状态。
+    /// 判别性：`commands.status` 上有 CHECK 约束，只改枚举而忘了改建表语句时，
+    /// 这条写入会以 `CHECK constraint failed` 失败——正是本用例要抓的缺陷。
+    ///
+    /// 注：**不做数据库迁移**（客户 2026-09-16 决定）。产品尚未发布，
+    /// 不背版本兼容成本；正式发布后若再改状态取值，才需要考虑迁移。
+    /// 代价：本机**旧**的 dev 库（约束还是四态）写入该状态会失败，
+    /// 删掉 `%APPDATA%/mf-perch/mf-perch.db` 即可。
     #[test]
-    fn v2_migration_allows_connection_lost_status() {
-        let conn = open_in_memory().expect("内存库（已迁移到当前版本）");
-
-        // 把表退回"旧版"形态：CHECK 只认四个旧状态，并把 user_version 调回 1，
-        // 这样下面的 migrate 会真正执行 V2 分支。
-        conn.execute_batch(
-            "PRAGMA foreign_keys = OFF;
-             CREATE TABLE commands_old (
-                 id           TEXT PRIMARY KEY,
-                 terminal_id  TEXT NOT NULL REFERENCES terminals(id) ON DELETE CASCADE,
-                 seq          INTEGER NOT NULL,
-                 command      TEXT NOT NULL,
-                 status       TEXT NOT NULL DEFAULT 'queued'
-                              CHECK (status IN ('queued','running','completed','failed')),
-                 exit_code    INTEGER,
-                 duration_ms  INTEGER,
-                 truncated    INTEGER NOT NULL DEFAULT 0,
-                 output_bytes INTEGER,
-                 created_at   TEXT NOT NULL,
-                 started_at   TEXT,
-                 finished_at  TEXT
-             );
-             DROP TABLE commands;
-             ALTER TABLE commands_old RENAME TO commands;
-             PRAGMA user_version = 1;
-             PRAGMA foreign_keys = ON;",
-        )
-        .expect("造一个旧版库");
-
-        // 旧约束下应当写不进去——先证明"这个用例确实抓得住旧形态"。
+    fn connection_lost_is_accepted_by_the_schema() {
+        let conn = open_in_memory().expect("内存库");
         conn.execute(
             "INSERT INTO hosts (id, address, port, created_at, updated_at)
-             VALUES ('host_v2', '127.0.0.1', 22, 'now', 'now')",
+             VALUES ('host_cl', '127.0.0.1', 22, 'now', 'now')",
             [],
         )
-        .expect("写入主机");
+        .unwrap();
         conn.execute(
             "INSERT INTO terminals (id, host_id, status, created_at, updated_at)
-             VALUES ('term_v2', 'host_v2', 'active', 'now', 'now')",
+             VALUES ('term_cl', 'host_cl', 'active', 'now', 'now')",
             [],
         )
-        .expect("写入终端");
-        let before = conn.execute(
-            "INSERT INTO commands (id, terminal_id, seq, command, status, created_at)
-             VALUES ('cmd_old', 'term_v2', 1, 'ls', 'connection_lost', 'now')",
-            [],
-        );
-        assert!(
-            before.is_err(),
-            "旧约束本应拒绝 connection_lost（否则本用例证明不了迁移的必要性）"
-        );
-
-        // 跑迁移，再写一次：这次必须成功。
-        migrate(&conn).expect("迁移应成功");
+        .unwrap();
         conn.execute(
             "INSERT INTO commands (id, terminal_id, seq, command, status, created_at)
-             VALUES ('cmd_new', 'term_v2', 2, 'ls', 'connection_lost', 'now')",
+             VALUES ('cmd_cl', 'term_cl', 1, 'sleep 60', 'connection_lost', 'now')",
             [],
         )
-        .expect("迁移后 connection_lost 必须可写");
-
-        // 迁移不能丢旧数据：先前那条 completed 记录要还在。
-        conn.execute(
-            "INSERT INTO commands (id, terminal_id, seq, command, status, created_at)
-             VALUES ('cmd_keep', 'term_v2', 3, 'pwd', 'completed', 'now')",
-            [],
-        )
-        .expect("写入保留记录");
-        let kept: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM commands WHERE status = 'completed'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(kept, 1, "迁移必须保留既有记录");
-
-        // 输出与 FTS 也必须活着：迁移里重建了表，容易把这两样一起弄丢。
-        conn.execute(
-            "INSERT INTO command_outputs (command_id, output) VALUES ('cmd_keep', 'hello-fts')",
-            [],
-        )
-        .expect("分离表输出应可写");
-        let hit: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM commands_fts WHERE commands_fts MATCH 'pwd'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(hit, 1, "迁移后 FTS 必须仍能搜到命令");
-        let hit2: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM command_outputs_fts WHERE command_outputs_fts MATCH 'hello'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(hit2, 1, "迁移后输出的 FTS 必须仍可用");
+        .expect("建表语句必须认这个新状态");
     }
 
     #[test]
