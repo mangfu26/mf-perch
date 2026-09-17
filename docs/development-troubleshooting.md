@@ -297,6 +297,54 @@ cmd /c "echo boom 1>&2" 2>&1 | Select-Object -Last 2
 
 ---
 
+## `Copy-Item` 还原文件后，测试仍在跑**旧实现**（mtime 被一起复制）
+
+### 现象
+
+做安全属性的差分验证时：先备份文件 → 临时改成错误实现 → 跑测试（红灯，符合预期）→
+`Copy-Item` 还原正确实现 → 再跑，**仍然是红灯**，而且失败信息与错误实现时**一字不差**。
+看起来像"修复没生效"，很容易误判成"我的实现不对"。
+
+### 原因
+
+`Copy-Item` 默认**连同原始时间戳一起复制**，于是还原后的文件 mtime 等于备份时的时间
+（早于构建产物）→ cargo 判定"源文件没比产物新"→ **根本不重新编译**，
+跑的还是那份带有错误实现的旧二进制。
+
+判据很硬：出问题的那次 `cargo test` 输出里**没有 `Compiling mf-perch`**。
+实测（2026-09-16，主机密钥错误码的差分验证）：
+
+```
+# 还原后直接跑：没有 Compiling，测试仍按错误实现失败
+test result: FAILED. 57 passed; 1 failed ... 实际错误：SshConnect(...)
+# 刷新 mtime 后再跑：出现 Compiling，随即全绿
+cargo :    Compiling mf-perch v0.1.0 (D:\projects\mf-perch\src-tauri)
+test result: ok. 58 passed; 0 failed
+```
+
+### 解决办法
+
+还原文件后**强制让 cargo 重新编译**，二选一：
+
+```powershell
+# ① 文档推荐的做法：作废候选产物
+cargo clean -p mf-perch
+
+# ② 或只刷新 mtime（省一次全量重编）
+(Get-Item src-tauri\src\ssh\auth.rs).LastWriteTime = Get-Date
+```
+
+然后**确认这次运行打印了 `Compiling mf-perch`** 再下结论。
+
+### 预防
+
+- **备份 / 还原源码一律记着这条**：`git stash`、`git checkout -- <file>` 会正确更新 mtime，
+  但 `Copy-Item` / 资源管理器复制**不会**；
+- 差分验证的结论必须建立在"这次确实重编了"之上——否则"红灯"证明不了任何事；
+- 这与"退出码 1"那条相反：那条是**看错信号**，这条是**跑错二进制**，都先查证据再改代码。
+
+---
+
 ## `pnpm add` 报 `ERR_PNPM_UNEXPECTED_STORE`：装新依赖会重链全部依赖
 
 ### 现象
