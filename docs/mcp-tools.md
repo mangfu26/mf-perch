@@ -240,8 +240,9 @@
 
 | 字段 | 类型 | 说明 |
 | ---- | ---- | ---- |
-| `command_id` | string | 命令历史 ID（人类审计用；**不可轮询**，见下） |
-| `exit_code` / `duration_ms` | number | 退出码与耗时 |
+| `command_id` | string | 命令历史 ID（人类审计用；**无需轮询**——调用返回时命令已结束，见下） |
+| `exit_code` | number \| null | 退出码；没拿到（如提权通道在结束标记到达前断开）时为 `null` |
+| `duration_ms` | number | 耗时（毫秒；提权命令没有"仍在跑"的返回态，因此恒有值） |
 | `output` | string | 命令输出（**不含**应用内部的身份核实行） |
 | `truncated` | boolean | 输出是否因上限被截断 |
 | `actual_uid` | number \| null | 远端核实到的**实际** uid；正常情况下为 `0` |
@@ -254,8 +255,10 @@
 
 **与 `run_command` 的三处刻意差异**
 
-1. **没有异步模式，也没有轮询**：一次调用 = 建立特权通道 → 切目录 → 执行 → 收通道。
-   `command_id` 只用于人类审计，**不要**拿它去 `get_command_status`。
+1. **没有异步模式，也不需要轮询**：一次调用 = 建立特权通道 → 切目录 → 执行 → 收通道，
+   **调用返回时命令已结束**。提权命令与普通命令写的是**同一张命令表**，因此拿 `command_id`
+   去 `get_command_status` 也能查到（例外只有两处：终端归档后按 §3.6 的 V3 不再可见；
+   超时放弃等待那一次见下表）——正常用法里不需要这一步。
 2. **没有"root 模式"**：不存在"进入 root 再退出"的会话态，因此不存在"忘记退出、
    后续命令继续以 root 执行"的风险；每条命令各自提权一次。
 3. **环境按 sudo 语义重置**（`env_reset`）：不继承数据面的环境变量，
@@ -281,9 +284,15 @@
 | 无法确定数据面当前目录 | `sudo_elevation_failed` | 显式传 `cwd` 后重试 |
 | 提权命令超过 30 秒未结束 | `sudo_elevation_failed` | 命令可能仍在远端执行；先查历史再决定是否重试 |
 | 终端已归档 | `terminal_archived` | 另建终端 |
+| 该终端在途命令数已达上限 | `command_queue_full` | 等现有命令结束，或改用别的终端——提权命令与普通命令**共用**该终端的串行队列，不能用它绕开上限 |
 
 > **`requiretty` 主机不支持提权**，这是 D47 的明确取舍（不做 PTY 回退，理由见决策记录）。
 > 报错文案会引导人类走免密路径（`NOPASSWD` 白名单 / `pam_ssh_agent_auth`）。
+
+> **上表不是全集**：同一路径还可能返回 `terminal_not_found`（`terminal_id` 不存在）、
+> `terminal_broken`（会话无法建立，通常是主机不可达）、`host_not_found` /
+> `credential_not_found`（主机或凭据已被删除）、`credential_undecryptable`（密钥/主密码问题）
+> 等，语义与 §3.4 / §4 的错误码表一致。
 
 ### 3.8 `archive_terminal`
 
@@ -361,4 +370,5 @@ npx -y @modelcontextprotocol/inspector --cli \
 
 > 本文 §3 的**入参 schema 即由该方式导出**（不是手抄代码）；改完工具定义后请重新导出比对。
 > 输出结构（§3 的"输出"表）来自 Rust 类型定义：`mcp/tools.rs` 的返回结构、
-> `terminal::RunOutcome`、`domain::command::CommandStatusView`、`error::AppError::code`。
+> `terminal::RunOutcome`、`terminal::PrivilegedOutcome`（§3.7）、
+> `domain::command::CommandStatusView`、`error::AppError::code`。

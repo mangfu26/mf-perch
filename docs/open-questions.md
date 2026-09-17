@@ -68,7 +68,7 @@
 | Q33 | sudo 提权：三模式设计是否采纳？进 MVP 还是二期？ | 采纳三模式设计，**一期全部实现** | 已答 |
 | Q34 | 更新版本信息的来源（GitHub Releases API / Gist / 可配置 JSON） | 客户选 **Gist**；源地址可配置 | 已答 |
 | Q35 | 视觉主题风格 | 暗色 Deep Space + 亮色 Minimal Light，令牌驱动 | 已答 |
-| Q36 | `ask` 模式下 sudo 密码被拒后 sudo 会自动重试（默认 3 次），是否合并为"一次询问" | **合并**：同一命令内记住拒绝结果，重试不再打扰用户（见 [`decisions.md`](decisions.md) **D44**） | 已答 |
+| Q36 | `ask` 模式下 sudo 密码被拒后 sudo 会自动重试（默认 3 次），是否合并为"一次询问" | **成因已消失**：提权改为 `run_as_root` 单命令形态后一次调用只问一次，"已拒绝"的记忆机制已随 **D49** 删除（见 [`decisions.md`](decisions.md) D49） | 已答 |
 
 ---
 
@@ -193,22 +193,34 @@
 ### Q33 — sudo 提权三模式
 
 - 客户答复：**采纳三模式设计，一期（MVP）全部实现**。
-- 结论（详见 [`docs/design/sudo.md`](design/sudo.md)）：
-  - 每主机可配策略：`deny`（默认）/ `ask` / `auto`。
-  - 透明拦截：包装脚本中定义并 `export -f sudo() { command sudo -A -p '' "$@"; }`。
-  - 密码投递：askpass 脚本 + 远端 FIFO（`~/.mf-perch/sudopw.fifo`），应用经独立 SSH channel 写入；**不落盘、不进环境变量**。
-  - `ask` 模式经系统通知征求用户同意；拒绝或 60 秒超时都向该次索要的 FIFO **写入空密码**让 sudo 认证失败（不是关闭 FIFO——理由见 [`docs/design/sudo.md`](design/sudo.md) §7.3）。
-  - fail-closed：未被拦截的 sudo 调用一律失败，不静默提权。
-  - 会话建立时先探测 `sudo -n true`，已配免密 sudo 则无需注入。
+- 结论（**现行做法**详见 [`docs/design/sudo.md`](design/sudo.md) §0 与
+  [`docs/decisions.md`](decisions.md) **D47 / D48 / D49**）：
+  - 每主机可配策略：`deny`（默认）/ `ask` / `auto`；三模式含义**收敛为"是否允许 Agent 提权"**
+    （原文措辞"sudo 密码注入"已不适用——数据面已无任何密码来源）。
+  - **双通道**：普通命令走**数据面**（常驻会话、无 TTY、协议不变）；提权由应用**自建一条短命通道**
+    以 `sudo -S` 执行同一套包装脚本，密码只写进**该通道的 stdin**，且每条通道最多写一次
+    （自有提示标记握手，不依赖 sudo 的文案）。
+  - 数据面上的 `sudo` 被 **shell 垫片明确拒绝**：非 0 返回 + 一句可操作说明（允许提权时指引改用
+    `run_as_root`，`deny` 时说明该主机已禁用提权）。**透明拦截 `sudo -A`、askpass 脚本、
+    远端 FIFO 投递、会话建立时的 `sudo -n` 免密探测，均已随 D47 / D49 移除。**
+  - Agent 接口：MCP 工具 `run_as_root(command, cwd=None)`——单命令形态，没有"root 模式"；
+    `cwd` 不传则继承数据面当前目录（提权前按需探测一次，探测不写命令历史，D48）。
+  - `ask` 模式经系统通知征求用户同意；拒绝 / 超时 / 通道不可用一律 **fail-closed**
+    （不投递密码、不提权，审计备注区分这三种经过）。
+  - `requiretty` 主机**不支持提权**（D47 定稿不做 PTY 回退）：明确报错并引导人类移除该选项或配置免密路径。
 
 ### Q36 — ask 模式下的重复询问
 
 - 客户答复：**同意建议——同一命令拒绝一次即对该命令的全部重试生效，只弹一次窗**。
-- 结论（详见 [`docs/decisions.md`](decisions.md) **D44**）：
-  - 记忆的范围是**当前命令**：拒绝一经给出，该命令后续的 sudo 索要自动沿用拒绝，不再弹窗、不再发通知；
-  - **下一条命令重新询问**——它不是"该终端禁止提权"；
-  - 除「允许」外（拒绝 / 超时 / 询问通道不可用）都记住，避免同一条命令里反复打扰；
-  - 审计备注区分"当场拒绝"与"自动沿用"，人类事后核对时能看出自己只被问过一次。
+- 结论（**该机制已删除**，详见 [`docs/decisions.md`](decisions.md) **D49** 与 D44 条末的取代说明）：
+  - 当初要做这件事，是因为旧投递机制下会连环询问："拒绝 → 空密码 → sudo 重试 → 再次索要"。
+  - **成因已随 D47 / D49 消失**：现行提权是 `run_as_root` 的**单命令形态**——一次调用只提权一次，
+    也就只问一次，因此**不再需要**"已拒绝"的记忆状态。
+  - 随之删除的实现面：`AskOutcome` 的 `should_remember()` 与 `DeniedByMemo` 变体、
+    `ActiveCommand::sudo_denied` / `denial_is_remembered` / `remember_denial`，
+    以及 e2e `tests/sudo_e2e.rs::deny_is_asked_only_once_per_command`。
+  - 现行 `AskOutcome` 只剩 4 个变体（`Allowed` / `Denied` / `TimedOut` / `Unavailable`），
+    每种各有自己的审计备注——人类事后仍能分辨"当场拒绝""没人应答""询问通道不可用"。
 
 ### Q10 — SSH 私钥导入
 

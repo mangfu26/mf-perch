@@ -39,18 +39,20 @@
 
 ## 3. 建议的工具集合
 
-三个 MCP 工具，底层共用同一套异步执行引擎：
+命令执行相关的 MCP 工具共 **4 个**（工具总数 **8 个**，完整清单见 [`docs/mcp-tools.md`](../mcp-tools.md) §2）。其中前三个共用**同一套异步执行引擎**；D47 新增的 `run_as_root` **不共用**——它没有异步模式、没有轮询。
 
 | 工具 | 入参 | 返回 | 说明 |
 | ---- | ---- | ---- | ---- |
 | `run_command` | `terminal_id`, `command`, `wait_seconds?` | 完成：`status=completed`、`exit_code`、`output`、`duration_ms`；超时：`status=running`、`command_id`、部分输出 | 同步模式，默认等待 30 秒（可配置，上限 50 秒） |
 | `run_command_async` | `terminal_id`, `command` | `status=running`、`command_id` | 异步模式，立即返回；等价于 `wait_seconds=0` |
-| `get_command_status` | `command_id`, `include_output?`, `tail_lines?` | `status`（running/completed/failed）、`exit_code`、`duration_ms`、部分或完整输出 | 轮询用，对两种模式发起的命令都有效 |
+| `get_command_status` | `command_id`, `tail_lines?` | `status`（queued/running/completed/failed）、`exit_code`、`duration_ms`、部分或完整输出 | 轮询用，对两种模式发起的命令都有效 |
+| `run_as_root` | `terminal_id`, `command`, `cwd?` | 独立结构 `PrivilegedOutcome`：`command_id`、`exit_code`、`duration_ms`、`output`、`truncated`、`actual_uid`、`actual_user` | 以**特权身份**执行一条命令（D47），走应用自建的短命特权通道；**没有异步、没有轮询** |
 
 补充说明：
 
 - `run_command_async` 在实现上等价于同步工具等待 0 秒，**不重复实现执行逻辑**。
 - 同步与异步发起的命令拥有相同的 `command_id` 语义，`get_command_status` 统一处理。
+- **`run_as_root` 与上述三个工具不同源**（D47）：它**不走异步执行引擎**——不返回 `status` / `still_running`，返回的是独立结构 `PrivilegedOutcome`（`src-tauri/src/terminal/mod.rs`），其 `command_id` 只用于人类审计，**不要**拿它去 `get_command_status`（契约上不提供轮询，见 [`docs/mcp-tools.md`](../mcp-tools.md) §3.7）。等待上限沿用同步等待设置，超时**不中断**远端命令而是明确报错；命令历史里带 `[特权用户(uid=0)]` 前缀，实际 uid 由远端核实后经 `actual_uid` 如实回报。
 - 工具描述（description）中明确提示：**预期耗时超过 30 秒的命令请使用异步模式**，给模型提供判断依据。
 
 ## 4. 必须明确的并发语义：同一终端串行
@@ -100,7 +102,7 @@
 | **A. 排队**（建议） | 命令进入队列，等待前一条结束后自动执行；同步调用超时后返回 `status=queued` + `command_id` | 与人类在 shell 里连续敲命令的直觉一致；Agent 不会因为"终端忙"而失败 | 队列需要上限（建议 10 条），超出则拒绝，防止无限堆积 |
 | B. 拒绝 | 立即返回错误 `terminal busy`，Agent 需自行换终端或稍后重试 | 行为更显式 | Agent 需处理错误分支，且容易误判为命令执行失败 |
 
-状态取值相应扩展：`queued`（排队中）、`running`（执行中）、`completed`（已完成）、`failed`（执行出错）、`broken`（终端连接断开）。
+状态取值相应扩展：`queued`（排队中）、`running`（执行中）、`completed`（已完成）、`failed`（执行出错）——命令状态**只有这四个**（`CommandStatus`，见 `src-tauri/src/domain/command.rs`）。`broken` 是**终端**状态，不是命令状态（`TerminalStatus`，见 `src-tauri/src/domain/terminal.rs`）：会话断开时标记为 `broken` 的是终端本身；其遗留的未完成命令在终端归档或应用重启时由 `fail_pending_for_terminal` / `fail_all_pending_on_startup` 收尾为 `failed`（`src-tauri/src/store/commands.rs`）。
 
 跨终端当然可以并行。
 
@@ -112,8 +114,8 @@
 
 ## 6. 已确认结论（Q4，2026-09-09）
 
-1. **采纳**双模式：`run_command`（同步）+ `run_command_async`（异步）+ `get_command_status`（轮询）。
+1. **采纳**双模式：`run_command`（同步）+ `run_command_async`（异步）+ `get_command_status`（轮询）。三者共用同一套异步执行引擎（D47 之后另有提权工具 `run_as_root`，见 §3——它不共用该引擎）。
 2. **采纳**同步超时降级为异步：超时返回 `command_id` + `status: running`，不报错、不中断远端命令。
 3. 同步默认等待 **30 秒**、上限 **50 秒**，客户确认可以。
 4. **同一终端串行**已接受；终端忙时采用 **A. 排队**，队列上限建议 10 条，超出则拒绝。
-5. 状态取值：`queued` / `running` / `completed` / `failed` / `broken`。
+5. 状态取值：`queued` / `running` / `completed` / `failed`（**不含 `broken`**——那是终端状态，不是命令状态；终端遗留的未完成命令在归档 / 应用重启时收尾为 `failed`）。

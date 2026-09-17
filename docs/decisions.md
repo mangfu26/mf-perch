@@ -67,6 +67,17 @@
   5. READY 标记之前的输出一律丢弃。
 - **背景**：客户询问是否会加载目标主机环境变量。默认（非登录 shell + `--noprofile --norc`）不会加载用户自定义 PATH，会导致 Agent 找不到 `node`/`conda`/`docker` 等命令，与人类 SSH 登录体验不一致。
 - **影响**：以登录 shell 启动可能受 profile 内容影响（欢迎语、耗时脚本），通过"丢弃 READY 前输出"与"可切干净模式"来控制风险。
+- **落实情况（2026-09-16 收网补记）**：第 1 点的登录 shell **曾经没有真正落地**——
+  `protocol::shell_invocation` 这对参数当时**没有任何调用方**，数据面把包装脚本原样交给
+  `channel.exec`，等价于 `bash -s`（**既不是**登录 shell 也不是显式干净模式），
+  于是设置页里"环境加载方式"这个用户可见的开关完全没有效果。
+  **现已接上**：新增 `protocol::wrapper_launch_command`（把脚本作为 `-c` 的**单个参数**
+  传入并做单引号转义，脚本内容与 NUL 分帧协议都不受影响），由
+  `src-tauri/src/ssh/session.rs` 用于数据面启动——登录模式 `bash -l -c '<脚本>'`、
+  干净模式 `bash --noprofile --norc -c '<脚本>'`。**提权通道刻意不加登录层**：
+  那条通道上 `sudo` 的 `env_reset` 会重置 PATH，包了等于没包，只会多一层难排查的嵌套。
+  回归用例 `tests/sudo_e2e.rs::shell_env_mode_actually_changes_the_remote_environment`
+  以"只有 profile 才会有的目录"为判据，**双向**断言（登录必须有、干净必须无）。
 
 ---
 
@@ -81,7 +92,8 @@
 - **背景**：客户提出同步/异步双模式，由 Agent 自行判断耗时选择。架构师评估认为 LLM 对耗时的预判不可靠（`apt-get update`、`npm install`、`docker build` 等耗时依赖网络与负载），若同步超时直接报错，Agent 可能重试导致命令重复执行；故引入"超时降级"使方案正确性不依赖模型判断准确率。
 - **影响**：
   - 三个工具共用同一套异步执行引擎，`run_command_async` 等价于等待 0 秒。
-  - 状态机：`queued` / `running` / `completed` / `failed` / `broken`。
+  - 状态机：`queued` / `running` / `completed` / `failed`（`broken` 是**终端**状态，
+    见 `domain/terminal.rs`，不属于命令状态机）。
   - 并行需创建多终端；每主机终端上限（Q11）成为并行能力的实际约束。
   - 输出需设上限并在截断时标注，避免撑爆 MCP 上下文。
 
@@ -219,6 +231,11 @@
 
 - **日期**：2026-09-09
 - **决策**：前端采用 **Vue 3**（`<script setup>` + Composition API）+ **TypeScript** + **Vite** + **Tailwind CSS** + **shadcn-vue** + **Pinia** + **Vue Router** + **xterm.js** + **lucide-vue-next**。
+  > **落实情况（2026-09-16 收网补记）**：其余各项均已采用；**xterm.js 未采用**——
+  > 它只声明在 `package.json` 里、全仓库零 import，命令输出实际用 `<pre>` 只读渲染
+  > （人类侧是审计视图，不需要终端模拟）。依赖保留不删，二期若真需要终端渲染再评估
+  > （见 `docs/design/frontend-stack.md` §2）。
+  > 另：实现中补用了 **`vue-i18n`**（D18 的 i18n 结构要求）。
 - **背景**：团队初版建议 React + shadcn/ui；客户表示更熟悉 Vue。架构师评估后建议采纳客户倾向——本项目由客户长期维护，技术栈熟悉度直接降低长期风险；Vue 3 生态对本项目需求完全够用，Tauri 官方支持 Vue 模板，终端渲染 xterm.js 框架无关。
 - **影响**：
   - 组件库使用 shadcn-vue（源码可控、可深度定制），不使用 Naive UI / Element Plus。
@@ -449,8 +466,10 @@
     仅参与 schema 生成，不改变 `Option<T>` 字段的序列化与反序列化行为。
   - 字段类型保持 `Option<T>` 且必须同时保留 `#[serde(default)]`，否则会变为必填。
   - 新增回归测试：`tool_schemas_do_not_use_array_type`、`tool_schemas_have_no_refs_or_defs`、
-    `optional_params_use_anyof_with_null`、`optional_params_accept_absent_and_null`，
-    并在 MCP e2e 中通过真实 HTTP `tools/list` 再次校验。
+    `optional_params_use_anyof_with_null`、`optional_params_accept_absent_and_null`。
+    schema 的**内容**契约由 `src/mcp/tools.rs` 的单测在进程内守住（那里能遍历
+    `tool_router()` 的全部工具）；MCP e2e 中重复的内容断言**已删**，那里只保留
+    端到端事实：经真实 HTTP `tools/list` 取回的每个工具 `inputSchema.type` 为 `"object"`。
   - 后续新增带可选参数的工具时，凡 `Option<T>` 字段都需加 `#[schemars(with = "Nullable<T>")]`，
     否则会重新引入告警。
 
@@ -566,17 +585,27 @@
   - 取代 **D11 第 3 点**中"sudopw.fifo 单条会话级 FIFO"的表述（投递机制改为按索要配对）；
   - 取代 **D11 第 4 点**中"关闭 FIFO 使 sudo 失败"的表述（实际做法是向 FIFO 写空行，
     见 [`docs/design/sudo.md`](design/sudo.md) §7.3）；旧条目保留原文以便追溯。
-- **影响**：
+- **影响**（下列符号**均已随 D49 删除**，此处保留以记录当时的实现面）：
   - `ssh::protocol`：`askpass_script`、`sudo_fifo_name(nonce, token)`、
     `is_valid_sudo_token`、`session_setup_script`、`session_cleanup_script`；
     `SessionEvent::SudoRequest` 携带 `token`。
   - `ssh::session`：`send_sudo_password(token, ..)` / `deny_sudo(token)`。
   - 会话清理按 nonce 前缀清扫 FIFO（`-type p`），不影响其它会话。
-  - 新增 e2e 回归 `concurrent_sudo_requests_do_not_cross_route`。已验证其在
-    "临时降级回共用 FIFO"时**失败**、恢复后通过——满足 P3 对能区分对错实现的要求。
+  - 新增 e2e 回归 `concurrent_sudo_requests_do_not_cross_route`
+    （**该用例已随 D49 删除**）。已验证其在"临时降级回共用 FIFO"时**失败**、
+    恢复后通过——满足 P3 对能区分对错实现的要求。
 - **相关**：D11（sudo 三模式）、D33（协议标记按 id 配对，同一思路）。
-- **已知待办**：sudo 密码错误会重试（默认 3 次），`ask` 模式下用户可能看到多次
-  确认；合并为一次询问属体验优化，尚未实施。
+- **已知待办（已随 D49 失效）**：sudo 密码错误会重试（默认 3 次），`ask` 模式下
+  用户可能看到多次确认。D44 曾把"合并为一次询问"实施为"同一命令的拒绝只问一次"，
+  该记忆机制随后被 D49 整体移除。**现行机制**：每条提权通道
+  **最多写一次密码**（`protocol::SudoAuthHandshake`）——看到提示标记才写一次，
+  第二次出现提示即判定上一次的密码未被接受，直接报"sudo 未接受该密码"，
+  不再重试（`ssh/session.rs`）。见 D47 的协议要求 2 与 D49。
+
+> **取代关系（D49，2026-09-16）**：本条描述的 askpass 脚本 + 按索要配对 FIFO 的
+> 密码投递机制**已被 D49 整体移除**（远端不再产生任何本应用的文件，
+> `$HOME/.mf-perch` 的清理逻辑一并删除）。提权改由 D47 的**双通道**承担，
+> 数据面上的 `sudo` 由 D49 明确拒绝。
 
 ---
 
@@ -602,8 +631,13 @@
 - **影响**：
   - `src-tauri/src/mcp/server.rs`：新增 `SESSION_IDLE_TIMEOUT` 与
     `session_manager()`；`StreamableHttpService` 不再用 `default()`。
-  - 新增单测：rmcp 默认值是 300 秒（记录被绕开的坑）、我们的管理器不继承该默认值、
-    超时不得短于 1 小时。
+  - 新增单测：`session_manager_does_not_inherit_rmcp_default_idle_timeout`
+    （断言**我们的**值不等于 rmcp 的 300 秒默认值）、
+    `session_idle_timeout_is_long_enough_for_human_pauses`（超时不得短于 1 小时）。
+    原先那条"断言 rmcp 默认值就是 300 秒"的用例
+    （`rmcp_default_idle_timeout_is_the_five_minute_trap`）**已删**：它断言的是
+    第三方库的内部常量，失败不指向用户问题；这个"坑"改由本条与
+    `src/mcp/server.rs` 的生产注释记录，注释里明确"刻意**不**断言 rmcp 的默认值本身"。
   - 新增 e2e：`expired_session_is_reported_as_not_found`（把超时压到 1 秒，
     秒级复现"会话不存在"，即客户看到的现象）；
     `mcp_session_survives_idle_longer_than_rmcp_default`（生产配置下空闲
@@ -815,31 +849,42 @@
 - **只传播「拒绝」，不传播「允许」**（安全方向，明确取舍）：
   若把"允许"也记住，则同一命令里的 `sudo a && sudo b` 会在人类只批准 `a` 的情况下
   自动放行 `b`——那是把一次授权放大成整条命令的授权。因此错误密码导致的
-  重试仍会再次询问（该情形下 sudo 也会重试 3 次）。"允许不被记住"由单测
-  `only_allow_may_escalate_and_every_other_outcome_is_remembered` 守住。
+  重试仍会再次询问（该情形下 sudo 也会重试 3 次）。当时这条不变式由单测守住，
+  该用例现存名为 `only_allow_may_escalate`（断言"只有「允许」会提权、其余一律
+  fail-closed"）——"是否要被记住"这一层已随 D49 一并消失，见本条末尾的取代关系。
 - **顺带修正的审计不准确**：原先 `(Ask, None)` 分支写死"等待确认超时"，
   但超时实际上被映射成 `Some(Deny)`，因此命令历史把"超时"记成了"用户已拒绝"。
-  现引入 `AskOutcome`（`Allowed` / `Denied` / `TimedOut` / `Unavailable` /
-  `DeniedByMemo`），五种来源各有各的审计备注，人类事后核对时能唯一对应经过
-  （单测 `audit_notes_distinguish_every_ask_outcome` 断言五者两两不同）。
+  现引入 `AskOutcome`（当时含 `Allowed` / `Denied` / `TimedOut` / `Unavailable` /
+  `DeniedByMemo` 五种来源），每种来源各有各的审计备注，人类事后核对时能唯一对应经过
+  （单测 `audit_notes_distinguish_every_outcome` 断言各来源两两不同；
+  `DeniedByMemo` 已随 D49 删除，现存 4 个变体）。
 - **范围取舍（明确接受）**：记忆按**命令**而非按"某一次 sudo 调用"。
   因此同一条命令里的 `sudo a && sudo b`，拒绝 `a` 之后 `b` 也会被自动拒绝
   （人类若确想放行，重跑该命令即会重新询问）。按单次 sudo 调用分组需要
   额外把"重试"与"新调用"区分开（如按 sudo 父进程 PID 分组），
   协议与状态复杂度都会上升，而安全性上命令级记忆只会**更保守**，故不采用。
 - **影响**：
-  - `terminal/sudo.rs`：新增 `AskOutcome` 及其 `decision()` / `should_remember()` /
-    `audit_note()`，新增 2 项单测；
-  - `terminal/mod.rs`：`ActiveCommand::sudo_denied`、`ask_human` /
-    `denial_is_remembered` / `remember_denial`；
+  - `terminal/sudo.rs`：新增 `AskOutcome` 及其 `decision()` / `audit_note()`，
+    另有 `should_remember()`（**已随 D49 删除**），新增 2 项单测；
+  - `terminal/mod.rs`：`ask_human`；当时另有 `ActiveCommand::sudo_denied` /
+    `denial_is_remembered` / `remember_denial`（三者**均已随 D49 删除**）；
   - `tests/sudo_e2e.rs`：新增真实环境回归 `deny_is_asked_only_once_per_command`
-    （断言拒绝后人类只被问 1 次，且**下一条命令重新询问**）；
+    （断言拒绝后人类只被问 1 次，且**下一条命令重新询问**；该用例**已随 D49 删除**，
+    `tests/sudo_e2e.rs` 文件仍在，现存用例覆盖数据面拒绝与 `run_as_root` 各路径）；
   - `docs/design/sudo.md` §7.10 由"尚未实施"改为已实施。
-- **未覆盖（诚实记录）**：超时路径的记忆只有单测覆盖（`should_remember`），
-  没有端到端——跑一次真实超时要等满 60 秒，代价大于收益；
-  拒绝路径的端到端已覆盖同一条代码路径。
+- **未覆盖（诚实记录）**：超时路径的记忆当时只有单测覆盖（`should_remember`，
+  **已随 D49 删除**），没有端到端——跑一次真实超时要等满 60 秒，代价大于收益；
+  拒绝路径的端到端曾覆盖同一条代码路径。
 - **相关**：Q33（三模式）、Q36（本决策）、D37（每请求独立 FIFO）、
   §7.10（拒绝触发重试的实测）。
+
+> **取代关系（D49，2026-09-16）**：本条描述的"同一命令的拒绝只问一次"记忆机制
+> **已被 D49 整体移除**——提权改为 `run_as_root` 单命令形态后，一次调用只提权一次、
+> 也就只问一次，不再需要"已拒绝"的记忆状态。随之删除的实现面：
+> `ActiveCommand::sudo_denied`、`denial_is_remembered`、`remember_denial`、
+> `AskOutcome` 的 `should_remember()` 与 `DeniedByMemo` 变体，
+> 以及 e2e `tests/sudo_e2e.rs::deny_is_asked_only_once_per_command`。
+> 现行机制见 D49（数据面 `sudo` 明确拒绝）与 D47（双通道）。
 
 ---
 
@@ -906,7 +951,7 @@
 ## D47 — sudo 提权改为「双通道」：密码走应用私有通道，不再经远端文件系统
 
 - **日期**：2026-09-15（2026-09-16 完成 PoC 验证并定稿）
-- **状态**：**方案定稿、PoC 已验证，正在实施**（本条记录设计结论、被否路线与实测证据）。
+- **状态**：**已实施**（R1–R4，2026-09-16；本条记录设计结论、被否路线与实测证据）。
 - **背景（要解决的问题）**：V2 / C1——`ask` / `auto` 模式下，提权密码须经 askpass + FIFO
   投递到远端，而 Agent 的命令与协议机制运行在**同一个 shell、同一个 UID**下，因此可以
   ①读出 nonce（shell 变量、askpass 文件名、导出的 `mfperch_askpass_path` 三条路径）

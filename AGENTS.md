@@ -193,7 +193,7 @@ Refs: #123
 ### 2.5 本项目约定
 
 - 描述与正文使用**中文**；
-- scope 建议与模块对应，推荐词表：`host`（SSH 主机）、`credential`（认证信息）、`terminal`（SSH 终端）、`mcp`（MCP Server）、`ui`（桌面界面）、`store`（持久化）、`ci`、`deps`、`docs`；
+- scope 建议与模块对应，推荐词表（按仓库历史提交的**实际用法**整理，2026-09-16 核对）：`host`（SSH 主机）、`ssh`（SSH 会话与协议）、`terminal`（SSH 终端）、`sudo`（提权）、`mcp`（MCP Server）、`ui`（桌面界面）、`settings`（设置）、`tray`（托盘）、`update`（版本检查）、`ci`（文档类改动用 `docs` 作 type，scope 仍写受影响模块，如 `docs(sudo)`）；
 - 涉及前后端契约的改动（如 Tauri IPC 命令签名、MCP 工具入参/返回结构），正文应说明两侧是否已同步。
 
 ### 2.6 提交前自检（安全红线）
@@ -324,7 +324,7 @@ Refs: #123
 | 项 | 状态 | 说明 |
 | ---- | ---- | ---- |
 | **ProxyJump** | ❌ **不在首发范围（D45）** | 原 D11 / Q9 曾承诺"MVP 含 ProxyJump"，**已由 D45 移出首发、列为未来新增功能**（客户评估：场景不高频、不急切）。当前只有数据管道字段（DB / 领域模型 / IPC），**前端无控件、连接层完全未使用**，无任何路径能让跳板机生效。半成品字段保留不删。对外**不得声称支持 ProxyJump**。见 [`docs/decisions.md`](docs/decisions.md) D45 |
-| **sudo 凭据边界（V2）** | ✅ **已根治（D47 / D48 / D49，2026-09-16）** | 提权改为**双通道**：普通命令走数据面（无 TTY、协议不变），提权由应用**自建的一条短命通道**以 `sudo -S` 投递（自有提示标记握手，每条通道最多写一次密码）。**数据面上的 `sudo` 被明确拒绝**（shell 垫片：非 0 返回 + 指引改用 `run_as_root`）；**旧的 askpass / FIFO 投递机制已整体移除**，远端不再产生任何本应用的文件（`$HOME/.mf-perch` 的清理逻辑随之删除）。新增 MCP 工具 `run_as_root(command, cwd=None)`（工具总数 7→8），cwd 自动继承（提权前在数据面**按需探测一次**当前目录，该探测不写命令历史，D48），环境按 sudo 语义重置；实际 uid 由远端核实并如实回报，非 0 时输出明确告警。三种模式含义收敛为"是否允许 Agent 经该工具提权"。**`requiretty` 主机不支持提权**（明确报错 + 引导免密；D47 定稿不做 PTY 回退）。**残余风险如实标注**：同 UID 理论上仍可经 `/proc/<pid>/fd/0` 尝试读取提权通道进程的 stdin，可行性取决于 `yama/ptrace_scope`（**未实测**），故对外表述用"提权密码不进入 Agent 的用户域"，不宣称"绝对不可读"。见 [`docs/decisions.md`](docs/decisions.md) **D47 / D48 / D49** |
+| **sudo 凭据边界（V2）** | ✅ **已根治（D47 / D48 / D49，2026-09-16）** | 提权改为**双通道**：普通命令走数据面（无 TTY、协议不变），提权由应用**自建的一条短命通道**以 `sudo -S` 投递（自有提示标记握手，每条通道最多写一次密码）。**数据面上的 `sudo` 被明确拒绝**（shell 垫片：非 0 返回 + 指引改用 `run_as_root`）；**旧的 askpass / FIFO 投递机制已整体移除**，远端不再产生任何本应用的文件（`$HOME/.mf-perch` 的清理逻辑随之删除）。新增 MCP 工具 `run_as_root(command, cwd=None)`（工具总数 7→8），cwd 自动继承（提权前在数据面**按需探测一次**当前目录，该探测不写命令历史，D48），环境按 sudo 语义重置；实际 uid 由远端核实并如实回报，非 0 时输出明确告警。三种模式含义收敛为"是否允许 Agent 经该工具提权"。**`requiretty` 主机不支持提权**（明确报错——两条提权失败文案都会点明常见原因是 `Defaults requiretty`，并给出两条出路：由人类移除该选项，或为该主机配置免密路径 `NOPASSWD` / `pam_ssh_agent_auth`；D47 定稿不做 PTY 回退）。**残余风险如实标注**：同 UID 理论上仍可经 `/proc/<pid>/fd/0` 尝试读取提权通道进程的 stdin，可行性取决于 `yama/ptrace_scope`（**未实测**），故对外表述用"提权密码不进入 Agent 的用户域"，不宣称"绝对不可读"。见 [`docs/decisions.md`](docs/decisions.md) **D47 / D48 / D49** |
 | **远程明文传输** | ⚠️ 已决策接受（D30） | 开启"允许远程连接"后 Token 与命令内容在网络中明文传输；局域网场景客户已接受，保留为未来工作 |
 | 未完成任务 | — | Q32（备份与同步需求，二期；Q29 提交身份邮箱已按 noreply 落地，2026-09-15） |
 
@@ -347,7 +347,7 @@ Refs: #123
 
 | 项 | 位置 | 说明 | 优先级 |
 | ---- | ---- | ---- | ---- |
-| 生成脚本文本断言 | `src/ssh/protocol.rs` | 对生成的 shell 脚本**源码**做子串/顺序断言（V1 明文落盘、`set +e` 与结束标记的先后、sudo 垫片的拒绝语义）。按 §5.2 判定：替代覆盖在 `#[ignore]` 后面、默认不跑，**不构成"已在别处覆盖"**，故不属于该删的重复；真正遗留的弱点是**脆**（改脚本文案可能失效）。**已决策：保留**（客户确认） | 已决 |
+| 生成脚本文本断言 | `src/ssh/protocol.rs` | 对生成的 shell 脚本**源码**做子串/顺序断言（`set +e` 与结束标记的先后、sudo 垫片的拒绝语义）。按 §5.2 判定：替代覆盖在 `#[ignore]` 后面、默认不跑，**不构成"已在别处覆盖"**，故不属于该删的重复；真正遗留的弱点是**脆**（改脚本文案可能失效）。**已决策：保留**（客户确认） | 已决 |
 
 **当前没有待决策的测试债。**
 
@@ -359,7 +359,7 @@ Refs: #123
 | `tests/ssh_integration.rs::session_is_not_confused_by_marker_like_output` ↔ `src/ssh/session.rs` 的 nonce 单测 | **不是重复**。单测喂的是合成输入，集成测试走真实 SSH 回显与真实输出交错 |
 | `src/ipc/tests.rs`、`src/mcp/tools.rs` 的 fixture ↔ `tests/common/mod.rs` | **无法合并**。`src/` 内的单元测试在生产 crate 内部，拿不到 `tests/` 的模块，只能各自保留 |
 
-**本轮已清偿**（保留记录，避免重复劳动）：集成测试 fixture 已收敛到 `tests/common/mod.rs`（`test_state` / `need_env` / `need_env_port`）；`src/sudo_bridge.rs` 全部用例改经 `register_pending` 登记，不再直接操作私有字段；`tests/mcp_e2e.rs` 的 `poll1` 改为精确四态断言；`tests/mcp_e2e.rs` 中与 `src/mcp/tools.rs` 重复的工具 schema **内容**断言已删（保留"经协议返回为对象形态"这一端到端事实）；`src/ssh/protocol.rs` 的真子集用例 `session_setup_only_cleans_regular_files_with_delete_flag` 已删——它被同文件 `session_setup_deletes_leave_no_window_for_plaintext` 严格覆盖（后者遍历**每一处** `-delete` 并额外断言删除早于本会话 askpass 写入，前者只看第一处），删除无覆盖损失；`src/mcp/server.rs` 的 `rmcp_default_idle_timeout_is_the_five_minute_trap` 已删——它断言的是第三方库的内部常量，失败不指向用户问题（§5.1 自检为「否」），知识已完整保存在 `docs/decisions.md` **D38** 与 `src/mcp/server.rs` 的生产注释中，而真不变式（我们的值不等于该默认值、且足够长）另有两条用例覆盖；相邻用例的注释已改为指向 D38，并说明为何刻意不再断言上游默认值；**前端测试基础设施已落地**（vitest 覆盖 `src/lib/` 纯逻辑，另有 `scripts/check-ipc-contract.mjs` 守住跨语言命令名契约），范围与边界见 §5.9。
+**本轮已清偿**（保留记录，避免重复劳动）：集成测试 fixture 已收敛到 `tests/common/mod.rs`（`test_state` / `need_env` / `need_env_port`）；`src/sudo_bridge.rs` 全部用例改经 `register_pending` 登记，不再直接操作私有字段；`tests/mcp_e2e.rs` 的 `poll1` 改为精确四态断言；`tests/mcp_e2e.rs` 中与 `src/mcp/tools.rs` 重复的工具 schema **内容**断言已删（保留"经协议返回为对象形态"这一端到端事实）；`src/ssh/protocol.rs` 的真子集用例 `session_setup_only_cleans_regular_files_with_delete_flag` 曾以"被同文件 `session_setup_deletes_leave_no_window_for_plaintext` 严格覆盖"为由删除（后者遍历**每一处** `-delete` 并额外断言删除早于本会话 askpass 写入，前者只看第一处）；**这两个用例现已随旧机制（D49）一并删除**——两者断言的都是 askpass / FIFO 清理的时序，而数据面已无密码落点，该"严格覆盖"关系与两条用例都不复存在（**不要再去代码里找它们**；现行不变式由 `wrapper_script_always_installs_reject_shim` 与 `reject_shim_refuses_and_guides_to_the_tool` 守住）；`src/mcp/server.rs` 的 `rmcp_default_idle_timeout_is_the_five_minute_trap` 已删——它断言的是第三方库的内部常量，失败不指向用户问题（§5.1 自检为「否」），知识已完整保存在 `docs/decisions.md` **D38** 与 `src/mcp/server.rs` 的生产注释中，而真不变式（我们的值不等于该默认值、且足够长）另有两条用例覆盖；相邻用例的注释已改为指向 D38，并说明为何刻意不再断言上游默认值；**前端测试基础设施已落地**（vitest 覆盖 `src/lib/` 纯逻辑，另有 `scripts/check-ipc-contract.mjs` 守住跨语言命令名契约），范围与边界见 §5.9。
 
 ---
 
@@ -504,7 +504,16 @@ Refs: #123
 cd src-tauri && cargo test -j 2
 
 # 真实环境端到端（需先导出 MFPERCH_TEST_*，见 docs/design/test-environment.md）
+# 每个文件是独立的 test target，按需选一个；--ignored 只跑该 target 下的 #[ignore] 用例
 cd src-tauri && cargo test --test ssh_integration -- --ignored --test-threads=1
+
+# 提权双通道的核心用例（13 条，含数据面拒绝 / 提权通道 / cwd 继承 / 身份核实）
+# 需要额外的 MFPERCH_TEST_SUDO_PW；mcp 是默认特性，无需再写 --features mcp
+cd src-tauri && cargo test --test sudo_e2e -- --ignored --test-threads=1
+
+# 一次跑完全部真实环境用例（22 条 #[ignore]：sudo_e2e 13 / ssh_integration 5 /
+# mcp_e2e 4，其中 mcp_e2e 有 1 条只等空闲超时、不需要 MFPERCH_TEST_*）
+cd src-tauri && cargo test -- --ignored --test-threads=1
 
 # 前端三道门禁（都不需要真实环境，与 §5.9 的分工一致）
 pnpm test        # src/lib 纯逻辑单测（vitest）

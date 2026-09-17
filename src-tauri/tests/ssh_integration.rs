@@ -12,7 +12,8 @@
 //! cargo test --test ssh_integration -- --ignored --test-threads=1
 //! ```
 //!
-//! 未设置环境变量时测试会跳过，避免在无环境的机器上失败。
+//! 前置条件不满足时测试**明确失败**（`need_env` 会 panic），不会静默跳过——
+//! 静默跳过会制造"绿灯假象"（AGENTS.md §5.6）。需要跳过时只能用 `#[ignore]` 表达。
 
 use std::time::Duration;
 

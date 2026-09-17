@@ -52,7 +52,7 @@
 | ---- | ---- |
 | 侧边导航 | 选中项用 `--accent-soft` 背景 + 高亮文字 |
 | 主机卡片 | 选中项描边 `--accent`；运行中显示绿点（暗色带辉光） |
-| 状态标签 | `exit 0` 绿 / 执行中 青 / `sudo 注入` 紫 / 异步 灰 |
+| 状态标签 | 命令状态四态：`completed` 绿 / `running` 青 / `queued` 灰 / `failed` 红（`src/views/TerminalDetailView.vue`、`src/views/TerminalsView.vue`）；提权**不用标签**表达，改由命令文本前缀 `[特权用户(uid=0)]` 表达（D48 方案 A） |
 | 命令时间线 | 每条命令一张卡片，命令行为等宽字体，输出区用 `--surface-code` |
 | 执行中指示 | 卡片顶部 2px 渐变进度条（暗色下循环扫动） |
 | 主按钮 | 暗色为紫渐变 + 辉光；亮色为纯靛蓝 + 浅阴影 |
@@ -61,6 +61,11 @@
 | 命令卡片 | 头部整行可点折叠 / 展开输出；默认收起；详情页与全局搜索**行为一致**（ChevronRight↔ChevronDown） |
 | 终端操作图标 | 归档 `Archive` / 删除 `Trash2` / **恢复归档 `RotateCcw`** / **重连 broken `Unplug`**——恢复与重连语义不同，图标必须区分；`RefreshCw` 专用于"刷新页面"，不复用于重连 |
 | 原生下拉 `<select>` | 弹层配色走 `--option-bg/--option-fg`（实色），根元素按主题设 `color-scheme`；见 §4.5 |
+
+> **早期设计稿里的 `sudo 注入` / 异步两个标签已不存在**：提权语义现由命令文本前缀
+> `[特权用户(uid=0)]` 表达（D48 方案 A，见 [`../mcp-tools.md`](../mcp-tools.md) §3.7）；
+> i18n 里配套的 `command.sudoInjected` / `sudoAsked` / `sudoDenied` / `async` 四个键
+> **已无任何引用**（属待清理的遗留），新界面不要照它们加标签。
 
 ### 4.1 弹窗（模态）的高度与滚动
 

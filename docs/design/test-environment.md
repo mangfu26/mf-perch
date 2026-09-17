@@ -28,7 +28,7 @@
 
 理由：
 
-1. **最贴近真实目标环境**：我们的设计依赖 bash 内建 `read -d`、`sudo -A`/`SUDO_ASKPASS`、登录 shell 环境加载——这些在真实 Linux 上才可靠验证。
+1. **最贴近真实目标环境**：现行设计依赖 bash 内建 `read -d`（NUL 分帧）、`sudo -S` 的**stdin 密码投递**与 sudo 的 `env_reset` 语义、以及登录 shell 的环境加载——后者即设置页的「环境加载方式」（`shell_env_mode`），**现已真正接在远端启动路径上**（`protocol::wrapper_launch_command`，D4），这些在真实 Linux 上才可靠验证。**注意**：早期的 `sudo -A` / `SUDO_ASKPASS` 依赖已随 D47 / D49 整体移除。
 2. **可测试 sudo 三模式**：WSL 里可创建普通用户并配置 sudo 密码，完整验证 `deny` / `ask` / `auto`。
 3. **可作为 SSH 服务端**：WSL 内安装 `openssh-server` 并启动，Windows 侧通过 `127.0.0.1:<port>` 连接，完整走真实 SSH 协议。
 4. 一次配置，后续自动化测试可复用。
@@ -100,21 +100,32 @@ wsl --install -d Ubuntu
 - `false` 的结束标记为 `rc=1` → 退出码正确回传 ✅
 - 每条命令均有带 nonce 的独立标记 → 输出边界清晰、防误判 ✅
 
-**④ sudo 免密探测（验证 Q33）**：
-- `mfperch`：`sudo -n true` 失败（`interactive authentication is required`）→ 需注入；
-- `mfperch-nopass`：`sudo -n id -u` 返回 `0` → 免密路径成立，无需注入。
+> **历史实测快照（2026-09-10）**：以下 ④⑤⑥ 三项验证的是**当时的**旧投递机制
+> （会话建立时 `sudo -n` 免密探测、`sudo -A` 无 askpass 即失败、askpass + FIFO 投递）。
+> 其中与**提权投递**相关的结论**已被 D47 / D49 取代**，不再代表现行实现；
+> 现行机制见 [`sudo.md`](sudo.md) §0 与 [`decisions.md`](../decisions.md) **D47 / D48 / D49**。
+> ④ 描述的环境事实仍然成立（可按下面的命令手工复现），但"应用在会话建立时探测"这一步已不存在。
 
-**⑤ fail-closed 验证（验证 Q33 模式一）**：`sudo -A -p ''` 无 askpass 时报
-`sudo: No askpass program specified in SUDO_ASKPASS`，退出码 1 → 天然拒绝提权。
+**④ 免密 sudo 的存在性（环境事实，现行仍可复现）**：
+- `mfperch`：`sudo -n true` 失败（`interactive authentication is required`）→ 该用户提权需要密码；
+- `mfperch-nopass`：`sudo -n id -u` 返回 `0` → 免密路径成立。
+- **现行差异**：应用**不再**在会话建立时做这项探测（`session_setup_script` 已随 D49 移除）；
+  数据面上的 `sudo` 一律被垫片拒绝，提权只经 `run_as_root` 的独立通道。
 
-**⑥ askpass + FIFO 密码投递（验证 Q33 模式二/三）**：实测发现并修复一个**设计缺陷**：
+**⑤ ~~fail-closed 验证~~（结论已被 D47 / D49 取代）**：
+- 旧：`sudo -A -p ''` 无 askpass 时报 `sudo: No askpass program specified in SUDO_ASKPASS`，退出码 1 → 天然拒绝提权。
+- 现：数据面包装脚本注入 `sudo` shell 垫片（`protocol::sudo_reject_shim`），**三种模式下都**非 0 返回 +
+  一句可操作说明（策略允许提权时指引改用 `run_as_root` 工具；`deny` 时说明该主机已禁用提权）。
+  现行验证：单测 `wrapper_script_always_installs_reject_shim` 与 `reject_shim_refuses_and_guides_to_the_tool`；
+  真实环境见 `src-tauri/tests/sudo_e2e.rs`。
 
-> **`sudo -A` 会把 askpass 程序的 stdout 第一行当作密码。**
-> 因此"请求标记"必须写到 **stderr**，密码才写 stdout。
-> 若标记误走 stdout，sudo 会把标记当密码，认证必然失败（实测报 `Authentication failed`）。
-> 修正后（标记 `>&2`）实测成功：stdout 返回 `root`，退出码 0。
-
-该修正已同步到 [`docs/design/sudo.md`](sudo.md) 第 3.3 与 6.2 节。
+**⑥ ~~askpass + FIFO 密码投递~~（机制已随 D47 / D49 整体移除）**：
+- 旧结论保留作教训：**`sudo -A` 会把 askpass 程序的 stdout 第一行当作密码**，因此"请求标记"必须写到
+  **stderr**，密码才写 stdout；标记误走 stdout 时 sudo 会把标记当密码，认证必然失败。
+  该修正当时同步到了 [`docs/design/sudo.md`](sudo.md) 第 3.3 与 6.2 节（那两节现属**历史记录**）。
+- 现：远端不部署 askpass、不建 FIFO、不设环境变量，**不产生任何本应用的文件**；密码只在提权通道
+  建立后写一次该通道的 stdin（`sudo -S -p '<自有提示标记>'` 握手，见 D47 的 PoC 与 `sudo.md` §0）。
+  上述 stdout / stderr 的坑随之不再适用。
 
 ### 5.3 后续可复用的验证清单
 
@@ -147,10 +158,18 @@ export MFPERCH_TEST_HOST=127.0.0.1
 export MFPERCH_TEST_PORT=2222
 export MFPERCH_TEST_USER=mfperch
 export MFPERCH_TEST_KEY=<测试私钥路径>
+# sudo_e2e 必需：缺失时按 AGENTS.md §5.6 直接失败（不静默跳过）
+export MFPERCH_TEST_SUDO_PW=<测试用户的 sudo 密码>
 # -j 2：避免默认并发耗尽 Windows 页面文件、把 target 产物写坏
 #       （现象与恢复见 ../development-troubleshooting.md）
 cargo test -j 2 --test ssh_integration -- --ignored --test-threads=1
 ```
+
+> 上面 5 个变量与 `src-tauri/tests/*.rs` 实际读取的一致（`sudo_e2e` / `mcp_e2e` 走 `common::need_env`，
+> `ssh_integration` 用同语义的本地 `need()`）——**缺失一律 `panic!`**，不静默跳过（AGENTS.md §5.6）。
+> 另有 2 个**可选**覆盖项，都有默认值，缺失不影响运行：`MFPERCH_TEST_SESSION_IDLE_SECS`
+> （`mcp_e2e` 的会话空闲超时）与 `MFPERCH_TEST_IDLE_SECS`（`mcp_e2e` 那条耗时用例的空闲时长）。
+> 真实环境用例的运行方式（含 `sudo_e2e` / 全部 `--ignored`）见 [`AGENTS.md`](../../AGENTS.md) §5.10。
 
 > 测试私钥位于 `.tmp-test/`（已被 `.gitignore` 排除，**绝不入库**）。
 
@@ -162,9 +181,9 @@ cargo test -j 2 --test ssh_integration -- --ignored --test-threads=1
 
 | 类别 | 规模 | 说明 |
 | ---- | ---- | ---- |
-| Rust 单测 | 254 项 | 生产文件内的 `#[cfg(test)]`，默认门禁 |
-| Rust 集成测试 | 25 项 | `mcp_e2e` 6 / `ssh_integration` 5 / `sudo_e2e` 7 / `update_e2e` 7 |
-| ↑ 其中需真实 SSH | 16 项 | 默认 `#[ignore]`（运行方式见 §5.4，环境准备见 §4） |
+| Rust 单测 | 240 项 | 生产文件内的 `#[cfg(test)]`（`src/` 内 `#[test]` 210 + `#[tokio::test]` 30），默认门禁 |
+| Rust 集成测试 | 31 项 | `mcp_e2e` 6 / `ssh_integration` 5 / `sudo_e2e` 13 / `update_e2e` 7 |
+| ↑ 其中 `#[ignore]`（默认门禁不跑） | 22 项 | `mcp_e2e` 4 / `ssh_integration` 5 / `sudo_e2e` 13；其中 **21 项需真实 SSH**，`mcp_e2e` 另 1 项是耗时的本地用例（空闲 310 秒）。`update_e2e` 7 项不依赖真实环境，默认就跑 |
 | 前端单测 | 21 项 | vitest，覆盖 `src/lib/` 纯逻辑 |
 | 前端契约检查 | 1 道 | `pnpm check:ipc`：命令名在 Rust 定义 / `generate_handler!` 注册 / 前端 `call()` 三处一致 |
 
