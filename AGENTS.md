@@ -262,7 +262,7 @@ Refs: #123
 | [`docs/design/terminal-session.md`](docs/design/terminal-session.md) | 终端会话模型（方案 C：常驻会话 + NUL 分帧 + 自打印标记） | 现行 |
 | [`docs/design/command-execution.md`](docs/design/command-execution.md) | 命令执行的同步 / 异步双模式与输出归属 | 现行 |
 | [`docs/design/credential-storage.md`](docs/design/credential-storage.md) | 凭据存储与字段级加密 | 现行 |
-| [`docs/design/sudo.md`](docs/design/sudo.md) | sudo 三模式（禁止注入 / 每次询问 / 自动注入） | 现行 |
+| [`docs/design/sudo.md`](docs/design/sudo.md) | 提权：双通道机制速览（现行）+ 旧的 askpass/FIFO 机制（历史记录） | 现行 |
 | [`docs/design/history-retention.md`](docs/design/history-retention.md) | 命令历史保留策略（按时间；归档永久保留） | 现行 |
 | [`docs/design/update-check.md`](docs/design/update-check.md) | 版本检查与提示更新流程 | 现行 |
 | [`docs/design/frontend-stack.md`](docs/design/frontend-stack.md) | 前端技术栈选型 | 现行 |
@@ -324,7 +324,7 @@ Refs: #123
 | 项 | 状态 | 说明 |
 | ---- | ---- | ---- |
 | **ProxyJump** | ❌ **不在首发范围（D45）** | 原 D11 / Q9 曾承诺"MVP 含 ProxyJump"，**已由 D45 移出首发、列为未来新增功能**（客户评估：场景不高频、不急切）。当前只有数据管道字段（DB / 领域模型 / IPC），**前端无控件、连接层完全未使用**，无任何路径能让跳板机生效。半成品字段保留不删。对外**不得声称支持 ProxyJump**。见 [`docs/decisions.md`](docs/decisions.md) D45 |
-| **sudo 凭据边界（V2）** | ✅ **已根治（D47 / D48，2026-09-16）** | 提权改为**双通道**：普通命令走数据面（无 TTY、协议不变），提权由应用**自建的一条短命通道**以 `sudo -S` 投递（自有提示标记握手，每条通道最多写一次密码），远端**不留 askpass / FIFO / 环境变量 / 二进制**。新增 MCP 工具 `run_as_root(command, cwd=None)`（工具总数 7→8），cwd 自动继承（经**应用内部命令**取数，D48），环境按 sudo 语义重置；实际 uid 由远端核实并如实回报，非 0 时输出明确告警。**`requiretty` 主机不支持提权**（明确报错 + 引导免密；D47 定稿不做 PTY 回退）。**残余风险如实标注**：同 UID 理论上仍可经 `/proc/<pid>/fd/0` 尝试读取提权通道进程的 stdin，可行性取决于 `yama/ptrace_scope`（**未实测**），故对外表述用"提权密码不进入 Agent 的用户域"，不宣称"绝对不可读"。见 [`docs/decisions.md`](docs/decisions.md) **D47 / D48** |
+| **sudo 凭据边界（V2）** | ✅ **已根治（D47 / D48 / D49，2026-09-16）** | 提权改为**双通道**：普通命令走数据面（无 TTY、协议不变），提权由应用**自建的一条短命通道**以 `sudo -S` 投递（自有提示标记握手，每条通道最多写一次密码）。**数据面上的 `sudo` 被明确拒绝**（shell 垫片：非 0 返回 + 指引改用 `run_as_root`）；**旧的 askpass / FIFO 投递机制已整体移除**，远端不再产生任何本应用的文件（`$HOME/.mf-perch` 的清理逻辑随之删除）。新增 MCP 工具 `run_as_root(command, cwd=None)`（工具总数 7→8），cwd 自动继承（经**应用内部命令**取数，D48），环境按 sudo 语义重置；实际 uid 由远端核实并如实回报，非 0 时输出明确告警。三种模式含义收敛为"是否允许 Agent 经该工具提权"。**`requiretty` 主机不支持提权**（明确报错 + 引导免密；D47 定稿不做 PTY 回退）。**残余风险如实标注**：同 UID 理论上仍可经 `/proc/<pid>/fd/0` 尝试读取提权通道进程的 stdin，可行性取决于 `yama/ptrace_scope`（**未实测**），故对外表述用"提权密码不进入 Agent 的用户域"，不宣称"绝对不可读"。见 [`docs/decisions.md`](docs/decisions.md) **D47 / D48 / D49** |
 | **远程明文传输** | ⚠️ 已决策接受（D30） | 开启"允许远程连接"后 Token 与命令内容在网络中明文传输；局域网场景客户已接受，保留为未来工作 |
 | 未完成任务 | — | Q32（备份与同步需求，二期；Q29 提交身份邮箱已按 noreply 落地，2026-09-15） |
 
@@ -347,7 +347,7 @@ Refs: #123
 
 | 项 | 位置 | 说明 | 优先级 |
 | ---- | ---- | ---- | ---- |
-| 生成脚本文本断言 15+ 条 | `src/ssh/protocol.rs` | 对生成的 shell 脚本**源码**做子串断言，由真实缺陷驱动（V1 明文落盘、askpass 标记必须走 stderr）。按 §5.2 判定：替代覆盖在 `#[ignore]` 后面、默认不跑，**不构成"已在别处覆盖"**，故不属于该删的重复；真正遗留的弱点是**脆**（改脚本文案可能失效）。**已决策：保留主体**（客户确认） | 已决 |
+| 生成脚本文本断言 | `src/ssh/protocol.rs` | 对生成的 shell 脚本**源码**做子串/顺序断言（V1 明文落盘、`set +e` 与结束标记的先后、sudo 垫片的拒绝语义）。按 §5.2 判定：替代覆盖在 `#[ignore]` 后面、默认不跑，**不构成"已在别处覆盖"**，故不属于该删的重复；真正遗留的弱点是**脆**（改脚本文案可能失效）。**已决策：保留**（客户确认） | 已决 |
 
 **当前没有待决策的测试债。**
 
