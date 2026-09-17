@@ -1087,3 +1087,62 @@ async fn run_as_root_does_not_clobber_a_concurrent_plain_command() {
 
     state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
 }
+
+/// **D47 R3 回归**：命令让 shell 进入 `set -e` 状态时，结束标记仍必须回来。
+///
+/// 背景（实测踩到的真缺陷）：包装脚本逐条 `eval` 命令，而 `set -e` 会**跨帧留在
+/// shell 状态里**。若打印结束标记前不显式 `set +e`，那么「先跑一条 `set -e`、
+/// 再跑一条失败的命令」会让远端 shell 当场退出，**第二帧的结束标记永远不来**——
+/// 应用侧只能干等到 30 秒超时，而远端其实早已返回。
+///
+/// 复现要点（**不能**把两件事写进同一条命令）：errexit 在 `eval` 整串结束后才生效，
+/// 所以同一帧里写 `set -e; <失败命令>` **不会**触发；必须**分成两帧**。
+///
+/// 判据刻意是**时间**：错误实现下也是"报错"，差别在于是立刻报错（127 带来结束标记）
+/// 还是等满超时才报错——这也正是该缺陷能潜伏到真实环境才暴露的原因。
+#[tokio::test]
+#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
+async fn run_as_root_returns_when_command_enables_set_e() {
+    let t = target();
+    let (state, key) = test_state();
+    let host_id = seed_host(&state, &key, &t, SudoPolicy::Auto).await;
+
+    let terminal = state
+        .terminals
+        .open_terminal(&state.db, &key, &host_id, None)
+        .await
+        .expect("终端应能建立");
+
+    // 第一帧：只打开 `set -e`（成功结束，把状态留在远端 shell 里）。
+    let ok = state
+        .terminals
+        .run_command(&state.db, &terminal.id, "set -e", Some(Duration::from_secs(20)))
+        .await
+        .expect("普通命令应能下发");
+    let (out, code) = collect(&state.terminals, &state.db, &ok.command_id).await;
+    assert_eq!(code, Some(0), "打开 set -e 的命令本身应成功：{out}");
+
+    // 第二帧：提权执行一条**必然失败**的命令——错误实现下远端 shell 直接退出。
+    let started = std::time::Instant::now();
+    let outcome = state
+        .terminals
+        .run_as_root(&state.db, &key, &terminal.id, "/nonexistent-binary-d47", None)
+        .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "命令让 shell 进入 set -e 后，结束标记仍必须回来（耗时 {elapsed:?} 说明脚本吞掉了标记、\
+         应用侧在等满 30 秒超时）：{outcome:?}"
+    );
+
+    let outcome = outcome.expect("结束标记回来后应正常返回结果（失败体现在退出码上）");
+    assert_ne!(
+        outcome.exit_code,
+        Some(0),
+        "不存在的命令应返回非 0 退出码：{}",
+        outcome.output
+    );
+
+    state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
+}

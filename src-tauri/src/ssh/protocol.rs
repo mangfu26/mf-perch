@@ -123,12 +123,16 @@ while IFS= read -r -d '' mfperch_frame; do
   mfperch_cmd=${{mfperch_frame#*$'\n'}}
   eval "$mfperch_cmd" < /dev/null
   mfperch_rc=$?
-  # `set -e` 会留在 shell 状态里（它本来就是合法的持久状态），随后 `mfperch_rc=$?`
-  # 这类赋值虽不会失败，但**赋值给已存在的变量**在 `set -e` 下不算命令、不触发退出，
-  # 而 `printf` 的写失败却会。为稳妥起见，打印结束标记这一步显式关掉 `set -e`：
-  # 结束标记是协议的一部分，任何用户命令留下的 shell 状态都不得让它消失——
-  # 丢了它，应用侧会一直等到超时（实测踩过：命令报 command not found，
-  # 随后 shell 因 `set -e` 直接退出，结束标记永远不来）。
+  # `set -e` 会**跨帧**留在 shell 状态里（它本来就是合法的持久状态）：
+  # Agent 先用一条命令打开它，**下一条**命令只要失败，整个包装脚本就当场退出。
+  # 打印结束标记这一步因此必须显式 `set +e`，否则结束标记永远不来、
+  # 应用侧只能干等到超时。实测形态（WSL Ubuntu，两帧：`set -e` → `/nonexistent`）：
+  #   无 `set +e`：只回第一帧的 END，包装脚本退出码 127，第二帧的 END 永不出现；
+  #   有 `set +e`：两帧 END 都回，退出码 0。
+  # 注意**不能**写成"eval 之后 set -e 就立刻生效"——errexit 在 eval 整串结束后才生效，
+  # 所以同一帧里写 `set -e; <失败命令>` 不会触发（这也是初版回归用例假绿的原因）。
+  # 守住它的是 `wrapper_always_emits_end_marker_even_after_set_e`（单测，查顺序）
+  # 与 `run_as_root_returns_when_command_enables_set_e`（真实环境 e2e，查"是否超时"）。
   set +e
   printf '\n{end}%s__%s__%s__\n' "$mfperch_nonce" "$mfperch_id" "$mfperch_rc"
 done
