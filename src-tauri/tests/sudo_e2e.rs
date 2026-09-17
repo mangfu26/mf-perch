@@ -121,9 +121,153 @@ async fn collect(
 /// **模式一：deny** —— sudo 必须失败，绝不提权。
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
-async fn deny_mode_makes_sudo_fail() {
+async fn data_plane_sudo_is_always_refused() {
+    // D47/D48 核心不变式：**数据面不许提权**。
+    //
+    // 旧机制（askpass + FIFO）会把密码投进 Agent 所在的用户域，因此被双通道取代；
+    // 取代之后数据面已经没有任何密码来源，若不在那里拦下 sudo，Agent 收到的
+    // 会是一句难懂的 sudo 报错，并可能反复重试。这里验证它收到的是**可操作**的拒绝。
+    //
+    // 三种策略都要验：拒绝的**原因**可以不同（策略禁用 / 改用工具），
+    // 但"命令不会被提权执行"必须一致——这正是本用例的判别性断言。
     let t = target();
 
+    for policy in [SudoPolicy::Deny, SudoPolicy::Ask, SudoPolicy::Auto] {
+        let (state, key) = test_state();
+        let host_id = seed_host(&state, &key, &t, policy).await;
+
+        let terminal = state
+            .terminals
+            .open_terminal(&state.db, &key, &host_id, None)
+            .await
+            .expect("终端应能建立");
+
+        // 用 `id -u` 作为判据：一旦提权成功，输出里会出现整行的 0。
+        let outcome = state
+            .terminals
+            .run_command(
+                &state.db,
+                &terminal.id,
+                "sudo id -u",
+                Some(Duration::from_secs(20)),
+            )
+            .await
+            .expect("命令应能下发");
+        let (output, code) = collect(&state.terminals, &state.db, &outcome.command_id).await;
+
+        assert_ne!(code, Some(0), "{policy:?} 下数据面 sudo 必须失败：{output}");
+        assert!(
+            !output.trim().lines().any(|l| l.trim() == "0"),
+            "{policy:?} 下数据面绝不允许提权成功：{output}"
+        );
+        assert!(
+            output.contains("[mf-perch]"),
+            "{policy:?} 下应给出应用自己的可操作说明，而不是 sudo 的原始报错：{output}"
+        );
+        // 说明必须指向正确的出路：允许提权的策略引导改用工具，
+        // 禁止提权的策略说明原因（引导它去用一个也会失败的入口是误导）。
+        if policy == SudoPolicy::Deny {
+            assert!(
+                output.contains("已禁用提权"),
+                "deny 策略应说明该主机已禁用提权：{output}"
+            );
+        } else {
+            assert!(
+                output.contains("run_as_root"),
+                "{policy:?} 策略应引导 Agent 改用 run_as_root 工具：{output}"
+            );
+        }
+
+        // 数据面命令必须继续可用（拒绝不能把终端搞坏）。
+        let follow = state
+            .terminals
+            .run_command(&state.db, &terminal.id, "echo still-alive", Some(Duration::from_secs(20)))
+            .await
+            .expect("后续命令应能下发");
+        let (out2, code2) = collect(&state.terminals, &state.db, &follow.command_id).await;
+        assert_eq!(code2, Some(0), "拒绝 sudo 后终端应继续可用：{out2}");
+
+        state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
+    }
+}
+
+/// **D47/D48 回归**：跑过新旧两条路径后，远端**不新增**任何本应用的临时节点。
+///
+/// 旧机制会在 `$HOME/.mf-perch/` 下写 askpass 脚本与按 PID 命名的 FIFO
+/// （V1 的明文落盘就发生在那套机制里）。双通道之后远端**不再产生任何文件**，
+/// 因此旧的清理逻辑（连同它的时序不变式）整体不再需要。
+///
+/// 判据用**前后快照对比**，而不是断言"目录为空"或"目录不存在"：
+/// 测试机可能残留旧机制留下的节点（实测本机就有 2026-09-11 的两个 FIFO），
+/// 而断言绝对值为零会把"机器不干净"误报成"实现又写了文件"（§5.4：测试不得
+/// 依赖机器上的既有状态）。真正要守的不变式是"本次操作没有新增痕迹"。
+#[tokio::test]
+#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
+async fn data_plane_leaves_no_new_remote_artifacts() {
+    let t = target();
+    let (state, key) = test_state();
+    let host_id = seed_host(&state, &key, &t, SudoPolicy::Auto).await;
+
+    let terminal = state
+        .terminals
+        .open_terminal(&state.db, &key, &host_id, None)
+        .await
+        .expect("终端应能建立");
+
+    // 旧机制会写的两类节点：askpass 脚本与 sudopw FIFO。
+    let count_cmd = r#"find "$HOME/.mf-perch" -maxdepth 1 \( -name 'askpass*' -o -name 'sudopw*' \) 2>/dev/null | wc -l"#;
+
+    let before = {
+        let outcome = state
+            .terminals
+            .run_command(&state.db, &terminal.id, count_cmd, Some(Duration::from_secs(20)))
+            .await
+            .expect("命令应能下发");
+        let (out, _) = collect(&state.terminals, &state.db, &outcome.command_id).await;
+        out.trim().to_string()
+    };
+
+    // 触发一次数据面 sudo 拒绝与一次真正的提权，覆盖两条路径。
+    let a = state
+        .terminals
+        .run_command(&state.db, &terminal.id, "sudo true", Some(Duration::from_secs(20)))
+        .await
+        .expect("命令应能下发");
+    let _ = collect(&state.terminals, &state.db, &a.command_id).await;
+    state
+        .terminals
+        .run_as_root(&state.db, &key, &terminal.id, "true", None)
+        .await
+        .expect("提权命令应能执行");
+
+    let after = {
+        let outcome = state
+            .terminals
+            .run_command(&state.db, &terminal.id, count_cmd, Some(Duration::from_secs(20)))
+            .await
+            .expect("命令应能下发");
+        let (out, code) = collect(&state.terminals, &state.db, &outcome.command_id).await;
+        assert_eq!(code, Some(0), "检查命令应成功：{out}");
+        out.trim().to_string()
+    };
+
+    assert_eq!(
+        after, before,
+        "双通道之后不得新增任何远端节点（旧机制会写 askpass 脚本与 sudopw FIFO）；\
+         操作前 {before} 个，操作后 {after} 个"
+    );
+
+    state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
+}
+
+/// **策略回归**：`deny` 主机上 `run_as_root` 必须被拒绝，且不建任何通道。
+///
+/// 这条守的是"人有权关掉提权"这一产品承诺：策略为 deny 时，Agent 既不能
+/// 经数据面提权（上一条用例），也不能经提权工具绕过。
+#[tokio::test]
+#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
+async fn run_as_root_is_refused_when_host_disables_elevation() {
+    let t = target();
     let (state, key) = test_state();
     let host_id = seed_host(&state, &key, &t, SudoPolicy::Deny).await;
 
@@ -133,141 +277,48 @@ async fn deny_mode_makes_sudo_fail() {
         .await
         .expect("终端应能建立");
 
-    // 用 `sudo id -u` 而非 `sudo -n`：后者本身就不读密码，
-    // 无法体现"拦截是否生效"。
-    let outcome = state
+    let err = state
         .terminals
-        .run_command(
-            &state.db,
-            &terminal.id,
-            "sudo id -u",
-            Some(Duration::from_secs(20)),
-        )
+        .run_as_root(&state.db, &key, &terminal.id, "id -u", None)
         .await
-        .expect("命令应能下发");
-
-    let (output, code) = collect(&state.terminals, &state.db, &outcome.command_id).await;
-
-    assert_ne!(
-        code,
-        Some(0),
-        "deny 模式下 sudo 必须失败（fail-closed）。输出：{output}"
-    );
-    // 关键：不能出现 root 的 uid（0），否则说明真的提权成功了。
+        .expect_err("deny 主机上提权必须被拒绝");
     assert!(
-        !output.trim().lines().any(|l| l.trim() == "0"),
-        "deny 模式下不得提权成功。输出：{output}"
+        matches!(err, AppError::SudoElevationFailed(_)),
+        "应以「提权失败」明确报错，实际：{err:?}"
     );
+    assert!(
+        err.to_string().contains("禁止注入"),
+        "报错应说明是该主机的策略禁用，并指引人类如何开启：{err}"
+    );
+
+    // 拒绝之后数据面照常可用。
+    let follow = state
+        .terminals
+        .run_command(&state.db, &terminal.id, "echo ok", Some(Duration::from_secs(20)))
+        .await
+        .expect("普通命令应能下发");
+    let (out, code) = collect(&state.terminals, &state.db, &follow.command_id).await;
+    assert_eq!(code, Some(0), "被拒绝提权后终端应继续可用：{out}");
 
     state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
 }
 
-/// **模式三：auto** —— 自动注入密码，sudo 应成功。
+/// **ask 模式**：人类拒绝时 `run_as_root` 不投递密码，命令不会被执行。
+///
+/// 与旧机制的区别值得记一笔：旧路径下"拒绝"必须**回写一个空密码**去解开
+/// 阻塞在 FIFO 上的 askpass（否则队列会卡住）；新路径下没有远端等待者，
+/// 拒绝就是简单的不写密码——少了一整类"忘记应答导致挂死"的缺陷形态。
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
-async fn auto_mode_injects_password_and_succeeds() {
+async fn run_as_root_ask_mode_denied_by_human_does_not_elevate() {
     let t = target();
-
-    let (state, key) = test_state();
-    let host_id = seed_host(&state, &key, &t, SudoPolicy::Auto).await;
-
-    let terminal = state
-        .terminals
-        .open_terminal(&state.db, &key, &host_id, None)
-        .await
-        .expect("终端应能建立");
-
-    let outcome = state
-        .terminals
-        .run_command(
-            &state.db,
-            &terminal.id,
-            "sudo id -u",
-            Some(Duration::from_secs(30)),
-        )
-        .await
-        .expect("命令应能下发");
-
-    let (output, code) = collect(&state.terminals, &state.db, &outcome.command_id).await;
-
-    assert_eq!(
-        code,
-        Some(0),
-        "auto 模式应自动注入密码并成功。输出：{output}"
-    );
-    // 与 deny 用例同一标准：整行等于 "0" 才算拿到 root 的 uid。
-    // 原先用 `output.contains('0')`——任何含字符 0 的输出都会通过，等于没验。
-    assert!(
-        output.trim().lines().any(|l| l.trim() == "0"),
-        "sudo id -u 应输出 root 的 uid（整行为 0）。输出：{output}"
-    );
-
-    state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
-}
-
-/// **模式二：ask + 允许** —— 用户同意后注入，sudo 成功。
-#[tokio::test]
-#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
-async fn ask_mode_with_allow_succeeds() {
-    let t = target();
-
     let (state, key) = test_state();
     let host_id = seed_host(&state, &key, &t, SudoPolicy::Ask).await;
 
-    // 注入一个"总是允许"的替身回调，替代真实人工确认。
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SudoRequest>();
-    let asker: mf_perch_lib::terminal::SudoAsker = Arc::new(move |req: SudoRequest| {
-        // 把请求转出去，测试侧可断言确实收到过请求。
-        let _ = tx.send(req);
-        let (rtx, rrx) = tokio::sync::oneshot::channel();
-        // 立即允许。
-        let _ = rtx.send(SudoDecision::Allow);
-        rrx
-    });
-    state.terminals.set_sudo_asker(asker).await;
-
-    let terminal = state
-        .terminals
-        .open_terminal(&state.db, &key, &host_id, None)
-        .await
-        .expect("终端应能建立");
-
-    let outcome = state
-        .terminals
-        .run_command(
-            &state.db,
-            &terminal.id,
-            "sudo id -u",
-            Some(Duration::from_secs(30)),
-        )
-        .await
-        .expect("命令应能下发");
-
-    let (output, code) = collect(&state.terminals, &state.db, &outcome.command_id).await;
-
-    assert_eq!(code, Some(0), "允许后 sudo 应成功。输出：{output}");
-    assert!(
-        output.trim().lines().any(|l| l.trim() == "0"),
-        "应输出 root 的 uid（整行为 0）。输出：{output}"
-    );
-
-    // 应当收到过确认请求（否则说明 ask 流程未被触发）。
-    let got = rx.try_recv();
-    assert!(got.is_ok(), "ask 模式应向用户发出确认请求");
-
-    state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
-}
-
-/// **模式二：ask + 拒绝** —— 拒绝后 sudo 失败，且**不能卡住队列**。
-#[tokio::test]
-#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
-async fn ask_mode_with_deny_fails_and_keeps_queue_alive() {
-    let t = target();
-
-    let (state, key) = test_state();
-    let host_id = seed_host(&state, &key, &t, SudoPolicy::Ask).await;
-
-    let asker: mf_perch_lib::terminal::SudoAsker = Arc::new(|_req: SudoRequest| {
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let asked_for = asked.clone();
+    let asker: mf_perch_lib::terminal::SudoAsker = Arc::new(move |_req: SudoRequest| {
+        asked_for.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (rtx, rrx) = tokio::sync::oneshot::channel();
         let _ = rtx.send(SudoDecision::Deny);
         rrx
@@ -280,395 +331,31 @@ async fn ask_mode_with_deny_fails_and_keeps_queue_alive() {
         .await
         .expect("终端应能建立");
 
-    let outcome = state
+    let err = state
         .terminals
-        .run_command(
-            &state.db,
-            &terminal.id,
-            "sudo id -u",
-            Some(Duration::from_secs(30)),
-        )
+        .run_as_root(&state.db, &key, &terminal.id, "id -u", None)
         .await
-        .expect("命令应能下发");
-
-    let (output, code) = collect(&state.terminals, &state.db, &outcome.command_id).await;
-
-    assert_ne!(code, Some(0), "拒绝后 sudo 应失败。输出：{output}");
+        .expect_err("人类拒绝后不得提权");
     assert!(
-        !output.trim().lines().any(|l| l.trim() == "0"),
-        "拒绝后不得提权。输出：{output}"
+        matches!(err, AppError::SudoElevationFailed(_)),
+        "应以「提权失败」报错，实际：{err:?}"
     );
-
-    // **关键回归**：拒绝必须让 askpass 的 read 得到**应答**而结束。
-    // 若对该次索要不作任何回应，askpass 会一直阻塞在 read 上（直到 120 秒兜底
-    // 超时），而命令串行执行，后续命令会被长时间拖住——这里验证队列仍可用。
-    let follow_up = state
-        .terminals
-        .run_command(
-            &state.db,
-            &terminal.id,
-            "echo queue-still-alive",
-            Some(Duration::from_secs(20)),
-        )
-        .await
-        .expect("后续命令应能下发");
-
-    let (out2, code2) = collect(&state.terminals, &state.db, &follow_up.command_id).await;
     assert_eq!(
-        code2,
-        Some(0),
-        "拒绝 sudo 后终端应继续可用（不得卡死队列）。输出：{out2}"
+        asked.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "应当只询问人类一次（单命令形态没有 sudo 重试带来的连环询问）"
     );
-    assert!(out2.contains("queue-still-alive"));
+
+    // 拒绝之后普通命令照常可用。
+    let follow = state
+        .terminals
+        .run_command(&state.db, &terminal.id, "echo ok", Some(Duration::from_secs(20)))
+        .await
+        .expect("普通命令应能下发");
+    let (out, code) = collect(&state.terminals, &state.db, &follow.command_id).await;
+    assert_eq!(code, Some(0), "拒绝提权后队列不得卡住：{out}");
 
     state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
-}
-
-/// 非 sudo 命令在 ask 模式下不应触发确认（避免打扰）。
-#[tokio::test]
-#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
-async fn ask_mode_does_not_prompt_for_non_sudo_commands() {
-    let t = target();
-
-    let (state, key) = test_state();
-    let host_id = seed_host(&state, &key, &t, SudoPolicy::Ask).await;
-
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SudoRequest>();
-    let asker: mf_perch_lib::terminal::SudoAsker = Arc::new(move |req: SudoRequest| {
-        let _ = tx.send(req);
-        let (rtx, rrx) = tokio::sync::oneshot::channel();
-        let _ = rtx.send(SudoDecision::Allow);
-        rrx
-    });
-    state.terminals.set_sudo_asker(asker).await;
-
-    let terminal = state
-        .terminals
-        .open_terminal(&state.db, &key, &host_id, None)
-        .await
-        .expect("终端应能建立");
-
-    let outcome = state
-        .terminals
-        .run_command(&state.db, &terminal.id, "echo no-sudo", Some(Duration::from_secs(15)))
-        .await
-        .expect("命令应能下发");
-
-    let (output, code) = collect(&state.terminals, &state.db, &outcome.command_id).await;
-    assert_eq!(code, Some(0));
-    assert!(output.contains("no-sudo"));
-
-    // 普通命令不应产生确认请求。
-    let got = rx.try_recv();
-    assert!(
-        got.is_err(),
-        "非 sudo 命令不应触发确认请求，实际收到：{got:?}"
-    );
-
-    state.terminals.delete_terminal(&state.db, &terminal.id).await.ok();
-}
-
-/// **V1 回归（严重）**：sudo 密码绝不能以普通文件形式落在远端。
-///
-/// 背景：曾经 setup 脚本先 `mkfifo`、后通配 `rm -f "$dir"/sudopw.fifo.*`，
-/// 把刚建好的 FIFO 自己删掉；随后 `cat > fifo` 退化为"创建普通文件并写入"，
-/// 密码明文落盘且同机可读。
-///
-/// 单纯断言"sudo 成功"**测不出**这个缺陷——普通文件同样支持写读。
-/// 因此这里直接检查远端文件类型与残留：这是唯一能区分"真 FIFO"与
-/// "普通文件"的判据。
-#[tokio::test]
-#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
-async fn sudo_password_never_lands_in_a_regular_file() {
-    let t = target();
-
-    let (state, key) = test_state();
-    let host_id = seed_host(&state, &key, &t, SudoPolicy::Auto).await;
-
-    let terminal = state
-        .terminals
-        .open_terminal(&state.db, &key, &host_id, None)
-        .await
-        .expect("终端应能建立");
-
-    // 1) 会话建立后：存在的 sudopw.fifo.* 必须**全是 FIFO**，不能有普通文件。
-    //    用 `find -type f` 精确判定普通文件（`-p` 判 FIFO）。
-    let check_cmd = r#"find "$HOME/.mf-perch" -maxdepth 1 -name 'sudopw.fifo.*' -type f 2>/dev/null | wc -l"#;
-    let outcome = state
-        .terminals
-        .run_command(&state.db, &terminal.id, check_cmd, Some(Duration::from_secs(15)))
-        .await
-        .expect("命令应能下发");
-    let (out, code) = collect(&state.terminals, &state.db, &outcome.command_id).await;
-    assert_eq!(code, Some(0), "检查命令应成功：{out}");
-    assert_eq!(
-        out.trim(),
-        "0",
-        "setup 后不得存在普通文件形态的 sudopw.fifo.*（FIFO 被删会导致密码落盘）"
-    );
-
-    // 2) 真正触发一次密码注入。
-    let outcome = state
-        .terminals
-        .run_command(&state.db, &terminal.id, "sudo id -u", Some(Duration::from_secs(30)))
-        .await
-        .expect("命令应能下发");
-    let (out, code) = collect(&state.terminals, &state.db, &outcome.command_id).await;
-    assert_eq!(code, Some(0), "auto 模式应成功提权：{out}");
-
-    // 3) 注入后仍不得出现普通文件（密码只经 FIFO 内存传递）。
-    let outcome = state
-        .terminals
-        .run_command(&state.db, &terminal.id, check_cmd, Some(Duration::from_secs(15)))
-        .await
-        .expect("命令应能下发");
-    let (out, _) = collect(&state.terminals, &state.db, &outcome.command_id).await;
-    assert_eq!(
-        out.trim(),
-        "0",
-        "注入密码后不得留下普通文件（说明密码可能已明文落盘）"
-    );
-
-    // 4) 归档会话后，本会话的临时节点应被清理：
-    //    不变式是"一个会话只留下自己那一套"。归档 t1 再开 t2，
-    //    若 t1 的残留被清理，总数应与归档前相同（而不是累加）。
-    let count_cmd = r#"find "$HOME/.mf-perch" -maxdepth 1 \( -name 'sudopw.fifo.*' -o -name 'askpass.*' \) 2>/dev/null | wc -l"#;
-    let before = {
-        let outcome = state
-            .terminals
-            .run_command(&state.db, &terminal.id, count_cmd, Some(Duration::from_secs(15)))
-            .await
-            .expect("命令应能下发");
-        let (out, _) = collect(&state.terminals, &state.db, &outcome.command_id).await;
-        out.trim().to_string()
-    };
-
-    state
-        .terminals
-        .archive_terminal(&state.db, &terminal.id)
-        .await
-        .expect("归档应成功");
-
-    let t2 = state
-        .terminals
-        .open_terminal(&state.db, &key, &host_id, None)
-        .await
-        .expect("新终端应能建立");
-    let outcome = state
-        .terminals
-        .run_command(&state.db, &t2.id, count_cmd, Some(Duration::from_secs(15)))
-        .await
-        .expect("命令应能下发");
-    let (after, _) = collect(&state.terminals, &state.db, &outcome.command_id).await;
-    assert_eq!(
-        after.trim(),
-        before,
-        "归档后本会话临时节点应被清理；若残留则数量会增加（归档前 {before}，归档后 {}）",
-        after.trim()
-    );
-
-    state.terminals.delete_terminal(&state.db, &t2.id).await.ok();
-}
-
-/// **Q36 回归**：同一条命令内，人类只被问一次。
-///
-/// 背景：sudo 在密码错误时会重试（默认最多 3 次），`-A` 下每次重试都会重新
-/// 调用 askpass，因此产生新的索要（§7.10 实测 3 次）。若每次索要都弹窗，
-/// 人类要在几十秒内连点三次几乎相同的「拒绝」。
-///
-/// 本用例借**真实 sudo 的重试循环**验证两条不变式：
-/// 1. 拒绝一经给出，同一条命令的后续索要自动沿用，不再询问人类；
-/// 2. **下一条命令必须重新询问**——否则"拒绝"会退化成"该终端永久禁止提权"，
-///    那是把 fail-closed 做成了 fail-broken。
-#[tokio::test]
-#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
-async fn deny_is_asked_only_once_per_command() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    let t = target();
-
-    let (state, key) = test_state();
-    let host_id = seed_host(&state, &key, &t, SudoPolicy::Ask).await;
-
-    // 替身回调每被调用一次 = 人类被弹一次窗。
-    let asked = Arc::new(AtomicUsize::new(0));
-    let asked_for_asker = asked.clone();
-    let asker: mf_perch_lib::terminal::SudoAsker = Arc::new(move |_req: SudoRequest| {
-        asked_for_asker.fetch_add(1, Ordering::SeqCst);
-        let (rtx, rrx) = tokio::sync::oneshot::channel();
-        let _ = rtx.send(SudoDecision::Deny);
-        rrx
-    });
-    state.terminals.set_sudo_asker(asker).await;
-
-    let terminal = state
-        .terminals
-        .open_terminal(&state.db, &key, &host_id, None)
-        .await
-        .expect("终端应能建立");
-
-    let outcome = state
-        .terminals
-        .run_command(
-            &state.db,
-            &terminal.id,
-            "sudo id -u",
-            Some(Duration::from_secs(30)),
-        )
-        .await
-        .expect("命令应能下发");
-    let (output, code) = collect(&state.terminals, &state.db, &outcome.command_id).await;
-
-    assert_ne!(code, Some(0), "拒绝后 sudo 应失败。输出：{output}");
-    assert!(
-        !output.trim().lines().any(|l| l.trim() == "0"),
-        "拒绝后不得提权。输出：{output}"
-    );
-    let asks_after_first = asked.load(Ordering::SeqCst);
-    assert_eq!(
-        asks_after_first, 1,
-        "同一条命令内的 sudo 重试不得重复询问人类，实际询问 {asks_after_first} 次。输出：{output}"
-    );
-
-    // 记忆必须随命令结束而失效。
-    let again = state
-        .terminals
-        .run_command(
-            &state.db,
-            &terminal.id,
-            "sudo id -u",
-            Some(Duration::from_secs(30)),
-        )
-        .await
-        .expect("命令应能下发");
-    let (out2, _) = collect(&state.terminals, &state.db, &again.command_id).await;
-
-    let asks_total = asked.load(Ordering::SeqCst);
-    assert_eq!(
-        asks_total, 2,
-        "新命令应重新询问人类（否则拒绝会变成永久禁止提权），实际累计询问 {asks_total} 次。\
-         第二条命令输出：{out2}"
-    );
-
-    state
-        .terminals
-        .delete_terminal(&state.db, &terminal.id)
-        .await
-        .ok();
-}
-
-/// **B2 回归（错配）**：并发的 sudo 索要必须各自收到自己的应答。
-///
-/// 背景：曾用**一条会话级 FIFO** 承载所有索要。FIFO 上一次写入只会被
-/// **其中任意一个**正在阻塞的读者取走，因此当两次索要同时在等，
-/// 应答就可能错配——表现是"用户点了允许的那次失败、点了拒绝的那次反而提权"。
-///
-/// 编排要点（都是为了让"旧实现必然错、新实现必然对"，而不是碰运气）：
-///
-/// 1. 第 1 条 sudo 先起，1.5 秒后再起第 2 条 —— 保证索要顺序确定：
-///    请求 #1 = 进程 A，请求 #2 = 进程 B；
-/// 2. 先批准 **#2**（后弹出的对话框），隔 300ms 再拒绝 **#1** ——
-///    于是"密码写入"发生在"空密码写入"之前。旧实现下密码会被
-///    **最先阻塞**的读者（A，已拒绝）取走 → A 越权成为 root、B 反而失败；
-/// 3. 之后到达的索要一律拒绝 —— sudo 在密码错误时可能重试 askpass，
-///    重试会产生新的令牌与新索要，必须同样应答，否则该次 sudo 会挂住。
-#[tokio::test]
-#[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
-async fn concurrent_sudo_requests_do_not_cross_route() {
-    let t = target();
-
-    let (state, key) = test_state();
-    let host_id = seed_host(&state, &key, &t, SudoPolicy::Ask).await;
-
-    // asker → 协调器：按**到达顺序**把应答通道交给协调器。
-    let (tx_req, mut rx_req) = tokio::sync::mpsc::unbounded_channel::<
-        tokio::sync::oneshot::Sender<SudoDecision>,
-    >();
-    let asker: mf_perch_lib::terminal::SudoAsker = Arc::new(move |_req: SudoRequest| {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = tx_req.send(tx);
-        rx
-    });
-    state.terminals.set_sudo_asker(asker).await;
-
-    // 协调器：收集请求并观察"总共有几次索要"（诊断重试行为）。
-    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let seen_for_task = seen.clone();
-    let coordinator = tokio::spawn(async move {
-        // #1 = 进程 A（先启动）。
-        let first = rx_req.recv().await.expect("应有第 1 次索要");
-        seen_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // #2 = 进程 B。
-        let second = rx_req.recv().await.expect("应有第 2 次索要");
-        seen_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-        // 先批准 B（写入密码），再拒绝 A——按设计意图让"密码写入"早于"空密码写入"。
-        let _ = second.send(SudoDecision::Allow);
-        // 这 300ms 只是为了让**旧实现**的错配稳定复现（它曾用一条会话级 FIFO 串答）。
-        // 它不承担正确性：修复后每个请求各有自己的 FIFO 与令牌，两个应答以任何次序
-        // 落地，结论都必须是"A 被拒、B 拿到 root"。因此这里不适合改成轮询——
-        // 没有任何可观测信号表示"密码已写入"，而断言本身并不依赖这个次序。
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        // 再拒绝 A。
-        let _ = first.send(SudoDecision::Deny);
-
-        // 其余（sudo 重试产生的新索要）一律拒绝，避免有索要得不到应答而挂住。
-        while let Some(tx) = rx_req.recv().await {
-            seen_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let _ = tx.send(SudoDecision::Deny);
-        }
-    });
-
-    let terminal = state
-        .terminals
-        .open_terminal(&state.db, &key, &host_id, None)
-        .await
-        .expect("终端应能建立");
-
-    // 注意：只重定向 stdout。askpass 的**协议标记走 stderr**，
-    // 若把子 shell 的 stderr 也重定向进文件，标记就到不了应用，索要不会被创建。
-    let cmd = r#"rm -f /tmp/mfperch-b2-a.out /tmp/mfperch-b2-b.out
-( sudo id -un > /tmp/mfperch-b2-a.out ) &
-sleep 1.5
-( sudo id -un > /tmp/mfperch-b2-b.out ) &
-wait
-printf 'A=%s\n' "$(cat /tmp/mfperch-b2-a.out)"
-printf 'B=%s\n' "$(cat /tmp/mfperch-b2-b.out)"
-"#;
-
-    // 异步模式下发：命令会一直挂着等我们应答，因此**不能**用同步等待
-    // （同步会阻塞到命令结束，而命令结束又依赖我们应答 → 自我死锁）。
-    let outcome = state
-        .terminals
-        .run_command(&state.db, &terminal.id, cmd, None)
-        .await
-        .expect("命令应能下发");
-
-    let (out, code) = collect(&state.terminals, &state.db, &outcome.command_id).await;
-    coordinator.abort();
-
-    eprintln!(
-        "[B2 诊断] 本次共产生 {} 次索要；命令输出：{out}",
-        seen.load(std::sync::atomic::Ordering::SeqCst)
-    );
-    assert_eq!(code, Some(0), "命令本身应正常结束：{out}");
-
-    // 被拒绝的第 1 次索要：不得提权。旧实现下它会拿到本属于 B 的密码。
-    assert!(
-        !out.contains("A=root"),
-        "被拒绝的索要不得提权（应答错配会让它拿到别人的密码）：{out}"
-    );
-    // 被允许的第 2 次索要：必须提权成功。旧实现下它会拿到空密码而失败。
-    assert!(
-        out.contains("B=root"),
-        "被允许的索要必须提权成功（应答错配会让它拿到空密码）：{out}"
-    );
-
-    state
-        .terminals
-        .delete_terminal(&state.db, &terminal.id)
-        .await
-        .ok();
 }
 
 // ===================================================================

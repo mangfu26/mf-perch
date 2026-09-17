@@ -1,40 +1,31 @@
-//! sudo 密码处理（Q33 三模式）。
+//! sudo 提权策略（Q33 三模式，D47/D48 后语义更新）。
 //!
-//! 客户在 Q33 明确要求三种模式**一期全部实现**，由用户为每个主机选择：
+//! 客户在 Q33 明确要求三种模式**一期全部实现**，由用户为每个主机选择。
+//! D47/D48 之后提权改走**应用自建的特权通道**（`run_as_root`），三模式的
+//! 含义随之收敛为"**是否允许 Agent 经该通道提权**"：
 //!
 //! | 模式 | 行为 |
 //! | ---- | ---- |
-//! | `deny` | 不注入。sudo 因无 TTY 且无密码而失败（默认，fail-closed） |
-//! | `ask` | 经系统通知征得同意后注入；拒绝或超时则让 sudo 失败 |
-//! | `auto` | 检测到请求即自动注入 |
+//! | `deny` | 不允许提权。`run_as_root` 直接报错，数据面的 sudo 垫片说明原因（默认，fail-closed） |
+//! | `ask` | 每次提权经系统通知征得人类同意后才投递密码；拒绝或超时即不提权 |
+//! | `auto` | 直接投递该主机已配置的提权密码 |
 //!
-//! `ask` 模式下**同一条命令只问一次**（Q36 / D44）：sudo 密码错误会重试
-//! （默认 3 次），每次重试都重新调用 askpass；拒绝一经给出便对该命令的
-//! 后续索要生效，人类不必连点三次「拒绝」。记忆随命令结束失效。
+//! 三种模式共享同一条不变式：**数据面（Agent 的普通命令）永远拿不到密码**。
+//! 数据面上的 `sudo` 由 [`crate::ssh::protocol::sudo_reject_shim`] 明确拒绝，
+//! 因此这里不再有"拦截是否被绕过"的问题——绕过也无处可取密码。
 //!
-//! ## 防误用的关键设计
+//! ## 密码的存放与投递
 //!
-//! - **不靠命令改写**：拦截由远端 shell 函数完成（`protocol::sudo_function_def`），
-//!   因此 `sh -c 'sudo x'` 这类写法不会像文本匹配那样漏判。
-//! - **未被拦截的 sudo 一律失败**：任何绕过拦截的调用都拿不到密码，
-//!   属 fail-closed，宁可失败不可越权。
-//! - **密码不落盘、不进环境变量**：经 FIFO 从内存传给 askpass，
-//!   读完即消失（环境变量会被同机其他进程从 `/proc/*/environ` 读到）。
+//! - 只在**应用内存**中，包一层 [`Zeroizing`]，会话结束即清零；
+//! - 只写进**特权通道的 stdin**，且每条通道最多写一次（见 `SudoAuthHandshake`）；
+//! - 远端不落任何文件：不部署 askpass、不建 FIFO、不设环境变量
+//!   （旧机制的这些痕迹已随 D47 一并移除，见 `docs/decisions.md`）。
 //!
-//! ## ask 模式的"拒绝"如何生效
+//! ## 关于 Q36（同一条命令只问一次）
 //!
-//! askpass 阻塞在 `read <&3` 上等待密码。**必须给它一个回应**，否则它会永久
-//! 阻塞，而命令串行执行，整条队列都会被拖死。
-//!
-//! 做法是向 FIFO **写入一个空行**：askpass 读到空密码交给 sudo，认证随即失败，
-//! 命令正常结束并返回非零退出码。
-//!
-//! 为什么不用"关闭 FIFO 让 read 得到 EOF"（初版设计）：askpass 已用
-//! `exec 3<>fifo` 以 O_RDWR 同时持有读写端，EOF 不会因外部关闭写端而出现。
-//! 该结论由 WSL 端到端实测得出，详见 `docs/design/sudo.md` §7.3。
-//!
-//! 注意：写入空密码会让 sudo **重试**（默认 3 次），因此拒绝必须被记住，
-//! 否则人类会被连续询问三次——见 [`AskOutcome`] 与 `docs/design/sudo.md` §7.10。
+//! 该问题的成因是旧机制下"空密码拒绝 → sudo 重试 → 再次索要"的连环询问。
+//! 单命令形态的提权一次调用只提权一次、也就只问一次，成因已消失；
+//! 因此 `AskOutcome` 不再需要"已拒绝"这一记忆状态。
 
 use zeroize::Zeroizing;
 
@@ -63,13 +54,6 @@ pub struct SudoContext {
 }
 
 impl SudoContext {
-    /// 是否需要在远端部署 askpass 与 FIFO。
-    ///
-    /// `deny` 模式不部署——这是"禁止注入"的实现方式：不装 askpass，
-    /// sudo 自然拿不到密码。
-    pub fn needs_askpass(&self) -> bool {
-        matches!(self.policy, SudoPolicy::Ask | SudoPolicy::Auto)
-    }
 
     /// `auto` 模式：可立即注入密码时返回密码。
     ///
@@ -128,28 +112,15 @@ pub enum AskOutcome {
     TimedOut,
     /// 询问通道不可用（界面 / 桥接异常），按拒绝处理。
     Unavailable,
-    /// 本条命令此前已被拒绝，自动沿用，未再打扰人类（Q36）。
-    DeniedByMemo,
 }
 
 impl AskOutcome {
-    /// 对应的 sudo 决策：**只有「允许」会提权**，其余一律 fail-closed。
+    /// 对应的提权决策：**只有「允许」会提权**，其余一律 fail-closed。
     pub fn decision(self) -> SudoDecision {
         match self {
             Self::Allowed => SudoDecision::Allow,
-            Self::Denied | Self::TimedOut | Self::Unavailable | Self::DeniedByMemo => {
-                SudoDecision::Deny
-            }
+            Self::Denied | Self::TimedOut | Self::Unavailable => SudoDecision::Deny,
         }
-    }
-
-    /// 是否应记住这次结果，使同一条命令的后续索要不再询问人类（Q36）。
-    ///
-    /// 除「允许」外都要记住：允许意味着这次提权已经成功，sudo 不会再问；
-    /// 而拒绝 / 超时 / 无法询问都会让 sudo 重试，不记住的话人类会在
-    /// 「60 秒超时 × 最多 3 次重试」的窗口里被反复弹窗。
-    pub fn should_remember(self) -> bool {
-        self != Self::Allowed
     }
 
     /// 写入命令输出的审计备注（人类与 Agent 都读得到）。
@@ -159,9 +130,6 @@ impl AskOutcome {
             Self::Denied => "sudo 提权请求：用户已拒绝",
             Self::TimedOut => "sudo 提权请求：等待确认超时，已按拒绝处理",
             Self::Unavailable => "sudo 提权请求：确认通道不可用，已按拒绝处理",
-            Self::DeniedByMemo => {
-                "sudo 提权请求：本次命令此前已拒绝提权，后续索要自动沿用拒绝（未再询问）"
-            }
         }
     }
 }
@@ -175,48 +143,17 @@ pub struct SudoRequest {
     pub host_label: String,
 }
 
-/// 应用一次 sudo 决策后的动作。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SudoAction {
-    /// 向 FIFO 写入密码。
-    Inject,
-    /// 向 FIFO 写入空行，让 askpass 以空密码应答，从而使 sudo 认证失败。
-    Deny,
-}
-
-/// 依据策略与决策决定实际动作。
-///
-/// 抽为纯函数以便覆盖各分支，尤其是"无密码时必须 Deny 而非静默"。
-pub fn resolve_action(
-    policy: SudoPolicy,
-    has_password: bool,
-    decision: Option<SudoDecision>,
-) -> SudoAction {
-    match policy {
-        // deny 不会产生请求（未部署 askpass），这里保守处理为拒绝。
-        SudoPolicy::Deny => SudoAction::Deny,
-        SudoPolicy::Auto => {
-            if has_password {
-                SudoAction::Inject
-            } else {
-                // 配置为自动注入却没有密码：不能假装成功，应让 sudo 失败。
-                SudoAction::Deny
-            }
-        }
-        SudoPolicy::Ask => match decision {
-            Some(SudoDecision::Allow) if has_password => SudoAction::Inject,
-            // 用户拒绝、超时未响应、或本就无密码可注入。
-            _ => SudoAction::Deny,
-        },
-    }
-}
 
 /// 供界面展示的策略说明。
+///
+/// 措辞随 D47/D48 更新：提权已改为独立通道的 `run_as_root` 工具，
+/// 数据面上的 `sudo` 命令**在任何策略下都被拒绝**（它拿不到密码），
+/// 因此这里的说明必须讲"是否允许 Agent 提权"，而不是"如何注入密码"。
 pub fn policy_description(policy: SudoPolicy) -> &'static str {
     match policy {
-        SudoPolicy::Deny => "Agent 执行 sudo 时自动拒绝（最安全）",
-        SudoPolicy::Ask => "sudo 需要提权时通知你确认",
-        SudoPolicy::Auto => "自动注入密码执行 sudo",
+        SudoPolicy::Deny => "不允许 Agent 提权（默认，最安全）",
+        SudoPolicy::Ask => "Agent 请求提权时通知你确认",
+        SudoPolicy::Auto => "Agent 请求提权时自动使用该主机的提权密码",
     }
 }
 
@@ -243,110 +180,36 @@ pub fn validate_for_policy(policy: SudoPolicy, has_password: bool) -> Result<()>
 mod tests {
     use super::*;
 
-    #[test]
-    fn deny_policy_never_enables_askpass() {
-        let ctx = SudoContext {
-            policy: SudoPolicy::Deny,
-            password: Some(Zeroizing::new("pw".to_string())),
-        };
-        // 即使配置了密码，deny 也不部署 askpass——这是模式一的实现方式。
-        assert!(!ctx.needs_askpass());
-    }
-
-    #[test]
-    fn ask_and_auto_policies_enable_askpass() {
-        for policy in [SudoPolicy::Ask, SudoPolicy::Auto] {
-            let ctx = SudoContext {
-                policy,
-                password: Some(Zeroizing::new("pw".to_string())),
-            };
-            assert!(ctx.needs_askpass(), "{policy:?} 应部署 askpass");
-        }
-    }
-
-    #[test]
-    fn auto_injects_when_password_present() {
-        assert_eq!(
-            resolve_action(SudoPolicy::Auto, true, None),
-            SudoAction::Inject
-        );
-    }
-
-    #[test]
-    fn auto_fails_closed_without_password() {
-        // 关键：没有密码时不能假装成功，否则用户以为策略生效而实际一直失败。
-        assert_eq!(
-            resolve_action(SudoPolicy::Auto, false, None),
-            SudoAction::Deny
-        );
-    }
-
-    #[test]
-    fn ask_injects_only_when_user_allows() {
-        assert_eq!(
-            resolve_action(SudoPolicy::Ask, true, Some(SudoDecision::Allow)),
-            SudoAction::Inject
-        );
-        assert_eq!(
-            resolve_action(SudoPolicy::Ask, true, Some(SudoDecision::Deny)),
-            SudoAction::Deny
-        );
-    }
-
-    #[test]
-    fn ask_without_response_defaults_to_deny() {
-        // 无人响应时不得默认提权。
-        assert_eq!(
-            resolve_action(SudoPolicy::Ask, true, None),
-            SudoAction::Deny
-        );
-    }
-
-    #[test]
-    fn timeout_decision_is_deny() {
-        assert_eq!(SudoDecision::on_timeout(), SudoDecision::Deny);
-    }
-
-    /// `AskOutcome` →（决策、是否记住）的完整映射。
+    /// 守的是一条**权限边界不变式**：除「允许」外一律不得提权。
     ///
-    /// 守的是一条**权限边界不变式**：除「允许」外一律不得提权，
-    /// 且必须被记住——不记住，同一条命令里的 sudo 重试就会反复弹窗（Q36）。
+    /// 超时与"询问通道不可用"都必须按拒绝处理（fail-closed）——
+    /// 无人应答时默认提权，等于把"人类确认"这道闸门变成摆设。
     #[test]
-    fn only_allow_may_escalate_and_every_other_outcome_is_remembered() {
+    fn only_allow_may_escalate() {
         let cases = [
-            (AskOutcome::Allowed, SudoDecision::Allow, false),
-            (AskOutcome::Denied, SudoDecision::Deny, true),
-            (AskOutcome::TimedOut, SudoDecision::Deny, true),
-            (AskOutcome::Unavailable, SudoDecision::Deny, true),
-            (AskOutcome::DeniedByMemo, SudoDecision::Deny, true),
+            (AskOutcome::Allowed, SudoDecision::Allow),
+            (AskOutcome::Denied, SudoDecision::Deny),
+            (AskOutcome::TimedOut, SudoDecision::Deny),
+            (AskOutcome::Unavailable, SudoDecision::Deny),
         ];
-        for (outcome, decision, remember) in cases {
+        for (outcome, decision) in cases {
             assert_eq!(outcome.decision(), decision, "{outcome:?} 的决策不符");
-            assert_eq!(
-                outcome.should_remember(),
-                remember,
-                "{outcome:?} 的记忆语义不符"
-            );
-            assert!(
-                !outcome.audit_note().is_empty(),
-                "{outcome:?} 必须有审计备注"
-            );
+            assert!(!outcome.audit_note().is_empty(), "{outcome:?} 必须有审计备注");
         }
     }
 
-    /// 五种来源的审计备注两两不同。
+    /// 四种来源的审计备注两两不同。
     ///
     /// 守的是审计的可核对性：命令历史里读到哪一条备注，就唯一对应一种经过。
-    /// 若"当场拒绝"与"自动沿用"用了同一句话，人类事后核对时会误以为
-    /// 每一次重试都是自己点的拒绝。
+    /// 若"当场拒绝"与"等待超时"用了同一句话，人类事后核对时会误以为
+    /// 自己点过拒绝。
     #[test]
-    fn audit_notes_distinguish_every_ask_outcome() {
+    fn audit_notes_distinguish_every_outcome() {
         let notes = [
             AskOutcome::Allowed,
             AskOutcome::Denied,
             AskOutcome::TimedOut,
             AskOutcome::Unavailable,
-            AskOutcome::DeniedByMemo,
         ]
         .map(AskOutcome::audit_note);
 
@@ -360,12 +223,8 @@ mod tests {
     }
 
     #[test]
-    fn ask_with_allow_but_no_password_still_denies() {
-        // 用户点了"允许"但主机没配密码——不能凭空提权。
-        assert_eq!(
-            resolve_action(SudoPolicy::Ask, false, Some(SudoDecision::Allow)),
-            SudoAction::Deny
-        );
+    fn timeout_decision_is_deny() {
+        assert_eq!(SudoDecision::on_timeout(), SudoDecision::Deny);
     }
 
     #[test]
@@ -375,30 +234,28 @@ mod tests {
 
     #[test]
     fn validate_rejects_ask_without_password() {
-        let err = validate_for_policy(SudoPolicy::Ask, false).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("sudo 密码"), "应给出可操作的提示：{msg}");
+        // 配置为需要提权却没有密码：必须在建立终端时就明确报错，
+        // 而不是让 Agent 在提权时收到一句莫名其妙的话（P1）。
+        assert!(validate_for_policy(SudoPolicy::Ask, false).is_err());
+        assert!(validate_for_policy(SudoPolicy::Auto, false).is_err());
     }
 
     #[test]
     fn validate_passes_when_password_provided() {
-        for policy in [SudoPolicy::Ask, SudoPolicy::Auto] {
-            assert!(validate_for_policy(policy, true).is_ok());
-        }
+        assert!(validate_for_policy(SudoPolicy::Ask, true).is_ok());
+        assert!(validate_for_policy(SudoPolicy::Auto, true).is_ok());
     }
 
     #[test]
     fn debug_hides_password() {
+        // D6 / P2：密码不得经日志或 panic 信息泄露。
         let ctx = SudoContext {
             policy: SudoPolicy::Auto,
-            password: Some(Zeroizing::new("SUPER-SECRET".to_string())),
+            password: Some(Zeroizing::new("s3cret".to_string())),
         };
-        let debug = format!("{ctx:?}");
-        assert!(
-            !debug.contains("SUPER-SECRET"),
-            "Debug 输出不得包含密码：{debug}"
-        );
-        assert!(debug.contains("redacted"));
+        let shown = format!("{ctx:?}");
+        assert!(!shown.contains("s3cret"), "调试输出泄露了密码：{shown}");
+        assert!(shown.contains("redacted"), "应显示占位符：{shown}");
     }
 
     #[test]
@@ -409,6 +266,7 @@ mod tests {
         };
         assert_eq!(auto.password_for_auto(), Some("pw"));
 
+        // ask 模式必须走人类确认，不得被任何路径直接取走密码。
         let ask = SudoContext {
             policy: SudoPolicy::Ask,
             password: Some(Zeroizing::new("pw".to_string())),

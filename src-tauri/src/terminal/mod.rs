@@ -40,7 +40,7 @@ pub mod sudo;
 
 pub use events::{event_channel, EventSink, TerminalEvent, EVENT_TERMINAL};
 pub use sudo::{
-    resolve_action, policy_description, validate_for_policy, AskOutcome, SudoAction, SudoContext,
+    policy_description, validate_for_policy, AskOutcome, SudoContext,
     SudoDecision, SudoRequest,
 };
 
@@ -60,15 +60,6 @@ struct ActiveCommand {
     /// 命令结束后的退出码；`None` 表示仍在执行。
     exit_code: Option<i32>,
     started: Instant,
-    /// 本条命令的 sudo 提权是否已被拒绝（Q36）。
-    ///
-    /// sudo 密码错误时会重试（默认最多 3 次），每次重试都重新调用 askpass、
-    /// 产生一次新的索要。拒绝一经给出便对**本条命令**的后续索要生效，
-    /// 人类只被问一次。
-    ///
-    /// 记忆挂在"当前命令"上，随命令结束（`active` 置回 `None`）自动消失：
-    /// 它不是"该终端禁止提权"，下一条命令照常询问。
-    sudo_denied: bool,
 }
 
 /// 命令结束信号，用于唤醒同步等待者。
@@ -342,12 +333,12 @@ impl TerminalRuntime {
             // 锁在此释放——SSH 连接期间不占用数据库。
         };
 
-        // askpass 仅在三模式中的 ask/auto 下部署（Q33）。
-        let sudo_enabled = sudo_ctx.needs_askpass();
+        // 数据面 sudo 垫片的指引随策略变化（D48）：deny 时说明该主机已禁用提权。
+        let elevation_allowed = sudo_ctx.policy != SudoPolicy::Deny;
         let auth = AuthMethod::from_credential(&credential);
 
         // --- 阶段 2：建立会话（无数据库锁） ---
-        match Session::connect(&terminal.id, &host, auth, sudo_enabled).await {
+        match Session::connect(&terminal.id, &host, auth, elevation_allowed).await {
             Ok((session, rx)) => {
                 // --- 阶段 3：回写 TOFU 主机密钥与环境快照 ---
                 let mut terminal = terminal;
@@ -497,10 +488,10 @@ impl TerminalRuntime {
             (terminal, host, auth, sudo_ctx)
         };
 
-        let sudo_enabled = sudo_ctx.needs_askpass();
+        let elevation_allowed = sudo_ctx.policy != SudoPolicy::Deny;
 
         // --- 阶段 2：重建会话 ---
-        let (session, rx) = Session::connect(&terminal.id, &host, auth, sudo_enabled).await?;
+        let (session, rx) = Session::connect(&terminal.id, &host, auth, elevation_allowed).await?;
         self.register(db, &terminal.id, session, rx, sudo_ctx, host_label(&host))
             .await;
 
@@ -562,9 +553,9 @@ impl TerminalRuntime {
         self.unregister(terminal_id).await;
 
         let (host, auth, sudo_ctx) = load_connection_context(db, key, &terminal).await?;
-        let sudo_enabled = sudo_ctx.needs_askpass();
+        let elevation_allowed = sudo_ctx.policy != SudoPolicy::Deny;
 
-        let (session, rx) = Session::connect(&terminal.id, &host, auth, sudo_enabled).await?;
+        let (session, rx) = Session::connect(&terminal.id, &host, auth, elevation_allowed).await?;
         let note = format!(
             "原 SSH 会话已断开，已自动重建（主机 {}）；\
              shell 状态已重置：工作目录、环境变量、后台进程均不再保留",
@@ -681,7 +672,6 @@ impl TerminalRuntime {
                     exit_code: None,
                     started,
                     // 新命令重新开始：提权的询问记忆不跨命令（Q36）。
-                    sudo_denied: false,
                 });
 
                 // 会话重建的审计备注（D39）：写在**这条**命令的输出开头。
@@ -1089,18 +1079,6 @@ fn spawn_output_pump(
                     // 避免因标记错位而永久阻塞。
                     entry.finished.mark_finished();
                 }
-                SessionOutput::SudoRequest { token } => {
-                    // Q33：按该主机的策略决定是否注入密码。
-                    // 关键词：ask 模式会等待用户确认，因此这里必须
-                    // **脱离输出泵的读取循环**去处理，否则会阻塞后续输出。
-                    //
-                    // 并发索要是安全的：每次索要各有自己的 FIFO（B2），
-                    // 应答按 (nonce, token) 精确投递，不会互相抢走。
-                    let entry = entry.clone();
-                    tokio::spawn(async move {
-                        handle_sudo_request(&entry, &token).await;
-                    });
-                }
                 SessionOutput::SudoPrompt => {
                     // D47：密码提示只应出现在**提权通道**上（由提权编排处理）。
                     // 数据面收到它说明状态异常（例如有人在数据面上直接跑了
@@ -1287,90 +1265,19 @@ pub(crate) fn decide_session_action(
     }
 }
 
-/// 等待用户对 sudo 请求的响应超时（Q33：拒绝或超时都让 sudo 失败）。
+/// 等待用户对提权请求的响应超时（Q33：拒绝或超时都让提权失败）。
 const SUDO_ASK_TIMEOUT: Duration = Duration::from_secs(crate::domain::SUDO_ASK_TIMEOUT_SECS);
 
-/// 处理一次 sudo 请求：按策略决定注入还是拒绝（Q33）。
+/// 等待人类对本次提权的决定（Q33 的 `ask` 模式）。
 ///
-/// `token` 标识本次索要（远端 askpass PID），应答据此精确定向到该次索要的
-/// FIFO——这是并发索要不会互相错配的前提（B2）。
-async fn handle_sudo_request(entry: &TerminalEntry, token: &str) {
-    let sudo = entry.sudo.clone();
-    let has_password = sudo.password.is_some();
-
-    let (decision, audit_note) = match sudo.policy {
-        // ask 模式：先取人类决策（本条命令已拒绝过则不再询问，Q36）。
-        // 先记下"这次询问属于哪条命令"：拒绝只记在那条命令上。
-        SudoPolicy::Ask => {
-            let asked_for = current_command_id(entry).await;
-            let outcome = ask_human(entry, asked_for.as_deref()).await;
-            (Some(outcome.decision()), outcome.audit_note())
-        }
-        SudoPolicy::Auto => (None, "sudo 提权请求：按主机策略自动注入密码"),
-        // deny 模式不会部署 askpass，正常不会走到这里；保守按拒绝记录。
-        SudoPolicy::Deny => (None, "sudo 提权请求：该主机已禁用提权注入"),
-    };
-
-    match resolve_action(sudo.policy, has_password, decision) {
-        SudoAction::Inject => {
-            let password = sudo
-                .password
-                .as_deref()
-                .map(|s| s.as_str())
-                .unwrap_or_default();
-
-            match entry.session.send_sudo_password(token, password).await {
-                Ok(()) => tracing::info!(
-                    host = %entry.host_label,
-                    "已按策略注入 sudo 密码"
-                ),
-                Err(e) => {
-                    // 注入失败仍必须让 sudo 结束，否则命令会一直挂着。
-                    tracing::error!("注入 sudo 密码失败：{e}");
-                    let _ = entry.session.deny_sudo(token).await;
-                    push_audit_note(entry, "sudo 提权：密码注入失败，本次提权已失败").await;
-                    return;
-                }
-            }
-        }
-        SudoAction::Deny => {
-            // 关键：必须**回应**这次索要——向该次索要的 FIFO 写入空行，让 askpass
-            // 以空密码应答、sudo 随即认证失败。若什么都不做，askpass 会一直阻塞在
-            // read 上（直到 120 秒兜底超时），而命令串行执行，队列会被拖住
-            // （见 docs/design/sudo.md §7.3）。
-            if let Err(e) = entry.session.deny_sudo(token).await {
-                tracing::error!("回应 sudo 拒绝（写入空密码）失败：{e}");
-            }
-            tracing::info!(
-                host = %entry.host_label,
-                policy = ?sudo.policy,
-                "已拒绝 sudo 密码注入"
-            );
-        }
-    }
-
-    // 人类侧审计（O3）：提权决策必须留在命令历史里，可被事后核对。
-    // 只记决策与来源，绝不记录密码本身。
-    push_audit_note(entry, audit_note).await;
-}
-
-/// 取人类对本次提权的决定（Q36 / Q33）。
+/// 与旧机制（askpass + FIFO）相比，这里**不再需要"同一命令只问一次"的记忆**：
+/// 提权改由 `run_as_root` 以单命令形态执行（D47），一次调用只提权一次、
+/// 也就只问一次；数据面的 `sudo` 已被 [`crate::ssh::protocol::sudo_reject_shim`]
+/// 明确拒绝（D48），不会再出现"sudo 认证失败后重试"带来的连环询问
+/// （那正是 Q36 当初要解决的问题的成因）。
 ///
-/// 本条命令此前已被拒绝时**不再询问**，直接沿用——这正是 Q36 的目的：
-/// sudo 密码错误会重试（默认 3 次），每次都弹窗等于让人在几十秒内
-/// 连点三次几乎相同的「拒绝」。
-///
-/// `asked_for` 是发起询问时的命令标识：拒绝只记在那条命令上（见
-/// [`remember_denial`]）。
-async fn ask_human(entry: &TerminalEntry, asked_for: Option<&str>) -> AskOutcome {
-    if denial_is_remembered(entry).await {
-        tracing::info!(
-            host = %entry.host_label,
-            "本条命令已拒绝过 sudo 提权，自动沿用拒绝（不再询问）"
-        );
-        return AskOutcome::DeniedByMemo;
-    }
-
+/// 超时与通道异常都按**拒绝**处理（fail-closed）：无人应答时不得默认提权。
+async fn ask_human(entry: &TerminalEntry) -> AskOutcome {
     let request = SudoRequest {
         request_id: crate::domain::new_id("sudo"),
         terminal_id: entry.session.terminal_id().to_string(),
@@ -1378,78 +1285,17 @@ async fn ask_human(entry: &TerminalEntry, asked_for: Option<&str>) -> AskOutcome
     };
 
     // 注意：等待人类应答期间**不得持有** `active` 锁——输出泵要用它记录输出，
-    // 持锁等待会让整条命令的输出在弹窗期间停止积累。
+    // 持锁等待会让这条命令的输出在弹窗期间停止积累。
     let rx = (entry.asker)(request);
-    let outcome = match tokio::time::timeout(SUDO_ASK_TIMEOUT, rx).await {
+    match tokio::time::timeout(SUDO_ASK_TIMEOUT, rx).await {
         Ok(Ok(SudoDecision::Allow)) => AskOutcome::Allowed,
         Ok(Ok(SudoDecision::Deny)) => AskOutcome::Denied,
         // 通道异常（桥接不可用）：无法询问，等同拒绝。
         Ok(Err(_)) => AskOutcome::Unavailable,
         Err(_) => {
-            tracing::info!("sudo 确认请求超时，按拒绝处理");
+            tracing::info!("提权确认请求超时，按拒绝处理");
             AskOutcome::TimedOut
         }
-    };
-
-    if outcome.should_remember() {
-        remember_denial(entry, asked_for).await;
-    }
-    outcome
-}
-
-/// 当前正在执行的命令标识（没有则为 `None`）。
-async fn current_command_id(entry: &TerminalEntry) -> Option<String> {
-    let active = entry.active.lock().await;
-    active.as_ref().map(|a| a.command_id.clone())
-}
-
-/// 本条命令此前是否已被拒绝过提权（Q36）。
-///
-/// 记忆挂在"当前命令"上（见 [`ActiveCommand::sudo_denied`]）：命令一结束
-/// 记忆即消失，下一条命令照常询问。当前没有执行中的命令时按"未拒绝"处理
-/// （例如上一条命令留下的后台进程又触发了一次 sudo）——宁可按常规询问，
-/// 也不要让一次旧拒绝静默吞掉新问题的确认机会。
-async fn denial_is_remembered(entry: &TerminalEntry) -> bool {
-    let active = entry.active.lock().await;
-    active.as_ref().is_some_and(|a| a.sudo_denied)
-}
-
-/// 记住"**这条**命令的提权已被拒绝"（Q36）。
-///
-/// `asked_for` 是发起询问时的命令标识，必须与当前命令一致才记——
-/// 人类可能在弹窗期间等上几十秒，而提问那条命令可能早已结束
-/// （例如后台进程触发的索要）。不校验就会把拒绝记到**下一条**命令上，
-/// 使它的确认被静默跳过：方向虽然仍是"拒绝"，但人类会莫名失去一次确认机会。
-async fn remember_denial(entry: &TerminalEntry, asked_for: Option<&str>) {
-    let mut active = entry.active.lock().await;
-    if let Some(a) = active.as_mut() {
-        if denial_applies_to(Some(a.command_id.as_str()), asked_for) {
-            a.sudo_denied = true;
-        }
-    }
-}
-
-/// 这次拒绝是否应记在当前命令上（Q36）。
-///
-/// 抽成纯函数，是因为它守的竞态分支在端到端里无法稳定复现
-/// （要求命令恰好在人类应答期间结束），见 [`remember_denial`]。
-fn denial_applies_to(current: Option<&str>, asked_for: Option<&str>) -> bool {
-    match (current, asked_for) {
-        // 有当前命令才能记；且必须是**发起这次询问的那条**命令。
-        (Some(current), Some(asked_for)) => current == asked_for,
-        // 没有当前命令（命令已结束）：无处可记，也不该记到别的命令上。
-        _ => false,
-    }
-}
-
-/// 把一条审计备注写进当前命令的输出（O3）。
-///
-/// 人类侧的终端审计视图按命令展示输出，因此提权决策写在这里就能被看到，
-/// 无需新增存储结构。当前没有执行中的命令时静默跳过。
-async fn push_audit_note(entry: &TerminalEntry, note: &str) {
-    let mut active = entry.active.lock().await;
-    if let Some(a) = active.as_mut() {
-        a.output.push_line(&format!("[mf-perch] {note}"));
     }
 }
 
@@ -1515,8 +1361,8 @@ async fn run_root_locked(
     let password = match sudo_ctx.policy {
         // auto：直接取已配置的提权密码；没有密码则 fail-closed（不猜、不尝试）。
         SudoPolicy::Auto => sudo_ctx.password_for_auto().map(|s| s.to_string()),
-        // ask：与数据面的 sudo 拦截同一套语义——由人类确认后才投递密码。
-        SudoPolicy::Ask => match ask_human(&entry, None).await.decision() {
+        // ask：由人类确认后才投递密码（提权通道上的唯一一次询问）。
+        SudoPolicy::Ask => match ask_human(&entry).await.decision() {
             SudoDecision::Allow => sudo_ctx.password.as_deref().map(|s| s.to_string()),
             SudoDecision::Deny => None,
         },
@@ -1546,7 +1392,6 @@ async fn run_root_locked(
             output: OutputAccumulator::new(max_bytes, max_lines),
             exit_code: None,
             started: Instant::now(),
-            sudo_denied: false,
         });
     }
     entry.emit_event(TerminalEvent::CommandStarted {
@@ -1724,7 +1569,6 @@ async fn probe_data_plane_cwd(entry: &Arc<TerminalEntry>, _held: &ExecGuard) -> 
             output: OutputAccumulator::new(64 * 1024, 64),
             exit_code: None,
             started: Instant::now(),
-            sudo_denied: false,
         });
     }
     let mut finished_rx = entry.finished.subscribe();
@@ -1823,9 +1667,6 @@ async fn pump_privileged_output(
                 // 这里绝不写密码（写错的字节会被后续命令帧当成命令执行）。
                 tracing::warn!("提权通道在就绪后再次收到密码提示，已忽略（不重复写密码）");
             }
-            SessionOutput::SudoRequest { .. } => {
-                tracing::warn!("提权通道收到 sudo 索要标记（该通道不部署拦截），已忽略");
-            }
             SessionOutput::Disconnected { reason } => {
                 let mut active = entry.active.lock().await;
                 if let Some(a) = active.as_mut() {
@@ -1893,27 +1734,6 @@ mod tests {
         assert_eq!(tail(text, 2), "4\n5");
         assert_eq!(tail(text, 10), text);
         assert_eq!(tail(text, 0), "");
-    }
-
-    /// 守的不变式：人类对 sudo 的拒绝**只对发起询问的那条命令**生效（Q36）。
-    ///
-    /// 记错命令的后果不是"更安全"，而是让别的命令的确认被静默跳过——
-    /// 人类以为自己会被问，实际没有。
-    #[test]
-    fn denial_is_recorded_only_for_the_command_that_asked() {
-        let cases = [
-            (Some("cmd_1"), Some("cmd_1"), true, "同一条命令：应记住"),
-            (Some("cmd_2"), Some("cmd_1"), false, "命令已切换：不得记到下一条上"),
-            (None, Some("cmd_1"), false, "命令已结束：无处可记"),
-            (Some("cmd_1"), None, false, "发起询问时没有命令：不得记"),
-        ];
-        for (current, asked_for, expected, why) in cases {
-            assert_eq!(
-                denial_applies_to(current, asked_for),
-                expected,
-                "{why}（current={current:?}, asked_for={asked_for:?}）"
-            );
-        }
     }
 
     #[tokio::test]
