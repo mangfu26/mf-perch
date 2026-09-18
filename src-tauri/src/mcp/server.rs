@@ -349,10 +349,9 @@ mod tests {
     use super::*;
     #[test]
     fn session_manager_does_not_inherit_rmcp_default_idle_timeout() {
-        // 回归：曾经直接使用 `LocalSessionManager::default()`，
-        // 于是 MCP 客户端空闲 5 分钟就被判"会话不存在"（客户用 MCP Inspector
-        // 实测反馈）。背景、根因与取舍见 docs/decisions.md 的 **D38**——
-        // rmcp 默认 `keep_alive` 是 300 秒这个"坑"记录在那里。
+        // 不变式：会话管理器**必须显式设置空闲超时**，不得沿用 rmcp 的默认值——
+        // 那只有 5 分钟，客户端空闲五分钟就被判"会话不存在"。
+        // 背景、根因与取舍（含该默认值这个"坑"）见 **D38**。
         //
         // 刻意**不**断言 rmcp 的默认值本身：那是第三方库的内部常量，
         // 它变了也不影响用户（我们已显式设为 `SESSION_IDLE_TIMEOUT`），

@@ -234,15 +234,11 @@ END;
 mod tests {
     use super::*;
 
-    /// `connection_lost` 必须能被真正写进库（客户 2026-09-16 要求）。
+    /// `connection_lost` 必须能被真正写进库。
     ///
     /// 判别性：`commands.status` 上有 CHECK 约束，只改枚举而忘了改建表语句时，
     /// 这条写入会以 `CHECK constraint failed` 失败——正是本用例要抓的缺陷。
-    ///
-    /// 注：**不做数据库迁移**（客户 2026-09-16 决定）。产品尚未发布，
-    /// 不背版本兼容成本；正式发布后若再改状态取值，才需要考虑迁移。
-    /// 代价：本机**旧**的 dev 库（约束还是四态）写入该状态会失败，
-    /// 删掉 `%APPDATA%/mf-perch/mf-perch.db` 即可。
+    /// （刻意**不做 schema 迁移**：理由与旧 dev 库的处置见 **D50**。）
     #[test]
     fn connection_lost_is_accepted_by_the_schema() {
         let conn = open_in_memory().expect("内存库");

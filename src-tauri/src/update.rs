@@ -716,8 +716,8 @@ mod tests {
 
     /// 清单里已支持的平台必须逐个映射正确：漏掉一个，该平台的更新检查就永远找不到安装包。
     ///
-    /// 这里对**全部**平台断言。原先用 `#[cfg(target_os = "windows")]` 包住断言行，
-    /// 在 macOS / Linux 上测试体为空、恒绿——等于没测（§5.3 的"绿灯假象"）。
+    /// 这里对**全部**平台断言。**不要**用 `#[cfg(target_os = "windows")]` 包住断言行：
+    /// 那样在 macOS / Linux 上测试体为空、恒绿——等于没测（§5.3 的"绿灯假象"）。
     #[test]
     fn platform_key_maps_every_supported_target() {
         let cases = [

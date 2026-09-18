@@ -261,7 +261,7 @@ Refs: #123
 
 | 文档 | 内容 | 时效性 |
 | ---- | ---- | ---- |
-| [`docs/decisions.md`](docs/decisions.md) | **技术决策记录（ADR）索引**：按域索引全部 D1–D52 + **取代关系表**（正文已拆到分片） | 现行 |
+| [`docs/decisions.md`](docs/decisions.md) | **技术决策记录（ADR）索引**：按域索引全部 D1–D53 + **取代关系表**（正文已拆到分片） | 现行 |
 | [`docs/decisions/`](docs/decisions/) | ADR **正文分片**，一条一个 `D<编号>.md`；由索引进入，不要整目录通读 | 现行（个别条目标"部分失效"） |
 | [`docs/decisions/archive/`](docs/decisions/archive/) | **整条已被移除/推翻**的决策原文（现含 D37、D44，均被 D49 移除） | **快照** |
 
@@ -311,13 +311,17 @@ Refs: #123
 ### 4.3 维护规则
 
 1. **入口唯一**：新增文档必须登记到本节（§4.2），否则等于不存在。
-2. **单一事实来源**：
-   - 技术决策 → `docs/decisions.md`（索引）与其指向的 `docs/decisions/D<编号>.md`（正文）；
-     新增决策写**新分片文件**并登记到索引，不要往索引里塞正文；
-   - 需求澄清的**结论** → 以 `docs/decisions.md` 为准；`docs/open-questions.md` 只保留
-     问题与状态，结论写摘要并指向对应决策，避免同一事实两处维护；
-   - 主题令牌 → **`src/styles/theme.css`**（运行时权威）；`docs/design/mockups/theme.css`
-     仅为**选型阶段快照**，改它不影响应用外观（见 D46）。
+2. **单一事实来源 = 同一知识点只允许一处权威落点**：
+   - **禁止复述**。同一事实写第二遍，就会随项目推进长出"两份版本不一致的描述"——
+     这不是冗余问题，是**冲突问题**：读到哪一份取决于运气，且两份会各自继续被改；
+   - 需要提及时**只引用**（指向文件路径 / `D<编号>` / `Q<编号>` / `P<编号>`），不要抄写内容；
+   - 既有落点分工（新增事实先对上表，对不上就先与客户确认落点）：
+     技术决策 → `docs/decisions.md`（索引）与其指向的 `docs/decisions/D<编号>.md`（正文）；
+     需求澄清的**结论** → 以 `docs/decisions.md` 为准，`docs/open-questions.md` 只保留
+     问题与状态；术语定义 → `docs/glossary.md`；MCP 契约 → `docs/mcp-tools.md`；
+     主题令牌 → **`src/styles/theme.css`**（运行时权威，见 D46）；
+     工程原则 → `docs/design/principles.md`；环境排错 → `docs/development-troubleshooting.md`；
+   - 新增决策写**新分片文件**并登记到索引，不要往索引里塞正文。
 3. **代码与文档同步**：改动若影响已记录的结论，**同一次提交内**更新对应文档；
    若推翻旧决策，**不要直接改旧条目**，而是新增一条决策说明取代关系
    （与 §2.3 的 `BREAKING CHANGE` 精神一致）。
@@ -332,6 +336,27 @@ Refs: #123
    > 一句话说明本文解决什么问题
    ```
 
+6. **只写现行事实 + 一行理由，不写流水账**（判据与例外见 **D53**）：
+   - 默认形态是"**实现 X；因为 Y**"，不是"**某年某月我们把 X 改成了 Y，因为原来是 Z**"；
+     改动过程由 git 历史承担（提交信息遵循 §2，因果链本来就在 `git log` 里）；
+   - **判据（一句话决定留不留）**：**删掉这段，下一个接手的 Agent 会不会重新提出这个
+     已被否掉的方案？**
+     - **会** → 留，但**压成一行护栏**（例：`不要引入 sccache，理由见
+       docs/development-troubleshooting.md 对应小节`；`不要对外声称支持 ProxyJump（D45）`）；
+     - **不会** → 删（例：某个中间版本实现过又整体移除的代码形态描述、"顺带修正"的过程记录）；
+   - **例外（不受本条约束，必须留）**：残余风险与能力边界（如 `security-audit.md` V2、
+     `requiretty` 不支持提权）、能区分对错实现的教训（P3 / P4）——那是学费，删了就是退款。
+7. **表述必须环境无关**（**D53**）：**无法假设后续接手者的机器比谁更好或更差**，
+   所以规则要写成**条件 + 机制**，不是写成某台机器的事实。
+   - 反例 → 正例：
+     `本机是机械硬盘，所以 -j 调大更慢` →
+     **`target` 位于机械硬盘（随机 I/O 受限）时**，提高并行度只是把瓶颈从 CPU 换到
+     内存与磁盘，不换来速度；
+   - 具体读数**保留但降级**：作为标注了日期与取法的**示例依据**
+     （"参考实测：2026-09-16 一台 4 核 / 7.9 GB 内存 / 机械盘开发机……"），
+     用来支撑机制判断，**不作为规则的适用前提**；
+   - 同样适用于代码注释：写"这个不变量为什么重要"，不写"我这台机器上它表现如何"。
+
 ### 4.4 已知缺口（对外说明前必看）
 
 > 这些是**已承诺但尚未实现**或**已知有残余风险**的事项。
@@ -339,9 +364,9 @@ Refs: #123
 
 | 项 | 状态 | 说明 |
 | ---- | ---- | ---- |
-| **ProxyJump** | ❌ **不在首发范围（D45）** | 原 D11 / Q9 曾承诺"MVP 含 ProxyJump"，**已由 D45 移出首发、列为未来新增功能**（客户评估：场景不高频、不急切）。当前只有数据管道字段（DB / 领域模型 / IPC），**前端无控件、连接层完全未使用**，无任何路径能让跳板机生效。半成品字段保留不删。对外**不得声称支持 ProxyJump**。见 [`docs/decisions.md`](docs/decisions.md) D45 |
-| **sudo 凭据边界（V1）** | ✅ **已根治（D47 / D48 / D49，2026-09-16）** | 提权改为**双通道**：普通命令走数据面（无 TTY、协议不变），提权由应用**自建的一条短命通道**以 `sudo -S` 投递（自有提示标记握手，每条通道最多写一次密码）。**数据面上的 `sudo` 被明确拒绝**（shell 垫片：非 0 返回 + 指引改用 `run_as_root`）；**旧的 askpass / FIFO 投递机制已整体移除**，远端不再产生任何本应用的文件（`$HOME/.mf-perch` 的清理逻辑随之删除）。新增 MCP 工具 `run_as_root(command, cwd=None)`（工具总数 7→8），cwd 自动继承（提权前在数据面**按需探测一次**当前目录，该探测不写命令历史，D48），环境按 sudo 语义重置；实际 uid 由远端核实并如实回报，非 0 时输出明确告警。三种模式含义收敛为"是否允许 Agent 经该工具提权"。**`requiretty` 主机不支持提权**（明确报错——两条提权失败文案都会点明常见原因是 `Defaults requiretty`，并给出两条出路：由人类移除该选项，或为该主机配置免密路径 `NOPASSWD` / `pam_ssh_agent_auth`；D47 定稿不做 PTY 回退）。**残余风险如实标注**：同 UID 理论上仍可经 `/proc/<pid>/fd/0` 尝试读取提权通道进程的 stdin，可行性取决于 `yama/ptrace_scope`（**未实测**），故对外表述用"提权密码不进入 Agent 的用户域"，不宣称"绝对不可读"。见 [`docs/decisions.md`](docs/decisions.md) **D47 / D48 / D49** |
-| **协议标记可被 Agent 伪造（V2）** | ⚠️ **已缓解未根治**（D3 的已知残余风险） | 结束 / 就绪标记带**每会话随机 128 位 nonce**，因此"命令输出恰好长得像标记"不会误判；但 nonce 是包装脚本里的 shell 变量，而 **Agent 的命令就运行在同一个 shell 中**（`echo "$mfperch_nonce"` 即可读到），所以它**能**伪造结束标记——影响命令状态与审计内容（输出看起来提前结束、记录被污染）。**这不是对抗性安全边界**：提高位宽只让盲猜不可行，挡不住主动读取。真正消除需把标记改由**独立通道**传递（如 SSH stderr 专线 + 双工确认），属协议层改动。见 [`docs/security-audit.md`](docs/security-audit.md) **V2 与 §4 遗留项 1**，以及代码注释 `src/ssh/protocol.rs` 的 `new_nonce`（"已记录为待评估项"）。对外**不得声称"Agent 无法伪造输出边界"** |
+| **ProxyJump** | ❌ **不在首发范围（D45）** | 对外**不得声称支持 ProxyJump**。现状：只有数据管道字段（DB / 领域模型 / IPC），前端无控件、连接层完全未使用，没有任何路径能让跳板机生效；半成品字段保留不删。取舍与演进见 **D45** |
+| **sudo 凭据边界（V1）** | ✅ **已根治（D47 / D48 / D49）** | 机制不在此处复述，见 **D47–D49** 与 [`design/sudo.md`](docs/design/sudo.md) §0。对外说辞两条红线：<br>① 只说"提权密码不进入 Agent 的用户域"，**不宣称"绝对不可读"**——同 UID 理论上仍可尝试读提权通道进程的 stdin，可行性取决于 `yama/ptrace_scope`（**未实测**，属如实标注的残余风险）；<br>② `Defaults requiretty` 的主机**不支持提权**（明确报错并给出两条出路），**不得声称全主机可用**；D47 定稿不做 PTY 回退 |
+| **协议标记可被 Agent 伪造（V2）** | ⚠️ **已缓解未根治**（D3 的已知残余风险） | 每会话随机 nonce 使"输出恰好长得像标记"不会误判，但 Agent 与普通命令同 shell，**主动读取即可伪造**结束标记；提高位宽挡不住。根治需把标记改由**独立通道**传递，属协议层改动。对外**不得声称"Agent 无法伪造输出边界"**。详见 [`security-audit.md`](docs/security-audit.md) **V2 与 §4 遗留项 1**、`src/ssh/protocol.rs` 的 `new_nonce` 注释 |
 | **远程明文传输** | ⚠️ 已决策接受（D30） | 开启"允许远程连接"后 Token 与命令内容在网络中明文传输；局域网场景客户已接受，保留为未来工作 |
 | 未完成任务 | — | Q32（备份与同步需求，二期；Q29 提交身份邮箱已按 noreply 落地，2026-09-15） |
 
@@ -349,13 +374,11 @@ Refs: #123
 
 | 项 | 说明 |
 | ---- | ---- |
-| 结论重复 | `docs/open-questions.md` 的"已确认结论"与 `docs/decisions.md` 内容重叠，尚未完全合并（规则见 §4.3.2） |
+| 结论重复 | `docs/open-questions.md` 各条的"结论"仍在复述 ADR 内容。**收敛模式已定**（一行结论 + 指向权威落点，不复述）：Q26 已按此处理，其余条目待逐条收敛（规则见 §4.3.2） |
 | 设计文档措辞 | 部分设计文档正文仍以"本文评估 / 团队建议"的口吻写成，但方案客户**已确认**；状态行已修正，正文措辞可在后续顺手统一 |
 
-> **历史沿革**：`docs/security-audit.md` 记录的那轮审计发现了一个曾被测试绿灯掩盖的严重缺陷
-> （sudo 密码明文落盘）。教训已沉淀为 [`docs/design/principles.md`](docs/design/principles.md) 的 **P3**，
-> 并在本文件 §2.6 安全红线中引用：**功能测试通过不等于安全属性成立**，
-> 涉及安全属性的修复必须构造能区分对错实现的断言。
+> P3 的由来（一次被测试绿灯掩盖的缺陷）记录在 [`docs/security-audit.md`](docs/security-audit.md)；
+> 该原则本身以 [`design/principles.md`](docs/design/principles.md) **P3** 为准，§2.6 已引用。
 
 ### 4.6 当前测试债
 
@@ -376,7 +399,18 @@ Refs: #123
 | `tests/ssh_integration.rs::session_is_not_confused_by_marker_like_output` ↔ `src/ssh/session.rs` 的 nonce 单测 | **不是重复**。单测喂的是合成输入，集成测试走真实 SSH 回显与真实输出交错 |
 | `src/ipc/tests.rs`、`src/mcp/tools.rs` 的 fixture ↔ `tests/common/mod.rs` | **无法合并**。`src/` 内的单元测试在生产 crate 内部，拿不到 `tests/` 的模块，只能各自保留 |
 
-**本轮已清偿**（保留记录，避免重复劳动）：集成测试 fixture 已收敛到 `tests/common/mod.rs`（`test_state` / `need_env` / `need_env_port`）；`src/sudo_bridge.rs` 全部用例改经 `register_pending` 登记，不再直接操作私有字段；`tests/mcp_e2e.rs` 的 `poll1` 改为精确四态断言；`tests/mcp_e2e.rs` 中与 `src/mcp/tools.rs` 重复的工具 schema **内容**断言已删（保留"经协议返回为对象形态"这一端到端事实）；`src/ssh/protocol.rs` 的真子集用例 `session_setup_only_cleans_regular_files_with_delete_flag` 曾以"被同文件 `session_setup_deletes_leave_no_window_for_plaintext` 严格覆盖"为由删除（后者遍历**每一处** `-delete` 并额外断言删除早于本会话 askpass 写入，前者只看第一处）；**这两个用例现已随旧机制（D49）一并删除**——两者断言的都是 askpass / FIFO 清理的时序，而数据面已无密码落点，该"严格覆盖"关系与两条用例都不复存在（**不要再去代码里找它们**；现行不变式由 `wrapper_script_always_installs_reject_shim` 与 `reject_shim_refuses_and_guides_to_the_tool` 守住）；`src/mcp/server.rs` 的 `rmcp_default_idle_timeout_is_the_five_minute_trap` 已删——它断言的是第三方库的内部常量，失败不指向用户问题（§5.1 自检为「否」），知识已完整保存在 `docs/decisions.md` **D38** 与 `src/mcp/server.rs` 的生产注释中，而真不变式（我们的值不等于该默认值、且足够长）另有两条用例覆盖；相邻用例的注释已改为指向 D38，并说明为何刻意不再断言上游默认值；**前端测试基础设施已落地**（vitest 覆盖 `src/lib/` 纯逻辑，另有 `scripts/check-ipc-contract.mjs` 守住跨语言命令名契约），范围与边界见 §5.9。
+**已清偿的测试债**（只留结论与护栏，删除过程在 `git log`）：
+
+- 集成测试 fixture 已收敛到 `tests/common/mod.rs`（`test_state` / `need_env` / `need_env_port`）；
+  `src/sudo_bridge.rs` 的用例统一经 `register_pending` 登记，不直接操作私有字段；
+- **前端测试基础设施已落地**：vitest 覆盖 `src/lib/` 纯逻辑，另有
+  `scripts/check-ipc-contract.mjs` 守跨语言命令名契约，范围与边界见 §5.9；
+- **不要再去找密码投递旧机制（askpass / FIFO）时代的用例**——它们已随 D49 整体删除。
+  该面现行不变式由 `src/ssh/protocol.rs` 的 `wrapper_script_always_installs_reject_shim`、
+  `reject_shim_refuses_and_guides_to_the_tool` 与 `tests/sudo_e2e.rs` 守住；
+- **不要为第三方库的内部常量写断言**（曾有一条断言 rmcp 的默认空闲超时，已删）：
+  它失败不指向用户问题（§5.1 自检为「否」），且会逼人在升级依赖时改数字。
+  该知识保存在 **D38** 与 `src/mcp/server.rs` 的生产注释里，真不变式另有用例覆盖。
 
 ---
 
@@ -525,8 +559,9 @@ cd src-tauri && cargo test -j 2 --test sudo_e2e -- --ignored <用例名> --test-
 # 【提交前】全量：单元 + 不依赖真实环境的集成。**一次提交只跑一次**
 # -j 2：并发过高会耗尽 Windows 页面文件、把 target 产物写坏（E0463/E0462），
 #      现象、根因与恢复步骤见 docs/development-troubleshooting.md。
-#      **不要**为了"跑快点"把 -j 调大：本机 7.9 GB 内存、target 在机械盘上，
-#      并行链接会同时打爆内存与磁盘随机读（评估过程见该 troubleshooting 文档）。
+#      **不要**为了"跑快点"把 -j 调大：当可用内存有限、且 `target` 落在随机 I/O 慢的盘
+#      （机械盘）上时，并行链接只是把瓶颈从 CPU 换到内存与磁盘，换不来速度
+#      （条件判断与实测依据见该排错文档）。
 # 判读以 **cargo 自己的输出**为准（每个 target 的 test result: ok 才算绿；出现 FAILED /
 # error: test failed 才是红）。PowerShell 会把 cargo 的 stderr 警告当成错误，
 # 造成"全绿却退出码 1"；需要机器判读时写文件日志，别用 Select-Object -Last N 截断：

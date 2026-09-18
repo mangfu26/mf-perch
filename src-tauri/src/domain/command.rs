@@ -6,7 +6,7 @@ use super::new_id;
 ///
 /// `queued` → `running` → `completed` | `failed` | `connection_lost`
 ///
-/// **`failed` 与 `connection_lost` 刻意分开**（客户 2026-09-16 要求）：
+/// **`failed` 与 `connection_lost` 刻意分开**（**D50**）：
 /// 两者对审计的含义完全不同——
 /// - `failed`：命令**跑过并自己失败**（退出码非零），结果已知；
 /// - `connection_lost`：**连接断了，命令结局未知**（可能已执行完、可能跑了一半），
@@ -135,7 +135,7 @@ mod tests {
         assert_eq!(CommandStatus::parse("unknown"), None);
     }
 
-    /// **区分"命令失败"与"因断线而未完成"**（客户 2026-09-16 要求）。
+    /// **区分"命令失败"与"因断线而未完成"**（**D50**）。
     ///
     /// 判别性：把 `connection_lost` 当成 `failed`（或反过来当成 `completed`）
     /// 都会让这条断言失败——而这两类混淆正是审计里最要命的误导。

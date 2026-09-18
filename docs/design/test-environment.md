@@ -1,51 +1,28 @@
 # 测试环境方案
 
-> 状态：已确认（Q26）
-> 客户建议：使用本机 WSL 进行测试。
+> 状态：已确认（Q26 / D27）
+> 本文解决一件事：**如何搭建并复用 Windows 侧的真实 SSH 联调环境**。选型理由在 D27，不复述。
 
-## 1. 本机探测结果（2026-09-10）
+## 1. 环境选型
 
-| 项 | 状态 | 说明 |
-| ---- | ---- | ---- |
-| WSL 二进制 | ✅ 存在 | `C:\Windows\System32\wsl.exe` |
-| WSL 发行版 | ❌ **无** | `wsl -l -v` 返回帮助文本；`HKCU:\...\Lxss` 注册表为空；`AppData\Local\Packages` 无 Linux 发行版包 |
-| Docker | ❌ 未安装 | `docker: command not found` |
-| Podman | ❌ 未安装 | `podman: command not found` |
-| OpenSSH 客户端 | ✅ 有 | `OpenSSH_10.3p1`（Windows 侧） |
-| bash | ✅ 有 | Git Bash（Cygwin 5.3.9）——注意：**不是 Linux**，行为差异大，不能替代 |
+测试目标环境 = **WSL Ubuntu 内的 `openssh-server`**（监听 `127.0.0.1:2222`），
+Windows 侧通过**真实 SSH 协议**连接它，不用进程内 mock。
+**选型理由与替代方案（Docker / 客户远端主机）的取舍见 [D27](../decisions/D27.md)，不要在此重新评估。**
 
-**结论：本机当前没有可用的 Linux 测试环境。** WSL 已启用（二进制在），但未安装任何发行版。
+> 操作提醒：**Git Bash 不是 Linux 测试目标**——它是 Cygwin，`bash` 内建行为差异大，
+> 在它里面跑出来的结论不成立；本文的命令一律在 WSL 内执行。
 
-## 2. 可选路径
+## 2. 一次性准备（需客户执行，团队无法代劳）
 
-| 方案 | 操作 | 优点 | 缺点 |
-| ---- | ---- | ---- | ---- |
-| **W1 安装 WSL 发行版**（推荐） | 以管理员身份执行 `wsl --install -d Ubuntu`，重启后创建用户 | 真实 Linux 内核、真实 bash/sudo/sshd；可跑 systemd；一次配置长期可用 | 需要管理员权限 + 重启；占用约 1–2 GB 磁盘 |
-| W2 安装 Docker Desktop | 安装 Docker Desktop 后跑 `openssh-server` 容器 | 环境可重置、适合自动化 | 需安装较大软件；容器内 sudo/systemd 行为与真机有差异 |
-| W3 客户提供真实主机 | 客户提供 1–2 台带 sudo 的 Linux | 最真实 | 依赖客户提供；网络与环境不可控 |
-
-## 3. 团队建议：W1（WSL + Ubuntu）
-
-理由：
-
-1. **最贴近真实目标环境**：现行设计依赖 bash 内建 `read -d`（NUL 分帧）、`sudo -S` 的**stdin 密码投递**与 sudo 的 `env_reset` 语义、以及登录 shell 的环境加载——后者即设置页的「环境加载方式」（`shell_env_mode`），**现已真正接在远端启动路径上**（`protocol::wrapper_launch_command`，D4），这些在真实 Linux 上才可靠验证。**注意**：早期的 `sudo -A` / `SUDO_ASKPASS` 依赖已随 D47 / D49 整体移除。
-2. **可测试 sudo 三模式**：WSL 里可创建普通用户并配置 sudo 密码，完整验证 `deny` / `ask` / `auto`。
-3. **可作为 SSH 服务端**：WSL 内安装 `openssh-server` 并启动，Windows 侧通过 `127.0.0.1:<port>` 连接，完整走真实 SSH 协议。
-4. 一次配置，后续自动化测试可复用。
-
-### 3.1 需要客户配合的操作
-
-请以**管理员身份**打开 PowerShell 执行：
+`wsl --install` 需要管理员权限且需要重启：
 
 ```powershell
 wsl --install -d Ubuntu
 ```
 
-然后**重启电脑**，首次启动 Ubuntu 时设置用户名与密码。完成后告知我们，我们继续配置 SSH 服务端。
+重启后首次进入 Ubuntu 设置用户名与密码，然后告知团队继续配置 SSH 服务端。
 
-> 注意：`wsl --install` 需要管理员权限，且需要重启，团队无法代为执行。
-
-## 4. 在 WSL 中搭建测试目标的步骤（客户完成安装后，团队负责）
+## 3. 搭建步骤（客户完成安装后由团队执行）
 
 1. 安装并启动 SSH 服务端：
    ```bash
@@ -65,12 +42,12 @@ wsl --install -d Ubuntu
    - `deny` 模式无需特殊配置。
 5. 验证 `bash -l` 能加载 profile（写入一个测试用的 `~/.bash_profile`）。
 
-## 5. 已确认结论与实测结果（Q26，2026-09-10）
+## 4. 环境现状与实测记录
 
-- 客户答复：本机为 Windows 10，**使用 WSL 进行测试**。
-- 环境状态：客户已安装 **WSL Ubuntu 26.04**（内核 6.18、systemd 已启用、bash 5.3.9）。
+- 当前环境：**WSL Ubuntu 26.04**（内核 6.18、systemd 已启用、bash 5.3.9；2026-09-10 记录）。
+  选型与客户答复见 **D27 / Q26**，此处不复述。
 
-### 5.1 已搭建的测试环境
+### 4.1 已搭建的测试环境
 
 | 项 | 状态 |
 | ---- | ---- |
@@ -81,7 +58,7 @@ wsl --install -d Ubuntu
 | 搭建脚本 | `/home/mf/setup-mfperch-test.sh` |
 | Windows → WSL SSH 连通性 | ✅ 已实测 |
 
-### 5.2 实测验证结论（关键）
+### 4.2 实测验证结论（关键）
 
 **① 密钥认证与命令执行**：Windows 侧 `ssh -i ... -p 2222 mfperch@127.0.0.1` 成功登录并执行命令。
 
@@ -127,7 +104,7 @@ wsl --install -d Ubuntu
   建立后写一次该通道的 stdin（`sudo -S -p '<自有提示标记>'` 握手，见 D47 的 PoC 与 `sudo.md` §0）。
   上述 stdout / stderr 的坑随之不再适用。
 
-### 5.3 后续可复用的验证清单
+### 4.3 后续可复用的验证清单
 
 编码阶段可直接用该环境验证：
 - 密码认证 / 密钥认证 / passphrase 密钥；
@@ -138,7 +115,7 @@ wsl --install -d Ubuntu
 - 长命令异步执行与轮询；
 - 连接断开、终端 broken 状态、归档与恢复。
 
-### 5.4 阶段一端到端实测结果（2026-09-10）
+### 4.4 阶段一端到端实测结果（快照：2026-09-10）
 
 阶段一的 SSH 会话层已在该环境完成端到端验证：`src-tauri/tests/ssh_integration.rs`
 的 5 项集成测试全部通过（走真实 SSH 协议，非 mock）。
@@ -173,7 +150,7 @@ cargo test -j 2 --test ssh_integration -- --ignored --test-threads=1
 
 > 测试私钥位于 `.tmp-test/`（已被 `.gitignore` 排除，**绝不入库**）。
 
-### 5.5 测试规模与门禁（**会随开发变化**）
+### 4.5 测试规模与门禁（**会随开发变化**）
 
 > 下面只是**量级参考**，不保证与当前代码一致——数字会随开发漂移。
 > 需要准确值时以实际输出为准：`cd src-tauri && cargo test -j 2`、`pnpm test`。

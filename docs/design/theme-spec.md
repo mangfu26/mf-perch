@@ -52,7 +52,7 @@
 | ---- | ---- |
 | 侧边导航 | 选中项用 `--accent-soft` 背景 + 高亮文字 |
 | 主机卡片 | 选中项描边 `--accent`；运行中显示绿点（暗色带辉光） |
-| 状态标签 | 命令状态四态：`completed` 绿 / `running` 青 / `queued` 灰 / `failed` 红（`src/views/TerminalDetailView.vue`、`src/views/TerminalsView.vue`）；提权**不用标签**表达，改由命令文本前缀 `[特权用户(uid=0)]` 表达（D48 方案 A） |
+| 状态标签 | 命令状态五态（D50 起）：`completed` 绿 / `running` 青 / `queued` 灰 / `failed` 红 / `connection_lost` 用 `warning` 色（`src/views/TerminalDetailView.vue`、`src/views/TerminalsView.vue`）；提权**不用标签**表达，改由命令文本前缀 `[特权用户(uid=0)]` 表达（D48 方案 A） |
 | 命令时间线 | 每条命令一张卡片，命令行为等宽字体，输出区用 `--surface-code` |
 | 执行中指示 | 卡片顶部 2px 渐变进度条（暗色下循环扫动） |
 | 主按钮 | 暗色为紫渐变 + 辉光；亮色为纯靛蓝 + 浅阴影 |

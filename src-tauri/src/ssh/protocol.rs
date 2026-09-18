@@ -111,7 +111,8 @@ while IFS= read -r -d '' mfperch_frame; do
   #   无 `set +e`：只回第一帧的 END，包装脚本退出码 127，第二帧的 END 永不出现；
   #   有 `set +e`：两帧 END 都回，退出码 0。
   # 注意**不能**写成"eval 之后 set -e 就立刻生效"——errexit 在 eval 整串结束后才生效，
-  # 所以同一帧里写 `set -e; <失败命令>` 不会触发（这也是初版回归用例假绿的原因）。
+  # 所以同一帧里写 `set -e; <失败命令>` 不会触发——**别**按"errexit 立刻生效"写回归用例，
+  # 那样构造出的场景根本不存在，用例会假绿。
   # 守住它的是 `wrapper_always_emits_end_marker_even_after_set_e`（单测，查顺序）
   # 与 `run_as_root_returns_when_command_enables_set_e`（真实环境 e2e，查"是否超时"）。
   set +e
@@ -133,11 +134,10 @@ done
 ///   与 `~/.bash_profile`，最接近人类 SSH 登录；
 /// - `CleanThenTask`：`bash --noprofile --norc -c '<脚本>'` —— 干净环境。
 ///
-/// **必须真正接到远端启动路径上**：这一对参数曾经只被自身单测引用，
-/// 生产代码直接把脚本原样交给 `channel.exec`（等价于 `bash -s`，**既不是**
-/// 登录 shell 也不是显式干净模式），结果是设置页里"环境加载方式"这个
-/// 用户可见的开关**完全没有效果**（实测：登录模式下 `~/.bash_profile` 里加的
-/// `/opt/...` 不会出现在 PATH 中）。现在由 [`wrapper_launch_command`] 使用。
+/// **必须真正接到远端启动路径上**（由 [`wrapper_launch_command`] 交给远端执行）：
+/// 只在类型里存着、却没拼进实际启动命令，效果是设置页里"环境加载方式"这个
+/// **用户可见的开关完全没有效果**，而且不报任何错
+/// （实测：登录模式下 `~/.bash_profile` 里加的 `/opt/...` 不会出现在 PATH 中）。
 ///
 /// **privileged 通道刻意只用这一对参数、不额外包登录 shell**：那条通道上
 /// 命令以 `sudo` 的 `env_reset` 语义运行，登录 shell 加载的 PATH 会被 sudo
@@ -189,8 +189,7 @@ pub fn sudo_reject_shim(elevation_allowed: bool) -> String {
 
 /// 环境快照命令（D4）：只输出三项，供人类排查"命令找不到"类问题。
 ///
-/// 会话初始化阶段曾额外部署 askpass 脚本与 FIFO（Q33 的旧投递机制）；
-/// 那部分已随 D47/D48 移除，因此这里只剩快照。
+/// 本函数**只读不写**：不在远端部署任何文件（D49 的不变式——远端不得出现本应用的痕迹）。
 ///
 /// 输出走 stderr，与包装脚本的协议标记一致，便于上层按同一个通道解析。
 pub fn env_snapshot_script() -> &'static str {
@@ -817,12 +816,12 @@ mod tests {
             assert!(script.contains("sudo()"), "应定义 sudo 垫片：{allowed}");
             assert!(script.contains("export -f sudo"), "应导出给子 bash 进程");
         }
-        // 旧机制的任何痕迹都不得残留（它们会重新引入密码投递面）。
+        // 数据面不得出现任何密码投递载体——重新引入就恢复了 V1 的攻击面（D49）。
         let script = wrapper_script("n", None, true);
         for forbidden in ["SUDO_ASKPASS", "askpass", "sudo -A", "mkfifo", ".mf-perch"] {
             assert!(
                 !script.contains(forbidden),
-                "数据面不得再出现旧投递机制的痕迹 {forbidden:?}：\n{script}"
+                "数据面脚本不得出现密码投递载体 {forbidden:?}：\n{script}"
             );
         }
     }
