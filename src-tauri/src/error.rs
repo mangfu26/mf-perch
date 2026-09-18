@@ -41,6 +41,13 @@ pub enum AppError {
     #[error("终端命令队列已满（上限 {limit} 条），请稍后重试")]
     CommandQueueFull { limit: usize },
 
+    /// 远端未安装 bash（当前**没有任何路径构造它**，见下）。
+    ///
+    /// 保留原因：`bash_not_available` 是二期"创建终端时探测远端能力"这条降级路线的错误码。
+    /// 现状是**超时报错**而非明确错误——远端无 bash 时包装脚本起不来，应用等不到 READY 标记，
+    /// 30 秒就绪超时后返回 [`AppError::SshConnect`]，文案已提示"请确认目标主机已安装 bash"。
+    /// 因此 `docs/mcp-tools.md` 的错误码表**不列**此码；若将来补上探测，记得同时把文档改回来
+    /// （机制与现状见 `docs/design/terminal-session.md` §6）。
     #[error("远端未安装 bash，无法建立终端。请在该主机安装 bash 后重试")]
     BashNotAvailable,
 

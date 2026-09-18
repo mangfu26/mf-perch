@@ -85,8 +85,14 @@
 
 **可能失败**：`host_not_found`、`credential_not_found`（主机未绑定凭据）、
 `terminal_quota_exceeded`（`scope` 会说明是 `per_host` 还是 `global`）、
-`ssh_auth_failed`、`ssh_connect_failed`、`host_key_mismatch`（TOFU 不一致，D10）、
-`bash_not_available`（远端无 bash）。**失败时仍会保留一条 `broken` 终端记录**供人类排查。
+`ssh_auth_failed`、`ssh_connect_failed`、`host_key_mismatch`（TOFU 不一致，D10）。
+**失败时仍会保留一条 `broken` 终端记录**供人类排查。
+
+> **远端没有 bash 时**：本产品要求目标主机具备 bash（见
+> [`docs/design/terminal-session.md`](design/terminal-session.md) §6）。缺失时**不会**返回
+> `bash_not_available`（该错误码已定义但当前没有任何代码路径会构造它），
+> 实际表现是**就绪超时 30 秒**后返回 `ssh_connect_failed`，文案提示"请确认目标主机已安装 bash"。
+> 即：不静默，但慢且错误码不专用；真正的能力探测是待补项。
 
 ### 3.3 `list_terminals`
 
@@ -322,10 +328,9 @@
 | `terminal_broken` | 终端会话不可用 | 见错误文案；主机可达时下次命令会自动重连 |
 | `terminal_quota_exceeded` | 终端配额已满 | 先 `archive_terminal` 释放槽位（`scope` 区分 per_host / global） |
 | `command_queue_full` | 该终端在途命令过多 | 等现有命令结束，或换终端 |
-| `bash_not_available` | 远端无 bash | 报告人类；该主机不可用本方案 |
 | `sudo_elevation_failed` | 提权失败（被策略禁止、无密码、密码被拒、需 TTY、取不到目录、超时） | **不要盲目重试**：按错误文案判断——多数情况需报告人类（D47） |
 | `ssh_auth_failed` | 认证失败 | 报告人类（凭据问题） |
-| `ssh_connect_failed` | 连接失败（含重连失败） | 确认主机可达后重试 |
+| `ssh_connect_failed` | 连接失败（含重连失败）；**远端无 bash 也归这里**（30 秒就绪超时，文案会提示确认已安装 bash） | 确认主机可达、且已安装 bash 后重试 |
 | `host_key_mismatch` | 主机密钥与首次记录不一致（或服务端出示证书形式密钥） | **停止**并报告人类（可能是中间人，D10）；错误文案会给出**已记录**与**本次出示**两个指纹，供人类独立核对 |
 | `credential_undecryptable` | 凭据无法解密 | 报告人类（密钥/主密码问题） |
 | `invalid_argument` | 参数非法 | 修正参数后重试 |
