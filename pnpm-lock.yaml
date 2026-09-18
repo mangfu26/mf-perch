@@ -29,12 +29,6 @@ importers:
       '@tauri-apps/plugin-store':
         specifier: ^2
         version: 2.4.4
-      '@vueuse/core':
-        specifier: ^14
-        version: 14.4.0(vue@3.5.42(typescript@6.0.3))
-      '@xterm/xterm':
-        specifier: ^6
-        version: 6.0.0
       class-variance-authority:
         specifier: ^0.7
         version: 0.7.1
@@ -571,9 +565,6 @@ packages:
     resolution: {integrity: sha512-JRgY90Sz8DDtPMsaDflvPMp9xYk69JZAmbuDvAquUVXKr2gEjqtzGNTTthLfckH0BzBqvnu31gb4a8TGLRe79g==}
     peerDependencies:
       vue: ^3.5.0
-
-  '@xterm/xterm@6.0.0':
-    resolution: {integrity: sha512-TQwDdQGtwwDt+2cgKDLn0IRaSxYu1tSUjgKarSDkUM0ZNiSRXFpjxEsvc/Zgc5kq5omJ+V0a8/kIM2WD3sMOYg==}
 
   acorn@8.18.0:
     resolution: {integrity: sha512-lGq+9yr1/GuAWaVYIHRjvvySG5/4VfKIvC8EWxStPdcDh/Ka7FG3twP6v4d5BkravUilhIAsG4Qj83t02LWUPQ==}
@@ -1580,8 +1571,6 @@ snapshots:
   '@vueuse/shared@14.4.0(vue@3.5.42(typescript@6.0.3))':
     dependencies:
       vue: 3.5.42(typescript@6.0.3)
-
-  '@xterm/xterm@6.0.0': {}
 
   acorn@8.18.0: {}
 
