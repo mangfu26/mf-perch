@@ -106,16 +106,17 @@ https://gist.githubusercontent.com/mangfu26/311c09b123911b6a4860483a645a4eb0/raw
 
 ## 5. 发版检查清单
 
-`sha256` 与 `size` **只能在构建出安装包之后才拿得到**（本地 `pnpm tauri build`，
-或将来接上 CI 发布流程）。逐项核对：
+`sha256` 与 `size` **只能在构建出安装包之后才拿得到**。默认取法：推送 tag 后由
+**发布流水线（D54）**构建，并把真实文件名 / `size` / `sha256` 印在该版 Release 的正文里，
+照抄即可；本地 `pnpm tauri build` 是备用取法。逐项核对：
 
 | # | 事项 | 怎么取/怎么核 |
 | ---- | ---- | ---- |
-| 1 | 构建安装包 | `pnpm tauri build`（产物在 `src-tauri/target/release/bundle/`） |
+| 1 | 构建安装包 | 推送 tag 由发布流水线构建（**D54**）；备用：`pnpm tauri build`（产物在 `src-tauri/target/release/bundle/`） |
 | 2 | `sha256` | `Get-FileHash -Algorithm SHA256 <安装包>`（Windows）/ `sha256sum <安装包>` |
 | 3 | `size` | 文件字节数：`(Get-Item <安装包>).Length` / `stat -c %s <安装包>` |
 | 4 | 安装包**文件名** | 必须与清单 `platforms.windows-x86_64.url` 末段**完全一致**（大小写、版本号都要对） |
-| 5 | Release **tag** | 必须与 URL 中的 tag 段一致（如 `v0.1.0`），否则链接 404 |
+| 5 | Release **tag** | 必须与 URL 中的 tag 段一致（如 `v0.1.0`），否则链接 404；tag 版本与应用版本的一致性已由流水线校验（**D54**），人工只需确认 URL 抄对 |
 | 6 | 顺序 | **先发 Release，再改 Gist**；改完用应用手动「检查更新」验证一次 |
 | 7 | 版本一致性 | 清单 `version` 高于用户本地版本才会提示；首发应**等于**本地版本，避免一装上就催更新 |
 
