@@ -291,7 +291,7 @@ Refs: #123
 | ---- | ---- | ---- |
 | [`docs/design/principles.md`](docs/design/principles.md) | 工程原则（来自真实教训，指导后续设计） | 现行 |
 | [`docs/mcp-tools.md`](docs/mcp-tools.md) | MCP 工具契约：入参 schema（由代码导出）、输出结构、错误码 | 现行 |
-| [`docs/update-manifest.md`](docs/update-manifest.md) | 更新清单（Gist JSON）的格式规范 | 现行 |
+| [`docs/update-manifest.md`](docs/update-manifest.md) | 更新清单（仓库根 `update.json`，流水线自动生成）的格式规范 | 现行 |
 | [`docs/update-manifest.example.json`](docs/update-manifest.example.json) | 上述格式的示例文件 | 现行 |
 
 **D. 上下文 —— 项目是什么**
