@@ -55,3 +55,6 @@ credentials.json
 *.sqlite
 *.sqlite3
 *.db
+
+# 本地专属配置（真实环境测试变量值等），禁止入库
+AGENTS.local.md
