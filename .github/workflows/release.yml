@@ -1,4 +1,5 @@
-# 发布流水线：推送 v* tag 时构建 Windows 安装包（NSIS + MSI），并创建带产物的 GitHub Release。
+# 发布流水线：推送 v* tag 时构建 Windows 安装包（NSIS + MSI），
+# 用 CHANGELOG 对应小节创建 GitHub Release，并把 update.json 更新清单回写到 main（D55）。
 # 本地等价命令：pnpm tauri build（产物在 src-tauri/target/release/bundle/）
 name: Release
 
@@ -104,35 +105,26 @@ jobs:
       - name: Build installers
         run: pnpm tauri build
 
-      # sha256 与 size 只有构建后才有，且更新清单 Gist 是人工维护的源（D23），
-      # 所以这里只把真实值算出来写进 Release 正文供人抄，不自动改 Gist。
-      - name: Collect artifact info
+      # 发布说明 = CHANGELOG.md 中该 tag 的小节（开源规范，正文不出现内部流程信息）。
+      # 找不到小节直接失败：强制"发版必须先写变更日志"，杜绝空说明或抄旧版说明。
+      - name: Extract release notes from CHANGELOG
         shell: pwsh
         run: |
-          $files = Get-ChildItem -Path $env:BUNDLE_DIR -Recurse -Include *.exe, *.msi
-          if (-not $files) { throw "bundle 目录下没有安装包，构建或打包步骤没产出文件" }
-          $rows = foreach ($f in $files) {
-            $hash = (Get-FileHash -Algorithm SHA256 $f.FullName).Hash.ToLower()
-            "| $($f.Name) | $($f.Length) | $hash |"
+          $lines = Get-Content CHANGELOG.md
+          $start = -1
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match "^## \[$([regex]::Escape($env:RELEASE_TAG))\]") { $start = $i; break }
           }
-          $notes = @(
-            "## $env:RELEASE_TAG",
-            '',
-            '### 安装包',
-            '',
-            '| 文件名 | 大小（字节） | SHA256 |',
-            '| --- | --- | --- |',
-            ($rows -join "`n"),
-            '',
-            '安装包未做代码签名，首次运行会看到 SmartScreen 提示。',
-            '',
-            '### 发版后仍需人工完成',
-            "1. 从上表选定对外的安装包。",
-            "2. 更新清单 Gist：version、pub_date、platforms.windows-x86_64 的 url / sha256 / size。",
-            "   url 末段必须与上表文件名完全一致（msi 带 -en-US 后缀），否则下载 404。",
-            "3. 顺序：先发本 Release，再改 Gist（反了会把用户引导到不存在的页面）。"
-          ) -join "`n"
+          if ($start -lt 0) { throw "CHANGELOG.md 没有 $env:RELEASE_TAG 小节：发布说明取自 CHANGELOG，请先补写" }
+          $body = @()
+          for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^## ') { break }
+            $body += $lines[$i]
+          }
+          $notes = ($body -join "`n").Trim()
+          if (-not $notes) { throw "$env:RELEASE_TAG 小节内容为空" }
           $notes | Out-File -FilePath release-notes.md -Encoding utf8NoBOM
+          $notes | Out-File -FilePath $env:RUNNER_TEMP\notes.txt -Encoding utf8NoBOM
           Write-Host $notes
 
       - name: Create GitHub Release
@@ -144,3 +136,38 @@ jobs:
           files: |
             ${{ env.BUNDLE_DIR }}/nsis/*.exe
             ${{ env.BUNDLE_DIR }}/msi/*.msi
+
+      # 更新清单 update.json（D55）：version / url / sha256 / size 全部取自
+      # 真实 tag 与真实构建产物，随发布自动回写 main——程序读 raw/main/update.json，
+      # 从此没有"忘记更新版本信息"这一类故障。
+      - name: Publish update manifest to main
+        shell: pwsh
+        run: |
+          $ver = ($env:RELEASE_TAG -replace '^v', '')
+          $file = Get-ChildItem -Path "$env:BUNDLE_DIR/msi" -Filter *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $file) {
+            $file = Get-ChildItem -Path "$env:BUNDLE_DIR/nsis" -Filter *.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if (-not $file) { throw "找不到安装包，无法生成清单" }
+          $manifest = @{
+            version   = $ver
+            notes     = (Get-Content "$env:RUNNER_TEMP\notes.txt" -Raw).Trim()
+            pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = @{
+              'windows-x86_64' = @{
+                url    = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG/$($file.Name)"
+                sha256 = (Get-FileHash -Algorithm SHA256 $file.FullName).Hash.ToLower()
+                size   = $file.Length
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Out-File -FilePath "$env:RUNNER_TEMP\update.json" -Encoding utf8NoBOM
+          # 以 main 最新提交为基底回写，避免把 tag 处的旧树推上去
+          git fetch origin main
+          git checkout -B main FETCH_HEAD
+          Copy-Item "$env:RUNNER_TEMP\update.json" update.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add update.json
+          git commit -m "chore(release): 发布 $env:RELEASE_TAG 更新清单"
+          git push origin main
