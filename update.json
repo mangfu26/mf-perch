@@ -1,0 +1,12 @@
+{
+  "notes": "首个公开版本。\n\nmf-perch 是一款 Windows 桌面应用，让 AI Agent 通过内嵌的 MCP Server\n安全地经 SSH 操作主机，人类保留完整的凭据控制权与命令审计权。\n\n### 新增\n\n- SSH 主机与凭据管理：密码 / 私钥两种认证，凭据字段级加密存储，对 AI Agent 不可见；\n- 常驻终端会话：`cd` / `export` 等 shell 状态跨命令保留，支持同步执行与长任务异步查询；\n- 内嵌 MCP Server：Bearer Token 鉴权，可接入任意 MCP 客户端；\n- sudo 提权策略（`deny` / `ask` / `auto`），提权密码走独立通道，不进入 Agent 可见域；\n- 命令历史与终端审计：AI 执行的每条命令可查，人类可删除、AI 仅可归档；\n- 应用内版本更新检查（提示 + 跳转下载，不自动安装）；\n- 系统托盘、暗色 / 亮色双主题。\n\n[v0.1.0]: https://github.com/mangfu26/mf-perch/releases/tag/v0.1.0",
+  "pub_date": "2026-09-19T15:13:15Z",
+  "platforms": {
+    "windows-x86_64": {
+      "size": 7217152,
+      "sha256": "4f5f1426bd13e61a300e769529f9ecc3c0ce249db56987702f7a15af69730fab",
+      "url": "https://github.com/mangfu26/mf-perch/releases/download/v0.1.0/mf-perch_0.1.0_x64_en-US.msi"
+    }
+  },
+  "version": "0.1.0"
+}
