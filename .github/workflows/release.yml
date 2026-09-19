@@ -1,0 +1,146 @@
+# 发布流水线：推送 v* tag 时构建 Windows 安装包（NSIS + MSI），并创建带产物的 GitHub Release。
+# 本地等价命令：pnpm tauri build（产物在 src-tauri/target/release/bundle/）
+name: Release
+
+# tag 触发只能按名字模式过滤，**无法**限定"tag 打在哪个分支上"——
+# 从哪条分支打 tag 由人控制（发布基线是 main，见 AGENTS.md §1.1）。
+on:
+  push:
+    tags:
+      - 'v*'
+  # 构建失败后可手动指定已有 tag 重跑，不必删掉 tag 重打
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要重新发布的 tag（如 v0.1.0）'
+        required: true
+
+# 创建 Release 需要写权限
+permissions:
+  contents: write
+
+# 同一 tag 的两个并发运行会互相覆盖 Release
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  # push tag 时 ref_name 即 tag 名；手动触发时取输入。版本校验与 Release 都以它为准
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  BUNDLE_DIR: src-tauri/target/release/bundle
+
+jobs:
+  release:
+    name: Build & Release (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      # 与开发机的 pnpm 主次版本保持一致
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # 安装包文件名里的版本来自 tauri.conf.json，Release 下载 URL 里的版本来自 tag。
+      # 两者不一致时，Release 挂的是 0.1.0 的包、清单指向 v0.2.0 的路径 → 用户 404。
+      - name: Verify tag matches app version
+        shell: pwsh
+        run: |
+          $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $appVer = $conf.version
+          $tagVer = ($env:RELEASE_TAG -replace '^v', '')
+          if ($tagVer -notmatch '^\d+\.\d+\.\d+$') {
+            throw "tag 必须是 vX.Y.Z 形式（实际: $env:RELEASE_TAG）"
+          }
+          if ($tagVer -ne $appVer) {
+            throw "tag 版本 $tagVer 与应用版本 $appVer 不一致：先同步 tauri.conf.json 的 version，再打 tag"
+          }
+          Write-Host "tag $env:RELEASE_TAG 与应用版本一致"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ── 门禁：AGENTS.md §5.10 的默认门禁。
+      # 带 #[ignore] 的真实环境用例不在 CI 跑——它们依赖开发机上的 WSL SSH 服务器。
+      - name: Gate - secret scan
+        run: pnpm check:secrets
+
+      - name: Gate - IPC contract
+        run: pnpm check:ipc
+
+      - name: Gate - frontend tests
+        run: pnpm test
+
+      # typecheck 单独提前跑，失败时省掉后面 cargo test 的几分钟编译
+      # （tauri build 的 beforeBuildCommand 会再跑一次 vue-tsc，幂等）
+      - name: Gate - typecheck
+        run: pnpm typecheck
+
+      - name: Gate - cargo test
+        working-directory: src-tauri
+        # 并行度取默认值：-j 2 是低内存 / target 在慢盘上的开发机降级，runner 不属于该条件
+        run: cargo test
+
+      # ── 构建：bundle.targets = "all" → 一次出 nsis/*.exe 与 msi/*.msi
+      - name: Build installers
+        run: pnpm tauri build
+
+      # sha256 与 size 只有构建后才有，且更新清单 Gist 是人工维护的源（D23），
+      # 所以这里只把真实值算出来写进 Release 正文供人抄，不自动改 Gist。
+      - name: Collect artifact info
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Path $env:BUNDLE_DIR -Recurse -Include *.exe, *.msi
+          if (-not $files) { throw "bundle 目录下没有安装包，构建或打包步骤没产出文件" }
+          $rows = foreach ($f in $files) {
+            $hash = (Get-FileHash -Algorithm SHA256 $f.FullName).Hash.ToLower()
+            "| $($f.Name) | $($f.Length) | $hash |"
+          }
+          $notes = @(
+            "## $env:RELEASE_TAG",
+            '',
+            '### 安装包',
+            '',
+            '| 文件名 | 大小（字节） | SHA256 |',
+            '| --- | --- | --- |',
+            ($rows -join "`n"),
+            '',
+            '安装包未做代码签名，首次运行会看到 SmartScreen 提示。',
+            '',
+            '### 发版后仍需人工完成',
+            "1. 从上表选定对外的安装包。",
+            "2. 更新清单 Gist：version、pub_date、platforms.windows-x86_64 的 url / sha256 / size。",
+            "   url 末段必须与上表文件名完全一致（msi 带 -en-US 后缀），否则下载 404。",
+            "3. 顺序：先发本 Release，再改 Gist（反了会把用户引导到不存在的页面）。"
+          ) -join "`n"
+          $notes | Out-File -FilePath release-notes.md -Encoding utf8NoBOM
+          Write-Host $notes
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          body_path: release-notes.md
+          fail_on_unmatched_files: true
+          files: |
+            ${{ env.BUNDLE_DIR }}/nsis/*.exe
+            ${{ env.BUNDLE_DIR }}/msi/*.msi
