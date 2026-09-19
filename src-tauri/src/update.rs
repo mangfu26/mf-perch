@@ -2,7 +2,7 @@
 //!
 //! 设计约束来自客户决定：
 //! - **不做自动下载与自动安装**——只检查版本、提示用户去下载页
-//! - 版本源为**可配置 URL**（默认指向客户的 Gist），便于换源或指向镜像
+//! - 版本源为**可配置 URL**（默认指向仓库的 update.json，见 D55），便于换源或指向镜像
 //! - 检查**异步且静默失败**：网络不通时不打扰用户，只记日志
 //! - 结果缓存 24 小时；手动检查不受缓存限制
 //! - 语义化版本比对；**应用版本高于远端时不提示**（避免开发版被"降级"提醒）
@@ -60,7 +60,7 @@ fn platform_key_for(os: &str, arch: &str) -> &'static str {
     }
 }
 
-/// 远端版本清单（客户在 Gist 中维护的 JSON）。
+/// 远端版本清单（仓库根 `update.json`，由发布流水线生成，格式见 docs/update-manifest.md）。
 ///
 /// 字段全部为可选或带默认值，使清单可以逐步完善，
 /// 缺字段不会导致整个检查失败。
@@ -124,21 +124,19 @@ pub enum UpdateStatus {
     },
 }
 
-/// 内置默认更新源地址（客户维护的 Gist 清单）。
+/// 内置默认更新源地址（仓库根部的 `update.json`，由发布流水线随 tag 自动回写，D55）。
 ///
-/// 设计取舍（D42）：
+/// 设计取舍（D42 / D55）：
 /// - **默认可用**：以前默认留空，用户既不知道地址、自动检查也从不生效，
 ///   等于"更新功能默认不存在"。现在内置一个默认值，开箱即可检查；
 /// - **仍可覆盖**：设置页可改成镜像或其它源（客户要求保留灵活性）；
-/// - **用不带修订号的 raw 地址**：
-///   `.../raw/<文件名>` 而不是 `.../raw/<一长串SHA>/<文件名>`。
-///   前者始终返回最新修订，因此**只改 Gist 内容就能让所有用户收到更新**；
-///   后者钉死在某一版，改了 Gist 老用户永远看不到（实测两种形式都返回 200、
-///   不跳转，所以这里选前者）；
+/// - **用分支名而不是提交 SHA**：`.../mf-perch/main/update.json`。
+///   分支引用始终返回最新内容，发布流水线回写一次，所有用户即可收到更新；
+///   钉死在 SHA 的地址改了文件老用户也永远看不到；
 /// - 代价：**改这个默认值需要发新版**——地址真要变时，老版本用户需手动改设置，
 ///   这正是保留可编辑入口的价值。
 pub const DEFAULT_SOURCE_URL: &str =
-    "https://gist.githubusercontent.com/mangfu26/311c09b123911b6a4860483a645a4eb0/raw/mf-perch-update.json";
+    "https://raw.githubusercontent.com/mangfu26/mf-perch/main/update.json";
 
 /// 读取**生效的**更新源地址。
 ///
@@ -332,7 +330,7 @@ pub async fn fetch_manifest(url: &str) -> Result<UpdateManifest> {
     let resp = client
         .get(url)
         .header("Accept", "application/json")
-        // GitHub Gist 的 raw 地址对 User-Agent 有要求。
+        // raw.githubusercontent 要求携带 User-Agent，缺失会被拒（403）。
         .header("User-Agent", concat!("mf-perch/", env!("CARGO_PKG_VERSION")))
         .send()
         .await
@@ -599,19 +597,23 @@ mod tests {
     }
 
     #[test]
-    fn builtin_default_uses_unpinned_raw_url() {
-        // 关键：raw 地址**不带修订号（SHA）**，这样只改 Gist 内容即可让所有用户
-        // 收到更新；带 SHA 的形式会钉死在某一版（客户实测时给的就是带 SHA 的）。
-        let raw = DEFAULT_SOURCE_URL
-            .split("/raw/")
-            .nth(1)
-            .expect("默认地址应包含 /raw/");
-        assert_eq!(
-            raw.matches('/').count(),
-            0,
-            "raw 之后应直接是文件名，不应再有一层修订号目录：{DEFAULT_SOURCE_URL}"
+    fn builtin_default_points_at_unpinned_branch() {
+        // D55：默认源必须指向**分支**（main）而不是某个提交 SHA——
+        // 分支引用始终返回最新清单，钉死 SHA 会让发布后的更新对老用户永久失效。
+        let url = DEFAULT_SOURCE_URL;
+        assert!(
+            url.starts_with("https://raw.githubusercontent.com/"),
+            "默认源应为仓库 raw 地址：{url}"
         );
-        assert!(raw.ends_with(".json"), "应指向清单文件：{raw}");
+        let after_host = url.trim_start_matches("https://raw.githubusercontent.com/");
+        // 路径形如 <owner>/<repo>/<ref>/<file>，ref 必须是分支名而不是 40 位 SHA
+        let ref_segment = after_host.split('/').nth(2).unwrap_or_default();
+        assert_eq!(ref_segment, "main", "应以 main 分支引用，不钉 SHA：{url}");
+        assert!(
+            !url.contains("gist.githubusercontent"),
+            "不应回退到 Gist 源（D23 已退役）：{url}"
+        );
+        assert!(url.ends_with("update.json"), "应指向清单文件：{url}");
     }
 
     #[test]
