@@ -355,12 +355,10 @@
 
 ### Q26 — 测试环境
 
-- 客户答复：本机 Windows 10，**使用 WSL 测试**；客户已安装 WSL Ubuntu 26.04。
-- 结论（详见 [`docs/design/test-environment.md`](design/test-environment.md)）：
-  - 已搭建：openssh-server 监听 `127.0.0.1:2222`、测试用户 `mfperch`（有 sudo 密码）、免密用户 `mfperch-nopass`、测试密钥对、profile 标记与测试 PATH 目录。
-  - **实测验证通过**：密钥认证、命令执行、`bash -l` 环境加载、NUL 分帧协议（状态保留 + 退出码 + nonce 标记）、sudo 免密探测、fail-closed 行为、askpass + FIFO 密码投递。
-  - **实测发现并修复设计缺陷**：`sudo -A` 把 askpass 的 **stdout 第一行当作密码**，故请求标记必须写 **stderr**；已同步修正 `docs/design/sudo.md`。
-  - **实测证实 D4 必要性**：默认非登录 shell 下自定义 PATH 不生效，`bash -l` 才生效。
+- 状态：**已答**（客户：Windows 10 + WSL；已安装 WSL Ubuntu 26.04）。
+- 结论一行：测试目标环境 = WSL Ubuntu 内的 openssh-server（`127.0.0.1:2222`），
+  Windows 侧走真实 SSH。选型与理由见 **D27**；环境现状、搭建步骤与实测读数见
+  [`docs/design/test-environment.md`](design/test-environment.md)（此处不复述）。
 
 ### Q27 — 开源许可证
 

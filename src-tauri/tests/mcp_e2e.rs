@@ -416,7 +416,8 @@ async fn mcp_session_survives_idle_longer_than_rmcp_default() {
     eprintln!("[MCP 空闲测试] 保持 {idle} 秒不发任何请求……");
     tokio::time::sleep(std::time::Duration::from_secs(idle)).await;
 
-    // 同一个会话 id 继续用：修复前这里会拿到 404 Session not found。
+    // 同一个会话 id 必须仍能复用：若空闲超时被改短（rmcp 默认 5 分钟），
+    // 这里会得到 404 Session not found（D38）。
     let (resp, _) = mcp_call(
         &client,
         &url,
@@ -758,18 +759,18 @@ async fn mcp_full_lifecycle_over_real_ssh() {
     )
     .await;
     let poll1_payload = tool_payload(&poll1);
-    // Q4 契约是四态：queued / running / completed / failed。
-    // 命令刚下发，只可能处于未完成态；原先只断言"status 有值"
-    // （`.is_some()`），任何取值都能通过，等于没验。
+    // 状态契约是五态：queued / running / completed / failed / connection_lost（D50）。
+    // 命令刚下发，只可能处于未完成态——断言必须是这两个具体取值；
+    // 只断言 `status` 有值（`.is_some()`）任何取值都能通过，等于没验。
     let poll1_status = poll1_payload["status"].as_str().unwrap_or_default();
     assert!(
         matches!(poll1_status, "queued" | "running"),
         "刚下发的命令应处于未完成态（queued/running），实际：{poll1_payload}"
     );
 
-    // 轮询直到命令进入终态。
-    // 原先这里用固定 `sleep 4s` 等远端 `sleep 2` 跑完——机器慢或负载高就会假失败，
-    // 而慢只会让测试更慢（§5.3）。这里改为有上限的轮询：状态没变就继续问，超时才失败。
+    // 轮询直到命令进入终态。**不要**改用固定 `sleep` 等远端 `sleep 2` 跑完：
+    // 机器慢或负载高时会假失败，而慢只会让测试更慢（§5.3）。
+    // 这里是带上限的轮询：状态没变就继续问，超时才失败。
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
     let poll2_payload = loop {
         let (poll2, _) = mcp_call(
@@ -864,10 +865,9 @@ async fn mcp_full_lifecycle_over_real_ssh() {
 
 /// 鉴权：错误或缺省 Token 必须被拒绝（Q2）。
 ///
-/// 不需要真实 SSH，也不需要任何 `MFPERCH_TEST_*` 环境变量——它只用内存库在本机起
-/// 一个 MCP 端点。原先挂着 `#[ignore = "需要 MCP 端点；设置环境变量后以 --ignored 运行"]`，
-/// 但函数体既不读环境变量也不碰 SSH；而这是全仓**唯一**覆盖 401 鉴权分支的用例，
-/// 于是默认 `cargo test` 永远不跑它，这条安全属性实际上没有门禁（§5.7）。改为默认执行。
+/// **默认执行，不要给它打 `#[ignore]`**：它只需要内存库，在**进程内**起一个 MCP 端点，
+/// 不碰真实 SSH、也不读任何 `MFPERCH_TEST_*`；而这是全仓**唯一**覆盖 401 鉴权分支的用例
+/// ——一旦变成 `#[ignore]`，这条安全属性就没有默认门禁了（§5.7）。
 #[tokio::test]
 async fn mcp_rejects_missing_or_wrong_token() {
     let (state, _key) = test_state();
@@ -972,7 +972,7 @@ async fn mcp_rejects_when_command_queue_is_full() {
         .filter(|o| o["code"].as_str() == Some("command_queue_full"))
         .count();
     // 精确条数：提交 limit + 2 条，前 limit 条占满队列，其余 2 条必须被拒。
-    // 原先只断言 `rejected > 0`——拒绝 1 条还是 11 条都算通过，上限形同没验。
+    // 只断言 `rejected > 0` 的话，拒绝 1 条还是 11 条都算通过，上限形同没验。
     assert_eq!(
         rejected, 2,
         "队列上限 {limit}，提交 {submitted} 条，应恰好拒绝 2 条；实际结果：{outcomes:?}"

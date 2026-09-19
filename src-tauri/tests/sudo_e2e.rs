@@ -101,10 +101,10 @@ async fn seed_host_with_env_mode(
 
 /// 等待某条命令结束，返回（输出，退出码）。
 ///
-/// 超时必须**明确失败**：原先超时返回 `(String::new(), None)`，
-/// 而调用方多用 `assert_ne!(code, Some(0))` 断言"提权未成功"——
-/// 命令根本没结束（SSH 断了、队列卡住）时该断言同样通过，
-/// 于是绿灯的理由与用例名不符。超时属于测试环境异常，不是被测行为。
+/// **超时必须明确失败**，不得返回"看起来像提权未成功"的值（空输出 + `code = None`）：
+/// 调用方多用 `assert_ne!(code, Some(0))` 断言"提权未成功"，而命令根本没结束
+/// （SSH 断了、队列卡住）时该断言同样通过，绿灯的理由就与用例名不符了。
+/// 超时属于测试环境异常，不是被测行为。
 async fn collect(
     _rt: &mf_perch_lib::terminal::TerminalRuntime,
     db: &mf_perch_lib::store::Db,
@@ -136,9 +136,8 @@ async fn collect(
 async fn data_plane_sudo_is_always_refused() {
     // D47/D48 核心不变式：**数据面不许提权**。
     //
-    // 旧机制（askpass + FIFO）会把密码投进 Agent 所在的用户域，因此被双通道取代；
-    // 取代之后数据面已经没有任何密码来源，若不在那里拦下 sudo，Agent 收到的
-    // 会是一句难懂的 sudo 报错，并可能反复重试。这里验证它收到的是**可操作**的拒绝。
+    // 数据面没有任何密码来源；若不在这里拦下 `sudo`，Agent 收到的会是一句难懂的
+    // sudo 报错并可能反复重试。本用例验证它收到的是**可操作**的拒绝。
     //
     // 三种策略都要验：拒绝的**原因**可以不同（策略禁用 / 改用工具），
     // 但"命令不会被提权执行"必须一致——这正是本用例的判别性断言。
@@ -203,16 +202,13 @@ async fn data_plane_sudo_is_always_refused() {
     }
 }
 
-/// **D47/D48 回归**：跑过新旧两条路径后，远端**不新增**任何本应用的临时节点。
-///
-/// 旧机制会在 `$HOME/.mf-perch/` 下写 askpass 脚本与按 PID 命名的 FIFO
-/// （V1 的明文落盘就发生在那套机制里）。双通道之后远端**不再产生任何文件**，
-/// 因此旧的清理逻辑（连同它的时序不变式）整体不再需要。
+/// **D47/D48 回归**：跑过提权与数据面两条路径后，远端**不新增**任何本应用的节点
+/// （D49 的不变式：远端不落任何文件，也就没有"清理"这一步）。
 ///
 /// 判据用**前后快照对比**，而不是断言"目录为空"或"目录不存在"：
-/// 测试机可能残留旧机制留下的节点（实测本机就有 2026-09-11 的两个 FIFO），
-/// 而断言绝对值为零会把"机器不干净"误报成"实现又写了文件"（§5.4：测试不得
-/// 依赖机器上的既有状态）。真正要守的不变式是"本次操作没有新增痕迹"。
+/// 测试主机上可能残留历史痕迹（实测记录见 D49），
+/// 断言绝对值为零会把"机器不干净"误报成"实现又写了文件"（§5.4：测试不得
+/// 依赖机器上的既有状态）。真正要守的不变式是"**本次操作没有新增痕迹**"。
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
 async fn data_plane_leaves_no_new_remote_artifacts() {
@@ -226,7 +222,8 @@ async fn data_plane_leaves_no_new_remote_artifacts() {
         .await
         .expect("终端应能建立");
 
-    // 旧机制会写的两类节点：askpass 脚本与 sudopw FIFO。
+    // 计数对象取投递载体的特征名（askpass* / sudopw*）：现行实现不应产生它们，
+    // 一旦出现就说明密码投递机制回潮（D49）。
     let count_cmd = r#"find "$HOME/.mf-perch" -maxdepth 1 \( -name 'askpass*' -o -name 'sudopw*' \) 2>/dev/null | wc -l"#;
 
     let before = {
@@ -265,7 +262,7 @@ async fn data_plane_leaves_no_new_remote_artifacts() {
 
     assert_eq!(
         after, before,
-        "双通道之后不得新增任何远端节点（旧机制会写 askpass 脚本与 sudopw FIFO）；\
+        "本次操作不得新增任何远端投递载体（D49：远端不落文件）；\
          操作前 {before} 个，操作后 {after} 个"
     );
 
@@ -317,9 +314,7 @@ async fn run_as_root_is_refused_when_host_disables_elevation() {
 
 /// **ask 模式**：人类拒绝时 `run_as_root` 不投递密码，命令不会被执行。
 ///
-/// 与旧机制的区别值得记一笔：旧路径下"拒绝"必须**回写一个空密码**去解开
-/// 阻塞在 FIFO 上的 askpass（否则队列会卡住）；新路径下没有远端等待者，
-/// 拒绝就是简单的不写密码——少了一整类"忘记应答导致挂死"的缺陷形态。
+/// 拒绝路径上远端没有任何等待者，因此不存在"忘记应答把队列挂死"这类缺陷形态。
 #[tokio::test]
 #[ignore = "需要真实 SSH 服务器；设置 MFPERCH_TEST_* 后以 --ignored 运行"]
 async fn run_as_root_ask_mode_denied_by_human_does_not_elevate() {
@@ -476,8 +471,7 @@ async fn privileged_channel_fails_fast_on_wrong_password() {
         "应以「提权失败」明确报错，实际：{err:?}"
     );
     // **判别性断言**：必须因"密码被拒"而失败，而不是等到就绪超时——
-    // 两者都是 SudoElevationFailed，只看类型会让"挂住到超时"也算通过
-    // （本用例初版就因此假绿灯）。
+    // 两者同为 SudoElevationFailed，**只断言错误类型会让"挂住到超时"也算通过**。
     assert!(
         err.to_string().contains("未接受该密码"),
         "应因「密码被拒」快速失败，而不是等待就绪超时，实际：{err}"
