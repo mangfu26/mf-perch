@@ -142,9 +142,11 @@ function main() {
 
   console.log("== 3/4 检查本地测试目录是否被忽略 ==");
   // git check-ignore 的退出码就是答案：0 = 已被忽略。
+  // 路径必须带结尾斜杠：CI 检出里该目录不存在，不带斜杠时 git 按文件评估，
+  // 匹配不上 .gitignore 的目录专用模式（`.tmp-test/`），会造成 CI 假红灯。
   let tmpTestIgnored = false;
   try {
-    execFileSync("git", ["check-ignore", "-q", ".tmp-test"], {
+    execFileSync("git", ["check-ignore", "-q", ".tmp-test/"], {
       cwd: root,
       stdio: "ignore",
     });
