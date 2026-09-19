@@ -134,13 +134,22 @@ pub fn set_auto_start(conn: &rusqlite::Connection, enabled: bool) -> Result<()> 
 ///
 /// 返回 `(监听器, 是否为持久化端口)`：调用方据此决定是否需要写回配置。
 pub async fn select_port(allow_remote: bool) -> Result<(TcpListener, u16)> {
+    scan_from(allow_remote, PORT_RANGE_START, PORT_RANGE_END).await
+}
+
+/// 从 `start` 到 `end` 递增寻找可绑定端口。生产路径一律以 [`PORT_RANGE_START`]–
+/// [`PORT_RANGE_END`] 调用本函数（见 [`select_port`]）；参数化范围只为让测试能在
+/// "实测可绑定的端口"上验证扫描策略，不假设 50001 在任意机器可绑定
+/// （Windows 系统保留端口段可能恰好覆盖它，绑定时报 os error 10013——
+/// CI runner 上实测会随机红灯）。
+async fn scan_from(allow_remote: bool, start: u16, end: u16) -> Result<(TcpListener, u16)> {
     let ip = if allow_remote {
         IpAddr::V4(Ipv4Addr::UNSPECIFIED)
     } else {
         IpAddr::V4(Ipv4Addr::LOCALHOST)
     };
 
-    for port in PORT_RANGE_START..=PORT_RANGE_END {
+    for port in start..=end {
         if let Ok(listener) = TcpListener::bind(SocketAddr::new(ip, port)).await {
             tracing::info!("MCP 端点监听端口 {port}");
             return Ok((listener, port));
@@ -159,6 +168,18 @@ pub async fn select_port_with_preference(
     preferred: Option<u16>,
     allow_remote: bool,
 ) -> Result<(TcpListener, u16)> {
+    scan_with_preference(preferred, allow_remote, PORT_RANGE_START, PORT_RANGE_END).await
+}
+
+/// 优先绑定 `preferred`，不可用则从 `start`–`end` 递增扫描。
+/// 生产路径经 [`select_port_with_preference`] 以 [`PORT_RANGE_START`]–[`PORT_RANGE_END`]
+/// 调用；参数化范围的理由同 [`scan_from`]。
+async fn scan_with_preference(
+    preferred: Option<u16>,
+    allow_remote: bool,
+    start: u16,
+    end: u16,
+) -> Result<(TcpListener, u16)> {
     let ip = if allow_remote {
         IpAddr::V4(Ipv4Addr::UNSPECIFIED)
     } else {
@@ -171,10 +192,10 @@ pub async fn select_port_with_preference(
             tracing::info!("MCP 端点复用已持久化的端口 {port}");
             return Ok((listener, port));
         }
-        tracing::info!("持久化端口 {port} 已被占用，重新从 {PORT_RANGE_START} 开始查找");
+        tracing::info!("持久化端口 {port} 已被占用，重新从 {start} 开始查找");
     }
 
-    select_port(allow_remote).await
+    scan_from(allow_remote, start, end).await
 }
 
 /// 创建一个可取消的端点句柄。
@@ -288,35 +309,60 @@ mod tests {
         assert!(!auto_start(&conn).unwrap());
     }
 
-    /// 断言测试端口当前**可用**；被占用时给出可操作的失败提示。
+    /// 测试扫描窗口取基准端口后 8 个：足够覆盖"起点 / 起点+1"两种期望，
+    /// 又不依赖机器上更远处的端口状态。
+    const TEST_SCAN_SPAN: u16 = 8;
+
+    /// 找一个"`base` 与 `base+1` 均实测可绑定"的扫描基准端口。
     ///
-    /// 最常见的占用者是**开发时正在运行的应用本体**——它监听的正是
-    /// [`PORT_RANGE_START`]。
-    ///
-    /// 这里刻意**失败并说明该怎么办**，而不是静默跳过：
-    /// 静默跳过会让"端口被占"这种环境问题伪装成绿色通过，
-    /// 掩盖真实回归（团队约定：环境不具备时应提示人去处理，而不是让测试装作没事）。
-    async fn require_port_free(port: u16) {
-        match TcpListener::bind(("127.0.0.1", port)).await {
-            Ok(listener) => drop(listener),
-            Err(e) => panic!(
-                "端口 {port} 被占用（{e}）。两种常见成因：\n\
-                 ① 有**正在运行的 mf-perch 应用实例**（它监听的就是这个端口段）——请先退出该实例；\n\
-                 ② 有**并发的测试**正在跑（e2e 也会启动 MCP 端点）——请等它结束后再跑本测试。\n\
-                 若两者都不成立，请检查是否有残留的 mf-perch / 测试进程。"
-            ),
+    /// 测试要验证的是**选端口策略**（偏好优先 / 占用则跳过递增 / 从起点扫描），
+    /// 不是"50001 恰好在当前机器可绑定"——后者是环境事实：Windows 的动态保留端口段
+    /// 可能覆盖 50001（CI runner 上实测随机出现 os error 10013）。
+    /// 因此用 OS 分配的空闲端口做基准；探测失败继续换，全部失败则明确 panic
+    /// （环境不满足时不静默跳过，见 AGENTS.md §5.6.3）。
+    async fn usable_base_port() -> u16 {
+        for _ in 0..25 {
+            let probe = TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("OS 应能分配空闲端口");
+            let port = probe
+                .local_addr()
+                .expect("应能读回 OS 分配的端口")
+                .port();
+            drop(probe);
+            // 保证测试里 base + TEST_SCAN_SPAN 不越出 u16 端口范围
+            if port > 65535 - TEST_SCAN_SPAN {
+                continue;
+            }
+            let next = port + 1;
+            let Ok(a) = TcpListener::bind(("127.0.0.1", port)).await else {
+                continue;
+            };
+            let Ok(b) = TcpListener::bind(("127.0.0.1", next)).await else {
+                drop(a);
+                continue;
+            };
+            drop(a);
+            drop(b);
+            return port;
         }
+        panic!("连续 25 次探测都找不到一对相邻可绑定端口，测试环境异常，请检查端口占用");
     }
 
     #[tokio::test]
     async fn select_port_prefers_persisted_port() {
         let _guard = PORT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        require_port_free(PORT_RANGE_START).await;
+        let base = usable_base_port().await;
 
-        let (listener, port) = select_port_with_preference(Some(PORT_RANGE_START), false)
-            .await
-            .unwrap();
-        assert_eq!(port, PORT_RANGE_START, "起始端口空闲时应被直接复用");
+        let (listener, port) = scan_with_preference(
+            Some(base),
+            false,
+            base,
+            base + TEST_SCAN_SPAN,
+        )
+        .await
+        .unwrap();
+        assert_eq!(port, base, "起始端口空闲时应被直接复用");
 
         drop(listener);
     }
@@ -324,18 +370,22 @@ mod tests {
     #[tokio::test]
     async fn select_port_rescans_when_persisted_is_taken() {
         let _guard = PORT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        require_port_free(PORT_RANGE_START).await;
+        let base = usable_base_port().await;
 
-        // 占用起始端口，模拟"持久化端口被占用"。
-        let blocker = TcpListener::bind(("127.0.0.1", PORT_RANGE_START))
+        // 占用偏好端口，模拟"持久化端口被占用"。
+        let blocker = TcpListener::bind(("127.0.0.1", base))
             .await
-            .expect("刚校验过端口可用，这里应能占用成功");
+            .expect("刚探测过端口可用，这里应能占用成功");
 
-        let (listener, port) = select_port_with_preference(Some(PORT_RANGE_START), false)
-            .await
-            .unwrap();
-        assert_ne!(port, PORT_RANGE_START, "应跳过被占用的持久化端口");
-        assert!(port > PORT_RANGE_START, "应从起始端口向后递增");
+        let (listener, port) = scan_with_preference(
+            Some(base),
+            false,
+            base,
+            base + TEST_SCAN_SPAN,
+        )
+        .await
+        .unwrap();
+        assert_eq!(port, base + 1, "应跳过被占用的偏好端口并递增到下一个可用端口");
 
         drop(listener);
         drop(blocker);
@@ -344,10 +394,13 @@ mod tests {
     #[tokio::test]
     async fn select_port_without_preference_scans_from_start() {
         let _guard = PORT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        require_port_free(PORT_RANGE_START).await;
+        let base = usable_base_port().await;
 
-        let (listener, port) = select_port_with_preference(None, false).await.unwrap();
-        assert_eq!(port, PORT_RANGE_START, "无持久化端口时应从起始端口开始");
+        let (listener, port) =
+            scan_with_preference(None, false, base, base + TEST_SCAN_SPAN)
+                .await
+                .unwrap();
+        assert_eq!(port, base, "无持久化端口时应从扫描起点开始");
         drop(listener);
     }
 
