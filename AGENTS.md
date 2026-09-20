@@ -262,7 +262,7 @@ Refs: #123
 
 | 文档 | 内容 | 时效性 |
 | ---- | ---- | ---- |
-| [`docs/decisions.md`](docs/decisions.md) | **技术决策记录（ADR）索引**：按域索引全部 D1–D54 + **取代关系表**（正文已拆到分片） | 现行 |
+| [`docs/decisions.md`](docs/decisions.md) | **技术决策记录（ADR）索引**：按域索引全部 D1–D56 + **取代关系表**（正文已拆到分片） | 现行 |
 | [`docs/decisions/`](docs/decisions/) | ADR **正文分片**，一条一个 `D<编号>.md`；由索引进入，不要整目录通读 | 现行（个别条目标"部分失效"） |
 | [`docs/decisions/archive/`](docs/decisions/archive/) | **整条已被移除/推翻**的决策原文（现含 D37、D44，均被 D49 移除） | **快照** |
 

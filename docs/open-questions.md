@@ -69,6 +69,7 @@
 | Q34 | 更新版本信息的来源（GitHub Releases API / Gist / 可配置 JSON） | 客户选 **Gist**；源地址可配置 | 已答 |
 | Q35 | 视觉主题风格 | 暗色 Deep Space + 亮色 Minimal Light，令牌驱动 | 已答 |
 | Q36 | `ask` 模式下 sudo 密码被拒后 sudo 会自动重试（默认 3 次），是否合并为"一次询问" | **成因已消失**：提权改为 `run_as_root` 单命令形态后一次调用只问一次，"已拒绝"的记忆机制已随 **D49** 删除（见 [`decisions.md`](decisions.md) D49） | 已答 |
+| Q37 | 修复"错误被吞"后，未解锁主密钥时到底该不该允许保存主机 | **保持必须先解锁**（不做延迟取密钥），理由与护栏见 [`decisions.md`](decisions.md) **D56** | 已答 |
 
 ---
 
@@ -221,6 +222,14 @@
     以及 e2e `tests/sudo_e2e.rs::deny_is_asked_only_once_per_command`。
   - 现行 `AskOutcome` 只剩 4 个变体（`Allowed` / `Denied` / `TimedOut` / `Unavailable`），
     每种各有自己的审计备注——人类事后仍能分辨"当场拒绝""没人应答""询问通道不可用"。
+
+### Q37 — 未解锁主密钥时能否保存主机
+
+- 客户答复：**保持必须先解锁**。
+- 结论一行：`save_host` / `save_credential` 在入口取主密钥，未解锁明确报错，
+  **不做**"延迟取密钥以放行无敏感字段的主机"。取舍理由与护栏见
+  [`docs/decisions.md`](decisions.md) **D56**（错误此前被吞导致该路径不可见，见
+  [`design/principles.md`](design/principles.md) **P5**）。
 
 ### Q10 — SSH 私钥导入
 
