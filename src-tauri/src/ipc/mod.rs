@@ -22,7 +22,8 @@ mod tests;
 
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::ser::SerializeMap;
+use serde::{Serialize, Serializer};
 use tauri::State;
 
 use crate::domain::credential::{Credential, CredentialKind, CredentialSummary};
@@ -36,11 +37,38 @@ use crate::store::keyring::KeyProvider;
 use crate::store::{commands as cmd_store, credentials, hosts, terminals};
 
 /// IPC 统一返回：错误以结构化形式返回，前端不必解析错误字符串。
-#[derive(Debug, Serialize)]
-#[serde(tag = "ok", rename_all = "lowercase")]
+#[derive(Debug)]
 pub enum IpcResult<T> {
     Ok { data: T },
     Err { code: String, message: String },
+}
+
+/// 手写序列化以锁定**线上形状**：`{ok:true,data}` / `{ok:false,code,message}`。
+///
+/// 不能用 `#[serde(tag = "ok")]` 的内部标签枚举：那会把 `ok` 写成变体名**字符串**
+/// （`"ok"` / `"err"`），而前端 `src/lib/ipc.ts` 的 `unwrap()` 按 `raw.ok` 的真假分流
+/// ——非空字符串 `"err"` 是真值，于是**所有后端错误都会被当成成功**
+/// （`data` 取到 `undefined`，界面提示"已添加/已保存"却查无数据）。
+/// 形状由 `ipc::tests` 的两条信封用例钉住。
+impl<T: Serialize> Serialize for IpcResult<T> {
+    fn serialize<S: Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(3))?;
+        match self {
+            Self::Ok { data } => {
+                map.serialize_entry("ok", &true)?;
+                map.serialize_entry("data", data)?;
+            }
+            Self::Err { code, message } => {
+                map.serialize_entry("ok", &false)?;
+                map.serialize_entry("code", code)?;
+                map.serialize_entry("message", message)?;
+            }
+        }
+        map.end()
+    }
 }
 
 impl<T> IpcResult<T> {

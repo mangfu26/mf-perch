@@ -14,6 +14,7 @@ import BaseButton from "@/components/ui/BaseButton.vue";
 import BaseInput from "@/components/ui/BaseInput.vue";
 import FormField from "@/components/ui/FormField.vue";
 import type { HostInput, HostSummary, ShellEnvMode, SudoPasswordSource, SudoPolicy } from "@/lib/api";
+import { parsePort } from "@/lib/host-form";
 import { useCredentialsStore } from "@/stores/credentials";
 
 const { t } = useI18n();
@@ -34,7 +35,9 @@ const credentials = useCredentialsStore();
 
 const name = ref("");
 const address = ref("");
-const port = ref<number>(22);
+// 数字输入框经 v-model 回传的是 DOM 字符串（`"2222"`），故类型含 string，
+// 提交前统一交给 parsePort 归一。
+const port = ref<number | string>(22);
 const credentialId = ref<string>("");
 const proxyJumpHostId = ref<string | null>(null);
 const sudoPolicy = ref<SudoPolicy>("deny");
@@ -91,7 +94,8 @@ function submit() {
     error.value = "请填写主机地址";
     return;
   }
-  if (!Number.isInteger(port.value) || port.value < 1 || port.value > 65535) {
+  const p = parsePort(port.value);
+  if (p === null) {
     error.value = "端口必须是 1–65535 之间的整数";
     return;
   }
@@ -100,7 +104,7 @@ function submit() {
     id: props.host?.id ?? null,
     name: name.value.trim() || null,
     address: address.value.trim(),
-    port: port.value,
+    port: p,
     credential_id: credentialId.value || null,
     // 保留原有的跳板机配置（当前界面无控件，但不得因编辑而丢失）。
     proxy_jump_host_id: proxyJumpHostId.value,

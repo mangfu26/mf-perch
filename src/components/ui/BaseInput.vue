@@ -58,6 +58,8 @@ const passthrough = computed(() => {
 
 function onInput(e: Event) {
   const target = e.target as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+  // 刻意原样透传 DOM 字符串：`type="number"` 也给出 `"2222"` 而非 2222，
+  // 需要数字的字段由调用方归一（主机端口见 src/lib/host-form.ts 的 parsePort）。
   emit("update:modelValue", target.value);
 }
 </script>
