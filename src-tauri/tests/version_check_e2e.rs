@@ -1,4 +1,10 @@
-//! 更新检查的端到端测试（D23）。
+//! 版本检查的端到端测试（D23），被测模块是 `src/update.rs`。
+//!
+//! **文件名刻意不含 `update`**：Windows 的 Installer Detection 会按文件名里
+//! `update` / `install` / `setup` / `patch` 这类关键字判定"需要管理员的安装程序"，
+//! 而 Rust 测试 exe 不带执行级别 manifest，于是 cargo 拉起本 target 时报
+//! `请求的操作需要提升。(os error 740)`、用例 never executed。
+//! 成因与差分证据见 [`docs/development-troubleshooting.md`](../../docs/development-troubleshooting.md)。
 //!
 //! 用本地 HTTP 服务返回真实的版本清单 JSON，验证：
 //! - 能正确解析清单并识别新版本

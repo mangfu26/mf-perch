@@ -169,8 +169,8 @@ cargo test -j 2 --test ssh_integration -- --ignored --test-threads=1
 | 类别 | 规模 | 说明 |
 | ---- | ---- | ---- |
 | Rust 单测 | 250 项 | 生产文件内的 `#[cfg(test)]`，默认门禁（`cargo test --lib -- --list` 实测） |
-| Rust 集成测试 | 32 项 | `mcp_e2e` 6 / `ssh_integration` 6 / `sudo_e2e` 13 / `update_e2e` 7 |
-| ↑ 其中 `#[ignore]`（默认门禁不跑） | 23 项 | `mcp_e2e` 4 / `ssh_integration` 6 / `sudo_e2e` 13；其中 **22 项需真实 SSH**，`mcp_e2e` 另 1 项是耗时的本地用例（空闲 310 秒）。`update_e2e` 7 项不依赖真实环境，默认就跑 |
+| Rust 集成测试 | 32 项 | `mcp_e2e` 6 / `ssh_integration` 6 / `sudo_e2e` 13 / `version_check_e2e` 7 |
+| ↑ 其中 `#[ignore]`（默认门禁不跑） | 23 项 | `mcp_e2e` 4 / `ssh_integration` 6 / `sudo_e2e` 13；其中 **22 项需真实 SSH**，`mcp_e2e` 另 1 项是耗时的本地用例（空闲 310 秒）。`version_check_e2e` 7 项不依赖真实环境，默认就跑 |
 | 前端单测 | 21 项 | vitest，覆盖 `src/lib/` 纯逻辑 |
 | 前端契约检查 | 1 道 | `pnpm check:ipc`：命令名在 Rust 定义 / `generate_handler!` 注册 / 前端 `call()` 三处一致 |
 
