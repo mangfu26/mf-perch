@@ -70,13 +70,12 @@ async function importKeyFile() {
   importing.value = true;
   error.value = null;
   try {
+    // 刻意**不**给 filters：OpenSSH 私钥按惯例没有扩展名（`~/.ssh/id_ed25519`），
+    // 而原生选择器只列出当前过滤项匹配的文件——给了扩展名就等于把这些密钥挡在外面。
+    // 格式判断交给内容：读到 PuTTY 的 .ppk 会明确报错，粘贴文本入口也始终可用。
     const selected = await openDialog({
       multiple: false,
       title: t("credential.privateKeyImport"),
-      filters: [
-        { name: "私钥", extensions: ["pem", "key", "ppk", "txt"] },
-        { name: "全部文件", extensions: ["*"] },
-      ],
     });
 
     if (typeof selected === "string") {

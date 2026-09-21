@@ -41,12 +41,16 @@ impl SudoPolicy {
 }
 
 /// 终端环境加载策略（D4）。
+///
+/// JSON 词表**逐变体写死**而不是用 `rename_all` 推导：变体名（`LoginThenTask`）
+/// 的 snake_case 与 `as_str()` 不同，而 JSON、DB 列、前端 `<select>` 选项值必须同一套词。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ShellEnvMode {
     /// 登录 shell（`bash -l`）：加载 profile，接近人类 SSH 登录环境。默认。
+    #[serde(rename = "login")]
     LoginThenTask,
     /// 干净模式：不加载 profile，可预测、无副作用。
+    #[serde(rename = "clean")]
     CleanThenTask,
 }
 
@@ -206,6 +210,77 @@ impl From<&Host> for HostPublicInfo {
             address: h.address.clone(),
             port: h.port,
             ready: h.credential_id.is_some(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 守的契约：领域枚举的**线上词汇表只有一个来源**——`as_str()`（写进 DB 列、
+    /// 也写进环境快照）与 serde 序列化出的 JSON 必须是同一个字符串。
+    ///
+    /// 前端表单的 `<select>` 选项值、`HostSummary` 回填与 `ipc::HostInput` 的
+    /// `parse` 全部按 `as_str()` 那一套词表工作；JSON 一旦由变体名推导出另一个
+    /// 拼写，编辑表单就匹配不到选项而显示空白（`ShellEnvMode` 曾如此）。
+    #[test]
+    fn serde_json_matches_as_str_for_every_domain_enum() {
+        let sudo_policy = [
+            (SudoPolicy::Deny, "deny"),
+            (SudoPolicy::Ask, "ask"),
+            (SudoPolicy::Auto, "auto"),
+        ];
+        for (variant, want) in sudo_policy {
+            assert_eq!(variant.as_str(), want, "SudoPolicy 的 DB 词表变了");
+            assert_eq!(
+                serde_json::to_value(variant).unwrap(),
+                json!(want),
+                "SudoPolicy 的 JSON 应为 {want:?}，实际与 as_str() 不一致",
+            );
+            assert_eq!(
+                serde_json::from_value::<SudoPolicy>(json!(want)).unwrap(),
+                variant
+            );
+            assert_eq!(SudoPolicy::parse(want), Some(variant));
+        }
+
+        let shell_env_mode = [
+            (ShellEnvMode::LoginThenTask, "login"),
+            (ShellEnvMode::CleanThenTask, "clean"),
+        ];
+        for (variant, want) in shell_env_mode {
+            assert_eq!(variant.as_str(), want, "ShellEnvMode 的 DB 词表变了");
+            assert_eq!(
+                serde_json::to_value(variant).unwrap(),
+                json!(want),
+                "ShellEnvMode 的 JSON 应为 {want:?}（前端选项值与 DB 列都用它），\
+                 实际与 as_str() 不一致会让编辑主机的「环境加载方式」回填空白",
+            );
+            assert_eq!(
+                serde_json::from_value::<ShellEnvMode>(json!(want)).unwrap(),
+                variant,
+            );
+            assert_eq!(ShellEnvMode::parse(want), Some(variant));
+        }
+
+        let sudo_password_source = [
+            (SudoPasswordSource::Own, "own"),
+            (SudoPasswordSource::ReuseLogin, "reuse_login"),
+        ];
+        for (variant, want) in sudo_password_source {
+            assert_eq!(variant.as_str(), want, "SudoPasswordSource 的 DB 词表变了");
+            assert_eq!(
+                serde_json::to_value(variant).unwrap(),
+                json!(want),
+                "SudoPasswordSource 的 JSON 应为 {want:?}，实际与 as_str() 不一致",
+            );
+            assert_eq!(
+                serde_json::from_value::<SudoPasswordSource>(json!(want)).unwrap(),
+                variant,
+            );
+            assert_eq!(SudoPasswordSource::parse(want), Some(variant));
         }
     }
 }

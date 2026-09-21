@@ -78,45 +78,54 @@ onUnmounted(() => {
       </div>
     </main>
 
-    <!-- 全局提示 -->
-    <Transition
-      enter-active-class="transition duration-200"
-      enter-from-class="opacity-0 translate-y-2"
-      leave-active-class="transition duration-150"
-      leave-to-class="opacity-0 translate-y-2"
-    >
-      <div
-        v-if="app.lastError"
-        class="fixed bottom-5 right-5 z-60 flex max-w-md items-start gap-2.5 rounded-xl border border-danger/30 bg-bg-elevated px-4 py-3 shadow-2xl"
+    <!-- 全局提示：必须 Teleport 到 body，见下方注释。 -->
+    <Teleport to="body">
+      <!--
+        层叠上下文陷阱：外壳是 `relative z-1`，它会**新建一个层叠上下文**，
+        提示的 z-60 只在这个上下文内部有效、跨不出去；而 BaseModal 把弹窗
+        Teleport 到 body，在根上下文以 z-50 压住整个外壳（1 < 50）。
+        结果就是提示被表单遮住。覆盖层一律与弹窗同级挂在 body 上，
+        层级才可比（60 > 50）。
+      -->
+      <Transition
+        enter-active-class="transition duration-200"
+        enter-from-class="opacity-0 translate-y-2"
+        leave-active-class="transition duration-150"
+        leave-to-class="opacity-0 translate-y-2"
       >
-        <AlertCircle class="mt-0.5 h-4 w-4 shrink-0 text-danger" />
-        <p class="text-[12.5px] leading-relaxed text-text-base">
-          {{ app.lastError }}
-        </p>
-        <button
-          type="button"
-          class="ml-1 rounded p-0.5 text-text-muted hover:text-text-base"
-          @click="app.clearError()"
+        <div
+          v-if="app.lastError"
+          class="fixed bottom-5 right-5 z-60 flex max-w-md items-start gap-2.5 rounded-xl border border-danger/30 bg-bg-elevated px-4 py-3 shadow-2xl"
         >
-          <X class="h-3.5 w-3.5" />
-        </button>
-      </div>
-    </Transition>
+          <AlertCircle class="mt-0.5 h-4 w-4 shrink-0 text-danger" />
+          <p class="text-[12.5px] leading-relaxed text-text-base">
+            {{ app.lastError }}
+          </p>
+          <button
+            type="button"
+            class="ml-1 rounded p-0.5 text-text-muted hover:text-text-base"
+            @click="app.clearError()"
+          >
+            <X class="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </Transition>
 
-    <Transition
-      enter-active-class="transition duration-200"
-      enter-from-class="opacity-0 translate-y-2"
-      leave-active-class="transition duration-150"
-      leave-to-class="opacity-0 translate-y-2"
-    >
-      <div
-        v-if="app.lastNotice"
-        class="fixed bottom-5 right-5 z-60 flex items-center gap-2.5 rounded-xl border border-border-base bg-bg-elevated px-4 py-3 shadow-2xl"
+      <Transition
+        enter-active-class="transition duration-200"
+        enter-from-class="opacity-0 translate-y-2"
+        leave-active-class="transition duration-150"
+        leave-to-class="opacity-0 translate-y-2"
       >
-        <CheckCircle2 class="h-4 w-4 shrink-0 text-success" />
-        <p class="text-[12.5px] text-text-base">{{ app.lastNotice }}</p>
-      </div>
-    </Transition>
+        <div
+          v-if="app.lastNotice"
+          class="fixed bottom-5 right-5 z-60 flex items-center gap-2.5 rounded-xl border border-border-base bg-bg-elevated px-4 py-3 shadow-2xl"
+        >
+          <CheckCircle2 class="h-4 w-4 shrink-0 text-success" />
+          <p class="text-[12.5px] text-text-base">{{ app.lastNotice }}</p>
+        </div>
+      </Transition>
+    </Teleport>
 
     <!-- sudo 提权确认（Q33 ask 模式）：必须挂在外壳层，
          因为窗口可能被隐藏到托盘后由后端唤出，此时路由组件未必已挂载 -->
