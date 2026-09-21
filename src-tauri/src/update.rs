@@ -4,7 +4,7 @@
 //! - **不做自动下载与自动安装**——只检查版本、提示用户去下载页
 //! - 版本源为**可配置 URL**（默认指向仓库的 update.json，见 D55），便于换源或指向镜像
 //! - 检查**异步且静默失败**：网络不通时不打扰用户，只记日志
-//! - 结果缓存 24 小时；手动检查不受缓存限制
+//! - 结果缓存 24 小时；手动检查不受缓存限制；**缓存按应用版本作废**（升级后不沿用旧版本的结论）
 //! - 语义化版本比对；**应用版本高于远端时不提示**（避免开发版被"降级"提醒）
 //! - 支持"忽略此版本"，同一版本不再重复提示
 //! - 可关闭自动检查
@@ -217,12 +217,31 @@ pub fn cache_is_fresh(conn: &Connection) -> Result<bool> {
     Ok(age.num_hours() < CACHE_TTL_HOURS)
 }
 
-/// 读取缓存的结果。
+/// 读取缓存的结果（只认**当前应用版本**算出来的那份）。
 pub fn cached_result(conn: &Connection) -> Result<Option<UpdateStatus>> {
-    match db::get_setting(conn, SETTING_CACHED)? {
-        Some(json) => Ok(serde_json::from_str(&json).ok()),
-        None => Ok(None),
-    }
+    cached_result_for(conn, &current_version())
+}
+
+/// 读取属于 `current` 这个应用版本的缓存结果，其余一律视为无缓存。
+///
+/// 缓存记录的是"当时那个版本看到的远端"，版本一变结论就过期：0.1.0 时缓存的
+/// `Available 0.1.1` 若继续给 0.1.1 用，设置页就会提示"更新到你自己"。
+/// 读取入口只有这一处，所以启动自动检查、设置页展示与手动检查同时受此约束。
+pub fn cached_result_for(conn: &Connection, current: &str) -> Result<Option<UpdateStatus>> {
+    let Some(json) = db::get_setting(conn, SETTING_CACHED)? else {
+        return Ok(None);
+    };
+    let Ok(status) = serde_json::from_str::<UpdateStatus>(&json) else {
+        return Ok(None);
+    };
+    let belongs_to_current = match &status {
+        UpdateStatus::UpToDate { current: c, .. }
+        | UpdateStatus::Available { current: c, .. }
+        | UpdateStatus::Ignored { current: c, .. } => c == current,
+        // Failed 不带版本信息，无法证明它属于当前版本，一并作废（下次检查会重算）。
+        UpdateStatus::Failed { .. } => false,
+    };
+    Ok(belongs_to_current.then_some(status))
 }
 
 /// 写入缓存结果并记录检查时间。
@@ -675,6 +694,54 @@ mod tests {
         assert!(cache_is_fresh(&conn).unwrap());
     }
 
+    /// 缓存是"**针对某个应用版本**算出来的结果"，版本一变就必须作废。
+    ///
+    /// 守的缺陷形态：0.1.0 时检查到"有 0.1.1 可更新"并写入缓存，升级到 0.1.1 后
+    /// 24 小时内仍读到旧缓存 → 设置页显示"发现新版本 0.1.1"，而当前版本就是 0.1.1。
+    #[test]
+    fn cache_is_invalidated_when_the_app_version_changes() {
+        let conn = mem_conn();
+        let available_for_010 = UpdateStatus::Available {
+            current: "0.1.0".into(),
+            latest: "0.1.1".into(),
+            notes: None,
+            published_at: None,
+            download_url: None,
+            sha256: None,
+            size: None,
+        };
+        store_result(&conn, &available_for_010).unwrap();
+
+        // 仍是 0.1.0：缓存有效，24 小时内不重复请求更新源。
+        let hit = cached_result_for(&conn, "0.1.0").unwrap();
+        assert!(
+            matches!(hit, Some(UpdateStatus::Available { .. })),
+            "同一版本应命中缓存，实际 {hit:?}"
+        );
+
+        // 升级到 0.1.1：旧缓存必须作废，否则就是本次的误报。
+        let stale = cached_result_for(&conn, "0.1.1").unwrap();
+        assert!(
+            stale.is_none(),
+            "缓存是按 0.1.0 算的，当前已是 0.1.1，不得继续作为结果展示；实际 {stale:?}"
+        );
+    }
+
+    /// `Failed` 缓存不带版本信息，无法证明它属于当前版本——同样作废。
+    /// （宁可多重查一次，也不拿旧结论糊弄新版本。）
+    #[test]
+    fn versionless_cached_failure_is_also_invalidated() {
+        let conn = mem_conn();
+        store_result(
+            &conn,
+            &UpdateStatus::Failed {
+                reason: "请求更新源失败".into(),
+            },
+        )
+        .unwrap();
+        assert!(cached_result_for(&conn, "0.1.1").unwrap().is_none());
+    }
+
     #[test]
     fn stale_cache_is_detected() {
         let conn = mem_conn();
@@ -698,7 +765,9 @@ mod tests {
         };
         store_result(&conn, &status).unwrap();
 
-        let loaded = cached_result(&conn).unwrap().expect("应有缓存");
+        let loaded = cached_result_for(&conn, "0.1.0")
+            .unwrap()
+            .expect("应有缓存");
         match loaded {
             UpdateStatus::Available { latest, .. } => assert_eq!(latest, "0.2.0"),
             other => panic!("缓存内容不符：{other:?}"),
