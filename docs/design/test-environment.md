@@ -160,19 +160,23 @@ cargo test -j 2 --test ssh_integration -- --ignored --test-threads=1
 
 > 测试私钥位于 `.tmp-test/`（已被 `.gitignore` 排除，**绝不入库**）。
 
-### 4.5 测试规模与门禁（**会随开发变化**）
+### 4.5 门禁口径（规模数字不登记，见 **D57**）
 
-> 下面只是**量级参考**，不保证与当前代码一致——数字会随开发漂移。
-> 需要准确值时以实际输出为准：`cd src-tauri && cargo test -j 2`、`pnpm test`。
+> 本文**不写"当前有多少条测试"**：那种数字是代码的副本，一次与本文无关的提交就会失真。
+> 需要量级时现取——`cd src-tauri && cargo test -j 2`（默认门禁）、
+> `cargo test --lib -- --list`（仅单测清单）、`pnpm test`（前端）。
 > 完整门禁清单见 [`AGENTS.md`](../../AGENTS.md) §5.10。
 
-| 类别 | 规模 | 说明 |
-| ---- | ---- | ---- |
-| Rust 单测 | 250 项 | 生产文件内的 `#[cfg(test)]`，默认门禁（`cargo test --lib -- --list` 实测） |
-| Rust 集成测试 | 32 项 | `mcp_e2e` 6 / `ssh_integration` 6 / `sudo_e2e` 13 / `version_check_e2e` 7 |
-| ↑ 其中 `#[ignore]`（默认门禁不跑） | 23 项 | `mcp_e2e` 4 / `ssh_integration` 6 / `sudo_e2e` 13；其中 **22 项需真实 SSH**，`mcp_e2e` 另 1 项是耗时的本地用例（空闲 310 秒）。`version_check_e2e` 7 项不依赖真实环境，默认就跑 |
-| 前端单测 | 21 项 | vitest，覆盖 `src/lib/` 纯逻辑 |
-| 前端契约检查 | 1 道 | `pnpm check:ipc`：命令名在 Rust 定义 / `generate_handler!` 注册 / 前端 `call()` 三处一致 |
+口径（结构，不随用例增删而变）：
+
+- **默认门禁就跑**：生产文件内 `#[cfg(test)]` 的单测 + 不依赖真实环境的集成测试
+  （`version_check_e2e` 用本地 HTTP 服务，属这一类）；
+- **默认不跑、要 `--ignored`**：`ssh_integration` / `sudo_e2e` / `mcp_e2e` 里标了
+  `#[ignore]` 的真实环境用例，目标信息一律从 `MFPERCH_TEST_*` 读（见 §2、§3）；
+- **前端**：`pnpm check:ipc` / `pnpm test` / `pnpm typecheck` 三道（分工见 AGENTS.md §5.9），
+  外加 `pnpm check:secrets` 安全自检（AGENTS.md §2.6）；
+- `mcp_e2e` 里有一条**只等空闲超时**的慢用例（约数分钟，不需要 `MFPERCH_TEST_*`）——
+  真实环境用例整组跑可能超过一条命令的时限，分组更稳。
 
 覆盖范围：协议解析、输出截断、加解密、密钥分层、仓储与配额、MCP 工具契约与鉴权、
 sudo 三模式、更新检查、跨语言 IPC 契约。

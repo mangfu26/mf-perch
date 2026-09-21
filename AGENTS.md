@@ -361,6 +361,13 @@ Refs: #123
      （"参考实测：2026-09-16 一台 4 核 / 7.9 GB 内存 / 机械盘开发机……"），
      用来支撑机制判断，**不作为规则的适用前提**；
    - 同样适用于代码注释：写"这个不变量为什么重要"，不写"我这台机器上它表现如何"。
+8. **不登记可由代码或测试自身导出的数量**（**D57**）：现行文档里**不写**"当前有多少条测试 /
+   多大规模 / 多少个命令"这类统计数字——它们是代码的副本，一次与本文档无关的提交就会失真，
+   留下"看着权威、其实是错的"读数比不写更糟。需要量级时**现取**：
+   `cargo test -j 2`、`pnpm test`、`cargo test --lib -- --list`。
+   **判据**：这个数字会不会因无关提交而漂移？会 → 不登记，改写"以 `<命令>` 输出为准"。
+   **不受本条约束**：快照文档与 ADR 里带日期的实测读数（不追改，删了等于销毁证据）；
+   结构事实（有哪几道门禁、哪些 target 带 `#[ignore]`、工具清单）。
 
 ### 4.4 已知缺口（对外说明前必看）
 
@@ -584,13 +591,13 @@ cd src-tauri && cargo test -j 2
 # 每个文件是独立的 test target，按需选一个；--ignored 只跑该 target 下的 #[ignore] 用例
 cd src-tauri && cargo test -j 2 --test ssh_integration -- --ignored --test-threads=1
 
-# 提权双通道的核心用例（13 条，含数据面拒绝 / 提权通道 / cwd 继承 / 身份核实）
+# 提权双通道的核心用例（含数据面拒绝 / 提权通道 / cwd 继承 / 身份核实）
 # 需要额外的 MFPERCH_TEST_SUDO_PW；mcp 是默认特性，无需再写 --features mcp
 cd src-tauri && cargo test -j 2 --test sudo_e2e -- --ignored --test-threads=1
 
-# 【推送 / 并入 main 前】全量 + 全部真实环境用例（23 条 #[ignore]：
-# sudo_e2e 13 / ssh_integration 6 / mcp_e2e 4，其中 1 条只等空闲超时、
-# 不需要 MFPERCH_TEST_*）
+# 【推送 / 并入 main 前】全量 + 全部真实环境用例（= 各 target 下所有 #[ignore] 用例；
+# 条数不在文档里维护，见 §4.3.8 与 D57）。注意 mcp_e2e 里有一条只等空闲超时的慢用例，
+# 整组一起跑可能超过单条命令的时限——分组跑更稳）
 cd src-tauri && cargo test -j 2 -- --ignored --test-threads=1
 
 # 前端三道门禁（都不需要真实环境，与 §5.9 的分工一致）
