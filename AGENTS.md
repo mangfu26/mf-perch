@@ -226,6 +226,10 @@ Refs: #123
   - **已发布版本不登记在本文件**：`git tag -l` 与仓库的 Releases 页就是事实来源，
     往规范里抄一份版本清单必然滞后（依据：§4.3.2 单一事实来源）。
 - 远程仓库地址：以本地 `git remote -v` 为准（`git@github.com:mangfu26/mf-perch.git`）
+- **行尾策略由仓库根的 `.gitattributes` 固定**（逐后缀显式声明 `text` / `-text`，文本入库一律 LF），
+  **不要改成依赖各机器的 `core.autocrlf`**：后者只作用于单台机器，换机后要么把 CRLF 提交进仓库
+  （此后每次改动都显示成整文件重写），要么制造"内容没变却显示已修改"的假象。新增文件类型时
+  在 `.gitattributes` 里补一行；**Windows 批处理必须写 `*.bat text eol=crlf`**。
 
 ---
 
@@ -396,7 +400,7 @@ Refs: #123
 
 | 疑似重复 | 复核结论 |
 | ---- | ---- |
-| `tests/update_e2e.rs` ↔ `src/update.rs` | **不是重复**。`src/update.rs` 的单测直接构造 `UpdateManifest` 结构体（`manifest()` / `manifest_with_asset()`），**绕过 serde 解析**；只有 e2e 走真实 JSON 文本，覆盖"清单字段名 → 状态分支"的线上映射。删掉 e2e 会丢掉"字段名写错、解析静默失配"这类缺陷的防线 |
+| `tests/version_check_e2e.rs` ↔ `src/update.rs` | **不是重复**。`src/update.rs` 的单测直接构造 `UpdateManifest` 结构体（`manifest()` / `manifest_with_asset()`），**绕过 serde 解析**；只有 e2e 走真实 JSON 文本，覆盖"清单字段名 → 状态分支"的线上映射。删掉 e2e 会丢掉"字段名写错、解析静默失配"这类缺陷的防线 |
 | `tests/ssh_integration.rs::session_is_not_confused_by_marker_like_output` ↔ `src/ssh/session.rs` 的 nonce 单测 | **不是重复**。单测喂的是合成输入，集成测试走真实 SSH 回显与真实输出交错 |
 | `src/ipc/tests.rs`、`src/mcp/tools.rs` 的 fixture ↔ `tests/common/mod.rs` | **无法合并**。`src/` 内的单元测试在生产 crate 内部，拿不到 `tests/` 的模块，只能各自保留 |
 
@@ -442,7 +446,7 @@ Refs: #123
 
 1. **是同一条不变式吗？** 换个更硬的问法：**同一个生产缺陷会让这两条测试都失败吗？**
    如果它们守的是**不同的**缺陷，那就不是重复——即使断言写法看着很像。
-   例：`tests/update_e2e.rs`（走真实 JSON，覆盖"清单字段名 → 状态分支"的线上映射）与
+   例：`tests/version_check_e2e.rs`（走真实 JSON，覆盖"清单字段名 → 状态分支"的线上映射）与
    `src/update.rs` 的单测（直接构造 `UpdateManifest`，绕过 serde）：字段名写错只让前者失败，
    两者守的不是同一个缺陷，**都要留**。
 2. **"已在别处覆盖"的那个"别处"，在同一道门禁里跑吗？**
@@ -486,7 +490,7 @@ Refs: #123
   写了就必须在注释里说明它守护的不变式是什么；
 - 测试需要数据库、应用状态、设置、缓存时，**在 fixture 内显式初始化**
   （内存库 `open_in_memory`、`tempfile` 临时目录、自建 `AppState`），**不得**依赖机器上的既有数据或残留状态；
-- 测试**不得依赖外网**；需要 HTTP 时起本地服务（范例见 `src-tauri/tests/update_e2e.rs`）。
+- 测试**不得依赖外网**；需要 HTTP 时起本地服务（范例见 `src-tauri/tests/version_check_e2e.rs`）。
 
 ### 5.5 测试放置位置
 
@@ -495,6 +499,11 @@ Refs: #123
 | 单元 / 模块测试 | 生产文件内的 `#[cfg(test)] mod tests` | 贴近被测代码；本项目绝大多数测试属于此类 |
 | 跨模块端到端（本地） | `src-tauri/tests/*.rs` | 不依赖真实 SSH / 外网，默认随 `cargo test` 运行 |
 | 真实环境端到端 | `src-tauri/tests/*.rs` + `#[ignore]` | 需真实 SSH 服务器，见 §5.6 |
+
+**`tests/*.rs` 的文件名不要含 `update` / `install` / `setup` / `patch` 关键字**——
+Windows 会按文件名把测试 exe 误判为需要管理员权限的安装程序，cargo 根本拉不起来
+（成因与处置见 [`docs/development-troubleshooting.md`](docs/development-troubleshooting.md)）。
+文件名也不要求与被测模块同名，可在文件头注释里注明归属。
 
 ### 5.6 真实环境测试的门禁（本项目专有）
 
