@@ -554,3 +554,47 @@ pnpm check:secrets
 - 改动这类门禁后要做**差分验证**（P3）：故意放入假私钥 / 假令牌 / 凭据类文件，
   确认它**确实会红灯**；只验证"能通过"说明不了任何事。
 
+---
+
+## Windows 侧手工验证 SSH 时：`Load key "...": bad permissions`，或 `ssh` 挂住不返回
+
+### 现象
+
+在 Windows 侧用手头的 `ssh.exe` 连联调环境（`docs/design/test-environment.md`）时：
+
+```
+Load key ".tmp-test/id_test": bad permissions
+mfperch@127.0.0.1: Permission denied (publickey,password).
+```
+
+或者更坑的一种：**命令什么都不打印，一直挂着**，看起来像网络或 sshd 出了问题。
+
+### 原因
+
+1. **Windows 版 OpenSSH 客户端会校验私钥文件的 ACL**：`ssh-keygen`（Git for Windows）
+   新建的私钥在 Windows 眼里权限过宽（继承了这个目录上原有的宽 ACL），客户端直接拒读。
+   Git 自带的那版 `ssh.exe` 看的是 POSIX 位（`0644` 也算"过宽"），System32 那版看的是 ACL——
+   **两个都得修**。
+2. 公钥没被接受时客户端**回落到口令提示**，而提示写在 **`/dev/tty`**（不是 stdout/stderr）。
+   把输出重定向或接进管道时看不见它 → 表现为"无声挂住"，直到服务端
+   `LoginGraceTime` 超时。服务端日志里对应的是一句
+   `Timeout before authentication for connection from 127.0.0.1`——**没有** `Accepted publickey`。
+
+### 解决办法
+
+```bash
+chmod 600 .tmp-test/id_test                                          # Git 版客户端
+icacls .tmp-test/id_test //inheritance:r //grant:r "$USERNAME:(R,W)" # System32 版客户端
+```
+
+排查时一律加 `-o BatchMode=yes`：禁止回落口令提示，认证失败会**立刻**返回并打印真实原因。
+
+### 预防
+
+- **这条只影响手工验证，与测试无关**：`src-tauri/tests/*.rs` 用 russh 自己读 PEM，
+  **不校验文件权限**。不要因为 `ssh` 连不上就去怀疑测试环境或 `authorized_keys`。
+- 判据顺序：先 `BatchMode=yes -vv` 看客户端有没有"Load key"报错，再看 WSL 侧
+  `/var/log/auth.log` 有没有 `Accepted publickey`。两边都正常才是网络/端口问题。
+- 换开发机时，`AGENTS.local.md`（gitignored）里的重建步骤应包含这一步——
+  私钥是在 Windows 侧生成的，权限校验也就只在 Windows 侧触发。
+

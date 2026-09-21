@@ -33,6 +33,10 @@ wsl --install -d Ubuntu
    ```
    Port 2222
    ```
+   **本机做法：让 sshd 自己绑定，端口只有 `sshd_config` 一个来源**——
+   `systemctl disable --now ssh.socket && systemctl enable --now ssh`。
+   新版 Ubuntu 的 ssh 可能由 systemd socket 激活接管，此时最终监听端口未必由 `Port` 决定；
+   **换机后不要假设，以 WSL 内 `ss -ltn | grep 2222` 的实际输出为准**。
 3. 准备两种认证：
    - 密码认证：创建一个测试用户（如 `mfperch`）并设置密码；
    - 密钥认证：生成测试密钥对，公钥写入 `~/.ssh/authorized_keys`。
@@ -44,19 +48,25 @@ wsl --install -d Ubuntu
 
 ## 4. 环境现状与实测记录
 
-- 当前环境：**WSL Ubuntu 26.04**（内核 6.18、systemd 已启用、bash 5.3.9；2026-09-10 记录）。
+- **环境因机器而异**：本机的取值、私钥路径与重建入口记在仓库根部的
+  **`AGENTS.local.md`**（gitignored，规则见 [`AGENTS.md`](../../AGENTS.md) §5.6.2）——
+  换开发机时重建它，不要照抄下面这张表的取值。
+  参考实测：2026-09-21 一台开发机为 **WSL Ubuntu 26.04.1**（内核 6.18、systemd 已启用、
+  bash 5.3.9、OpenSSH 10.2p1），下表各项在该机复验一致。
   选型与客户答复见 **D27 / Q26**，此处不复述。
 
-### 4.1 已搭建的测试环境
+### 4.1 该环境必须具备的项（换机后逐项核对）
 
-| 项 | 状态 |
+| 项 | 期望 |
 | ---- | ---- |
-| openssh-server | ✅ 监听 `127.0.0.1:2222` |
-| 测试用户 `mfperch`（有 sudo 密码 本地测试口令） | ✅ |
-| 免密 sudo 用户 `mfperch-nopass` | ✅ |
-| 测试密钥对（ed25519，无 passphrase） | ✅ |
-| 搭建脚本 | `/home/mf/setup-mfperch-test.sh` |
-| Windows → WSL SSH 连通性 | ✅ 已实测 |
+| openssh-server | 监听 `127.0.0.1:2222` |
+| 测试用户 `mfperch` | 可密钥登录；在 `sudo` 组且**提权需口令**（`sudo -n id -u` 必须失败） |
+| 免密 sudo 用户 `mfperch-nopass` | `sudo -n id -u` 返回 `0`（免密路径） |
+| 测试密钥对 | ed25519、**无 passphrase**（russh 直接读 PEM） |
+| `~/.bash_profile`（`mfperch`） | 把 `/opt/mfperch-test-bin` 加进 PATH，且**不打印任何内容**；该目录内有可执行 `mfperch-test` |
+| `requiretty` | **不得**设置，否则提权通道不可用（能力边界见 [`AGENTS.md`](../../AGENTS.md) §4.4） |
+| 搭建脚本 | 幂等、可重跑；本机路径记在 `AGENTS.local.md`（不入库） |
+| Windows → WSL SSH 连通性 | Windows 侧可连通（NAT 模式下的实测见 §4.2 ①） |
 
 ### 4.2 实测验证结论（关键）
 
