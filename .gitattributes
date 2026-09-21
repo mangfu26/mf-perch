@@ -1,0 +1,36 @@
+# 行尾与文件类型规则（跟着仓库走，不依赖每台机器的 core.autocrlf）
+#
+# 为什么要有这个文件：仓库里文本文件统一存 LF，但"要不要转换"以前只由
+# 各台开发机的 core.autocrlf 决定。后果有两类：
+#   1) 某台机器把 CRLF 提交进仓库 → 之后每次改动都显示成整文件重写；
+#   2) 机器配置与工作区实际字节不符 → 文件内容没变却被标成"已修改"
+#      （换机当天就在 src-tauri/Cargo.toml 上撞到）。
+# 这里逐后缀**显式**声明，而不是只写 `* text=auto`：auto 等于"继续按内容猜"，
+# 歧义正是猜出来的。后面的规则覆盖前面的，所以 `*` 兜底写在最前。
+
+# 兜底：未列出的类型仍按内容判断（新增文件不至于漏配）
+* text=auto
+
+# ── 文本：入库统一 LF；工作区换行由该机的 core.autocrlf 决定 ──
+*.rs text
+*.ts text
+*.vue text
+*.mjs text
+*.css text
+*.html text
+*.md text
+*.json text
+*.yaml text
+*.yml text
+*.toml text
+*.lock text
+*.svg text
+LICENSE text
+
+# ── 二进制：禁止任何转换（被"转换"就直接损坏）──
+*.png -text
+*.ico -text
+*.icns -text
+
+# 说明：本仓库没有 .bat / .cmd。若将来加入 Windows 批处理，必须显式
+# `*.bat text eol=crlf`——纯 LF 的批处理在老版本 cmd 下会被解析成一行。

@@ -226,6 +226,10 @@ Refs: #123
     版本清单 `update.json` 由流水线自动回写 main（**D55**）。
     后续**推送与打 tag 仍需客户单独指示**（见 §1.4 / §1.5）。
 - 远程仓库地址：以本地 `git remote -v` 为准（`git@github.com:mangfu26/mf-perch.git`）
+- **行尾策略由仓库根的 `.gitattributes` 固定**（逐后缀显式声明 `text` / `-text`，文本入库一律 LF），
+  **不要改成依赖各机器的 `core.autocrlf`**：后者只作用于单台机器，换机后要么把 CRLF 提交进仓库
+  （此后每次改动都显示成整文件重写），要么制造"内容没变却显示已修改"的假象。新增文件类型时
+  在 `.gitattributes` 里补一行；**Windows 批处理必须写 `*.bat text eol=crlf`**。
 
 ---
 
