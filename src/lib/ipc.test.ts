@@ -56,6 +56,19 @@ describe("call：解包后端信封", () => {
     expect(err.code).toBe("internal_error");
   });
 
+  it("`ok` 是字符串标签（如后端误用内部标签枚举）时判为失败，不给假成功", async () => {
+    // v0.1.0 的真实缺陷：`{"ok":"err"}` 在真值判断下会被当成功，
+    // 用户看到"保存成功"却查无数据。形状由后端用例钉住（P5），这里守住"绝不假成功"。
+    invoke.mockResolvedValue({
+      ok: "err",
+      code: "ssh_auth",
+      message: "认证失败",
+    } as never);
+    const err = await rejection(call("save_host"));
+    expect(err).toBeInstanceOf(IpcError);
+    expect(err.code).toBe("internal_error");
+  });
+
   it("ok 为真但缺 data 时返回 undefined，而不是抛错", async () => {
     invoke.mockResolvedValue({ ok: true });
     await expect(call("delete_host")).resolves.toBeUndefined();

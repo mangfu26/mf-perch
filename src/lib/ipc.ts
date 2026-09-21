@@ -25,8 +25,10 @@ export class IpcError extends Error {
 /** 解包后端返回；失败时抛出携带 `code` 的 `IpcError`。 */
 function unwrap<T>(raw: IpcEnvelope<T>): T {
   if (raw && typeof raw === "object" && "ok" in raw) {
-    if (raw.ok) return raw.data;
-    throw new IpcError(raw.code, raw.message);
+    // 只认布尔字面量：`ok` 一旦被序列化成字符串标签（如 `"err"`），
+    // 真值判断会把后端错误当成成功。宁可报"格式无法识别"，也不给假的成功（P1 / P5）。
+    if (raw.ok === true) return raw.data;
+    if (raw.ok === false) throw new IpcError(raw.code, raw.message);
   }
   throw new IpcError("internal_error", "后端返回了无法识别的数据格式");
 }

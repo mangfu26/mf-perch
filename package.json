@@ -1,7 +1,7 @@
 {
   "name": "mf-perch",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "Apache-2.0",
   "type": "module",
   "description": "让 AI Agent 像人类一样通过 MCP 与 SSH 访问和管理主机",

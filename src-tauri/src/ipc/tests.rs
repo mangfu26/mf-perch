@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use crate::domain::credential::CredentialKind;
 use crate::domain::host::SudoPolicy;
-use crate::ipc::{save_credential_inner, save_host_inner, CredentialInput, HostInput};
+use crate::error::AppError;
+use crate::ipc::{save_credential_inner, save_host_inner, CredentialInput, HostInput, IpcResult};
 use crate::state::AppState;
 use crate::store::{credentials, hosts};
 
@@ -312,4 +313,58 @@ async fn save_credential_computes_key_fingerprint() {
     assert_eq!(summary.kind, CredentialKind::Key);
     let fp = summary.fingerprint.expect("密钥类凭据应有指纹");
     assert!(fp.starts_with("SHA256:"), "指纹格式应与 OpenSSH 一致：{fp}");
+}
+
+// ==================== IPC 信封形状（跨语言契约） ====================
+
+/// 把信封序列化成 JSON 文本（走线上真正用的那条路：serde 的实现）。
+fn envelope_json<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_string(v).expect("信封应可序列化")
+}
+
+/// 守的契约：失败信封的 `ok` 必须是**布尔 false**。
+///
+/// 判别性（P3）：这条信封曾是内部标签枚举，`ok` 被写成变体名字符串 `"err"`，
+/// 而前端只看真假——非空字符串为真，于是**后端错误全被当成成功**、
+/// `data` 取到 `undefined`，界面提示"已添加"却查无数据
+/// （v0.1.0 客户实测：添加主机后列表没有卡片，且任何后端错误的提示都看不到）。
+/// 前端 `src/lib/ipc.ts` 现在只认布尔字面量，失配会退化成 `internal_error`，
+/// 但**真实的错误码就丢了**；所以线上形状仍要由产出方（后端）自己钉住
+/// （原则见 docs/design/principles.md P5）。
+#[test]
+fn error_envelope_reports_ok_as_boolean_false() {
+    let json = envelope_json(&IpcResult::<String>::from(AppError::HostNotFound(
+        "host_x".into(),
+    )));
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("应是合法 JSON");
+
+    assert_eq!(
+        parsed.get("ok"),
+        Some(&serde_json::Value::Bool(false)),
+        "`ok` 必须是布尔 false，否则前端把错误当成功；实际 JSON：{json}"
+    );
+    assert_eq!(parsed["code"], "host_not_found", "错误码必须原样透出");
+    assert_eq!(
+        parsed["message"],
+        "主机不存在：host_x",
+        "中文原因必须原样透出"
+    );
+}
+
+/// 成功信封：`ok` 为布尔 true 且数据在 `data` 字段。
+#[test]
+fn ok_envelope_reports_boolean_true_with_data() {
+    let json = envelope_json(&IpcResult::ok("host_1".to_string()));
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("应是合法 JSON");
+
+    assert_eq!(
+        parsed.get("ok"),
+        Some(&serde_json::Value::Bool(true)),
+        "`ok` 必须是布尔 true，实际 JSON：{json}"
+    );
+    assert_eq!(parsed["data"], "host_1");
+    assert!(
+        parsed.get("code").is_none() && parsed.get("message").is_none(),
+        "成功信封不该带错误字段，实际 JSON：{json}"
+    );
 }

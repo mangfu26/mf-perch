@@ -221,10 +221,10 @@ Refs: #123
 - 主分支：`main`（**开发主线 + 发布基线**；禁止直接提交，改动经 `develop/xxx` 合并进来）
   - **2026-09-18 建立**：经客户指示由 `develop/init` 建立（当时两者指向同一提交）；
     同日客户明确 `develop/init` 只是首发专用分支，**该分支已删除**（见 §1.1 的历史沿革）。
-  - 本地与 `origin/main` 保持同步（首发推送于 2026-09-19 完成）；
-    tag **`v0.1.0` 已创建并发布**：tag 推送触发发布流水线，产物挂 GitHub Release，
-    版本清单 `update.json` 由流水线自动回写 main（**D55**）。
-    后续**推送与打 tag 仍需客户单独指示**（见 §1.4 / §1.5）。
+  - 本地与 `origin/main` 保持同步；**发布 = 在 `main` 的稳定提交上打 tag**
+    （机制见 **D54 / D55**；推送与打 tag 仍需客户单独指示，见 §1.4 / §1.5）。
+  - **已发布版本不登记在本文件**：`git tag -l` 与仓库的 Releases 页就是事实来源，
+    往规范里抄一份版本清单必然滞后（依据：§4.3.2 单一事实来源）。
 - 远程仓库地址：以本地 `git remote -v` 为准（`git@github.com:mangfu26/mf-perch.git`）
 - **行尾策略由仓库根的 `.gitattributes` 固定**（逐后缀显式声明 `text` / `-text`，文本入库一律 LF），
   **不要改成依赖各机器的 `core.autocrlf`**：后者只作用于单台机器，换机后要么把 CRLF 提交进仓库
@@ -266,7 +266,7 @@ Refs: #123
 
 | 文档 | 内容 | 时效性 |
 | ---- | ---- | ---- |
-| [`docs/decisions.md`](docs/decisions.md) | **技术决策记录（ADR）索引**：按域索引全部 D1–D54 + **取代关系表**（正文已拆到分片） | 现行 |
+| [`docs/decisions.md`](docs/decisions.md) | **技术决策记录（ADR）索引**：按域索引全部 D1–D56 + **取代关系表**（正文已拆到分片） | 现行 |
 | [`docs/decisions/`](docs/decisions/) | ADR **正文分片**，一条一个 `D<编号>.md`；由索引进入，不要整目录通读 | 现行（个别条目标"部分失效"） |
 | [`docs/decisions/archive/`](docs/decisions/archive/) | **整条已被移除/推翻**的决策原文（现含 D37、D44，均被 D49 移除） | **快照** |
 
