@@ -62,6 +62,9 @@ export default {
     sudoPolicyAskDesc: "Agent 请求提权时通过系统通知征得你的同意",
     sudoPolicyAuto: "自动提权",
     sudoPolicyAutoDesc: "Agent 请求提权时自动使用该主机的提权密码",
+    sudoPolicyNotNeeded: "无需提权",
+    sudoPolicyNotNeededDesc:
+      "该主机以 root 等特权身份登录，命令本身就已是特权执行：不包 sudo，也不配置或使用任何 sudo 密码",
     sudoPasswordSource: "sudo 密码来源",
     sudoPasswordOwn: "单独配置",
     sudoPasswordReuse: "复用 SSH 登录密码",

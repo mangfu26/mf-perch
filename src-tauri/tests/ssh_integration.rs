@@ -96,7 +96,7 @@ async fn wait_for_command(
 async fn connect_and_execute_simple_command() {
     let (host, auth) = test_target();
 
-    let (session, mut rx) = Session::connect("term_test", &host, auth, false)
+    let (session, mut rx) = Session::connect("term_test", &host, auth, SudoPolicy::Deny)
         .await
         .expect("会话应能建立");
 
@@ -117,7 +117,7 @@ async fn connect_and_execute_simple_command() {
 async fn session_preserves_cwd_and_env() {
     let (host, auth) = test_target();
 
-    let (session, mut rx) = Session::connect("term_state", &host, auth, false)
+    let (session, mut rx) = Session::connect("term_state", &host, auth, SudoPolicy::Deny)
         .await
         .expect("会话应能建立");
 
@@ -158,7 +158,7 @@ async fn session_preserves_cwd_and_env() {
 async fn session_reports_nonzero_exit_code() {
     let (host, auth) = test_target();
 
-    let (session, mut rx) = Session::connect("term_rc", &host, auth, false)
+    let (session, mut rx) = Session::connect("term_rc", &host, auth, SudoPolicy::Deny)
         .await
         .expect("会话应能建立");
 
@@ -181,7 +181,7 @@ async fn session_reports_nonzero_exit_code() {
 async fn session_handles_quoting_and_special_chars() {
     let (host, auth) = test_target();
 
-    let (session, mut rx) = Session::connect("term_quote", &host, auth, false)
+    let (session, mut rx) = Session::connect("term_quote", &host, auth, SudoPolicy::Deny)
         .await
         .expect("会话应能建立");
 
@@ -216,7 +216,7 @@ async fn host_key_mismatch_has_its_own_error_code() {
             .into(),
     );
 
-    let err = match Session::connect("term_tofu", &host, auth, false).await {
+    let err = match Session::connect("term_tofu", &host, auth, SudoPolicy::Deny).await {
         Ok(_) => panic!("主机密钥与记录不一致时必须拒绝连接，实际却连接成功"),
         Err(e) => e,
     };
@@ -234,7 +234,7 @@ async fn host_key_mismatch_has_its_own_error_code() {
 async fn session_is_not_confused_by_marker_like_output() {
     let (host, auth) = test_target();
 
-    let (session, mut rx) = Session::connect("term_spoof", &host, auth, false)
+    let (session, mut rx) = Session::connect("term_spoof", &host, auth, SudoPolicy::Deny)
         .await
         .expect("会话应能建立");
 

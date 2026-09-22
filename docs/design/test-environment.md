@@ -40,10 +40,13 @@ wsl --install -d Ubuntu
 3. 准备两种认证：
    - 密码认证：创建一个测试用户（如 `mfperch`）并设置密码；
    - 密钥认证：生成测试密钥对，公钥写入 `~/.ssh/authorized_keys`。
-4. 配置 sudo 三种模式用于测试：
+4. 配置 sudo 各档策略用于测试：
    - 默认用户有 sudo 密码 → 测 `ask` / `auto`；
    - 另建一个 `NOPASSWD` 用户 → 测免密路径；
-   - `deny` 模式无需特殊配置。
+   - `deny` 模式无需特殊配置；
+   - `not_needed`（D60）**需要一台以 root 身份登录的主机**，即 sshd 开 `PermitRootLogin`。
+     该选项改动的是测试机的 sshd 配置，**需客户授权后才动**；未开时该档的真实端到端**未实测**
+     （诚实标注见 **D60**，进程内不变式由 `privileged_launch_command` 的用例守住）。
 5. 验证 `bash -l` 能加载 profile（写入一个测试用的 `~/.bash_profile`）。
 
 ## 4. 环境现状与实测记录
@@ -101,8 +104,9 @@ wsl --install -d Ubuntu
 
 **⑤ ~~fail-closed 验证~~（结论已被 D47 / D49 取代）**：
 - 旧：`sudo -A -p ''` 无 askpass 时报 `sudo: No askpass program specified in SUDO_ASKPASS`，退出码 1 → 天然拒绝提权。
-- 现：数据面包装脚本注入 `sudo` shell 垫片（`protocol::sudo_reject_shim`），**三种模式下都**非 0 返回 +
-  一句可操作说明（策略允许提权时指引改用 `run_as_root` 工具；`deny` 时说明该主机已禁用提权）。
+- 现：数据面包装脚本注入 `sudo` shell 垫片（`protocol::sudo_reject_shim`），**四种策略下都**非 0 返回 +
+  一句可操作说明（策略允许提权时指引改用 `run_as_root` 工具；`deny` 时说明该主机已禁用提权；
+  `not_needed` 时说明"已是特权身份，直接执行即可"，D60）。
   现行验证：单测 `wrapper_script_always_installs_reject_shim` 与 `reject_shim_refuses_and_guides_to_the_tool`；
   真实环境见 `src-tauri/tests/sudo_e2e.rs`。
 
@@ -120,7 +124,8 @@ wsl --install -d Ubuntu
 - 密码认证 / 密钥认证 / passphrase 密钥；
 - 方案 C 的包装脚本（NUL 分帧、状态保留、结束标记、退出码）；
 - `bash -l` vs 干净模式；
-- sudo `deny` / `ask` / `auto` 三模式；
+- sudo `deny` / `ask` / `auto` 三档；**`not_needed` 不在其列**——它需要以 root 登录，
+  而本环境未开 `PermitRootLogin`（改它需客户授权，见上面第 3 节第 4 条与 **D60**）；
 - 免密 sudo 快速路径；
 - 长命令异步执行与轮询；
 - 连接断开、终端 broken 状态、归档与恢复。
@@ -179,4 +184,5 @@ cargo test -j 2 --test ssh_integration -- --ignored --test-threads=1
   真实环境用例整组跑可能超过一条命令的时限，分组更稳。
 
 覆盖范围：协议解析、输出截断、加解密、密钥分层、仓储与配额、MCP 工具契约与鉴权、
-sudo 三模式、更新检查、跨语言 IPC 契约。
+sudo 提权（`deny` / `ask` / `auto` 走真实环境；`not_needed` 仅进程内，见 §3 第 4 条与 **D60**）、
+更新检查、跨语言 IPC 契约。

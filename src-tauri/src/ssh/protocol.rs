@@ -77,13 +77,16 @@ pub fn new_nonce() -> String {
 /// - 打印结束标记前显式 `set +e`：`set -e` 会跨帧留在 shell 状态里，
 ///   否则一条失败命令会让整个包装脚本退出、结束标记永不回来。
 ///
-/// `elevation_allowed` 决定垫片给出的指引：为真时告诉 Agent 改用 `run_as_root`
-/// 工具，为假时说明该主机已禁用提权。两种情况**都拒绝执行**——数据面没有
+/// `sudo_policy` 决定垫片给出的**指引**：四种文案都**拒绝执行**——数据面没有
 /// 任何拿到密码的途径，放行只会让 Agent 收到一句难以理解的 sudo 报错。
 ///
 /// 启动方式（登录 shell / 干净模式）由 [`shell_invocation`] 决定，
 /// 脚本本身不含该差异——保证两种模式下协议行为完全一致。
-pub fn wrapper_script(nonce: &str, init_script: Option<&str>, elevation_allowed: bool) -> String {
+pub fn wrapper_script(
+    nonce: &str,
+    init_script: Option<&str>,
+    sudo_policy: crate::domain::host::SudoPolicy,
+) -> String {
     // 初始化脚本在包装循环之前执行一次，用于 nvm / conda 等显式加载（D4）。
     let init = match init_script {
         Some(s) if !s.trim().is_empty() => format!("# 主机配置的初始化脚本\n{}\n", s.trim()),
@@ -92,7 +95,7 @@ pub fn wrapper_script(nonce: &str, init_script: Option<&str>, elevation_allowed:
 
     // 数据面 sudo 拦截（D47/D48）：提权已改为**独立的特权通道**，
     // 数据面不再具备任何提权能力，因此这里装的是"明确拒绝"而非密码注入。
-    let sudo_setup = sudo_reject_shim(elevation_allowed);
+    let sudo_setup = sudo_reject_shim(sudo_policy);
 
     format!(
         r#"set +e
@@ -176,11 +179,18 @@ pub fn wrapper_launch_command(env_mode: crate::domain::host::ShellEnvMode, scrip
 /// 用 shell 函数而非 PATH 上的可执行文件：不落任何远端文件、不依赖远端工具、
 /// 随会话消失；`export -f` 之后对 `bash -c` 子进程同样生效（Agent 的命令
 /// 常常在自己的 bash 里跑）。
-pub fn sudo_reject_shim(elevation_allowed: bool) -> String {
-    let reason = if elevation_allowed {
-        "数据面不允许提权；请改用 run_as_root 工具以特权身份执行该命令"
-    } else {
-        "该主机已禁用提权（sudo 策略为「禁止注入」）；如需提权请由人类在主机设置中开启"
+///
+/// **`not_needed` 档同样拒绝**（D60）：该主机以特权身份登录，数据面上的 `sudo`
+/// 技术上能成，但放行它会开出第二条"以 root 执行却不进特权审计"的路，
+/// 破掉 D49"特权执行只有一个入口"的不变式。因此只换文案、不换语义。
+pub fn sudo_reject_shim(sudo_policy: crate::domain::host::SudoPolicy) -> String {
+    use crate::domain::host::SudoPolicy;
+    let reason = match sudo_policy {
+        SudoPolicy::Deny => "该主机已禁用提权（sudo 策略为「禁止注入」）；如需提权请由人类在主机设置中开启",
+        SudoPolicy::NotNeeded => "该主机已以特权身份登录，直接执行即可（无需 sudo 包装）",
+        SudoPolicy::Ask | SudoPolicy::Auto => {
+            "数据面不允许提权；请改用 run_as_root 工具以特权身份执行该命令"
+        }
     };
     format!(
         "sudo() {{\n  printf '%s\\n' '[mf-perch] {reason}' >&2\n  return 1\n}}\nexport -f sudo\n"
@@ -272,12 +282,34 @@ pub fn shell_single_quote(s: &str) -> String {
 ///
 /// 这样提权通道跑的是**同一套包装循环**（NUL 分帧 + nonce 结束标记），
 /// 因此提权命令的输出与退出码能和普通命令一样被精确归属。
+///
+/// **`not_needed` 档不走这里**（D60）：登录身份已是特权用户时不包 `sudo`，
+/// 改由 [`wrapper_launch_command`] 按该主机的环境加载方式直接起 bash——
+/// 少一层 `env_reset`，也少一个"sudo 要 TTY"的失败面。
 pub fn privileged_wrapper_command(nonce: &str, script: &str) -> String {
     format!(
         "sudo -S -p {} bash -c {}",
         shell_single_quote(&sudo_prompt_marker(nonce)),
         shell_single_quote(script)
     )
+}
+
+/// 选择**特权通道**的启动方式（D47 建立、D60 分档）。
+///
+/// 抽成纯函数只为一个理由：这条分支决定"命令到底交不交给 sudo"，是权限边界上
+/// 最容易改错、又最难在进程内测到的一处。留在 session 的连接流程里，它只能靠
+/// 真实 SSH 环境验证；放在这里，"哪几档必须包 sudo、哪一档绝对不能"就是表驱动断言。
+pub fn privileged_launch_command(
+    sudo_policy: crate::domain::host::SudoPolicy,
+    env_mode: crate::domain::host::ShellEnvMode,
+    nonce: &str,
+    script: &str,
+) -> String {
+    if sudo_policy.needs_elevation() {
+        privileged_wrapper_command(nonce, script)
+    } else {
+        wrapper_launch_command(env_mode, script)
+    }
 }
 
 /// 从原始字节流中**摘除第一个**密码提示标记，返回是否摘到（D47）。
@@ -453,6 +485,7 @@ pub fn encode_frame(command_id: &str, command: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::host::SudoPolicy;
 
     #[test]
     fn nonce_is_hex_and_unique() {
@@ -740,7 +773,7 @@ mod tests {
     /// 语句存在但位置不对（在 `eval` 之前、或在 `while` 之外）同样防不住。
     #[test]
     fn wrapper_always_emits_end_marker_even_after_set_e() {
-        let script = wrapper_script("nonce_x", None, false);
+        let script = wrapper_script("nonce_x", None, SudoPolicy::Deny);
 
         let eval_at = script
             .find("eval \"$mfperch_cmd\"")
@@ -776,7 +809,7 @@ mod tests {
     #[test]
     fn wrapper_script_contains_key_elements() {
         let nonce = "testnonce";
-        let script = wrapper_script(nonce, None, false);
+        let script = wrapper_script(nonce, None, SudoPolicy::Deny);
 
         // 必须用 NUL 读取，且不依赖任何外部命令。
         assert!(script.contains("read -r -d ''"));
@@ -794,16 +827,16 @@ mod tests {
 
     #[test]
     fn wrapper_script_includes_init_script_when_provided() {
-        let script = wrapper_script("n", Some("export FOO=bar"), false);
+        let script = wrapper_script("n", Some("export FOO=bar"), SudoPolicy::Deny);
         assert!(script.contains("export FOO=bar"));
 
-        let without = wrapper_script("n", None, false);
+        let without = wrapper_script("n", None, SudoPolicy::Deny);
         assert!(!without.contains("export FOO=bar"));
 
         // 空白（或仅空白字符）的初始化脚本必须与"未提供"完全等价：
         // 不得往脚本里插入空的初始化段落。这里比对**整份脚本**，
         // 而不是"某句注释文本是否出现"——后者一改文案就失效，也抓不到行为回归。
-        let blank = wrapper_script("n", Some("   \n  "), false);
+        let blank = wrapper_script("n", Some("   \n  "), SudoPolicy::Deny);
         assert_eq!(blank, without, "空白初始化脚本不应改变生成的脚本");
     }
 
@@ -811,13 +844,20 @@ mod tests {
     fn wrapper_script_always_installs_reject_shim() {
         // D47/D48 核心：数据面**不许提权**——不论主机策略如何，都必须装上垫片，
         // 让 `sudo` 明确失败并告诉 Agent 改用 run_as_root。
-        for allowed in [true, false] {
-            let script = wrapper_script("n", None, allowed);
-            assert!(script.contains("sudo()"), "应定义 sudo 垫片：{allowed}");
+        // 四档全枚举是 D60 带出来的要求：`not_needed` 技术上 sudo 能成，
+        // 放行它会开出第二条"以 root 执行却不进特权审计"的路。
+        for policy in [
+            SudoPolicy::Deny,
+            SudoPolicy::Ask,
+            SudoPolicy::Auto,
+            SudoPolicy::NotNeeded,
+        ] {
+            let script = wrapper_script("n", None, policy);
+            assert!(script.contains("sudo()"), "应定义 sudo 垫片：{policy:?}");
             assert!(script.contains("export -f sudo"), "应导出给子 bash 进程");
         }
         // 数据面不得出现任何密码投递载体——重新引入就恢复了 V1 的攻击面（D49）。
-        let script = wrapper_script("n", None, true);
+        let script = wrapper_script("n", None, SudoPolicy::Auto);
         for forbidden in ["SUDO_ASKPASS", "askpass", "sudo -A", "mkfifo", ".mf-perch"] {
             assert!(
                 !script.contains(forbidden),
@@ -829,10 +869,10 @@ mod tests {
     /// 守的不变式：垫片必须**真的拒绝**（非 0 返回），并给出可操作指引。
     ///
     /// 只断言"含有某句话"是不够的：Agent 需要的是"这条命令不会被执行"。
-    /// 因此这里同时检查返回码与两种策略下的文案差异。
+    /// 因此这里同时检查返回码与三种指引下的文案差异。
     #[test]
     fn reject_shim_refuses_and_guides_to_the_tool() {
-        let allowed = sudo_reject_shim(true);
+        let allowed = sudo_reject_shim(SudoPolicy::Auto);
         assert!(allowed.contains("return 1"), "垫片必须以非 0 返回：{allowed}");
         assert!(
             allowed.contains("run_as_root"),
@@ -840,7 +880,7 @@ mod tests {
         );
         assert!(allowed.contains(">&2"), "拒绝说明应走 stderr，不污染命令输出");
 
-        let denied = sudo_reject_shim(false);
+        let denied = sudo_reject_shim(SudoPolicy::Deny);
         assert!(denied.contains("return 1"), "垫片必须以非 0 返回：{denied}");
         assert!(
             denied.contains("已禁用提权"),
@@ -853,6 +893,76 @@ mod tests {
             "禁用提权时不应引导去用一个也会失败的入口：{denied}"
         );
         assert_ne!(allowed, denied, "两种策略的文案必须不同");
+
+        // D60：`not_needed` 仍然拒绝（不破 D49），但指引是"直接执行"，
+        // 既不该提 run_as_root，也不该提密码——这一档根本没有口令。
+        let already_root = sudo_reject_shim(SudoPolicy::NotNeeded);
+        assert!(
+            already_root.contains("return 1"),
+            "该档同样必须拒绝执行：{already_root}"
+        );
+        assert!(!already_root.contains("run_as_root"), "该档无需绕道：{already_root}");
+        for forbidden in ["密码", "口令", "sudo -S"] {
+            assert!(
+                !already_root.contains(forbidden),
+                "该档不涉及口令，文案不得出现 {forbidden:?}：{already_root}"
+            );
+        }
+        assert_ne!(already_root, denied, "「已是特权身份」与「已禁用提权」不能混为一谈");
+    }
+
+    /// 守的不变式（D47 建立、D60 分档）：**只有 `not_needed` 不包 sudo**，
+    /// 其余三档的特权通道都必须走 `sudo -S` 并带上自有提示标记。
+    ///
+    /// 判别性（每条都对应一个真实缺陷形态）：
+    /// - `needs_elevation()` 写反 → 该提权的档位不再包 sudo，Agent 以普通身份
+    ///   执行了本该特权的命令，而审计照旧写"特权"——**授权与记录双双失真**；
+    /// - 顺手把 `not_needed` 也包上 sudo → 该档重新背上 `env_reset`（PATH 被重置）
+    ///   与 `requiretty` 两个失败面，"root 主机反而用不了"这个原始缺陷就回来了；
+    /// - `not_needed` 的启动命令里出现提示标记 → 应用会去写一份根本不存在的密码。
+    #[test]
+    fn only_not_needed_launches_the_privileged_channel_without_sudo() {
+        use crate::domain::host::{ShellEnvMode, SudoPolicy};
+        let script = "true";
+
+        for policy in [SudoPolicy::Deny, SudoPolicy::Ask, SudoPolicy::Auto] {
+            let launch =
+                privileged_launch_command(policy, ShellEnvMode::LoginThenTask, "n1", script);
+            assert!(
+                launch.starts_with("sudo -S -p "),
+                "{policy:?} 档必须经 sudo -S 提权，实际：{launch}"
+            );
+            assert!(
+                launch.contains(&sudo_prompt_marker("n1")),
+                "提示标记要带上本通道的 nonce，否则握手无法判定是否写密码：{launch}"
+            );
+        }
+
+        let launch = privileged_launch_command(
+            SudoPolicy::NotNeeded,
+            ShellEnvMode::LoginThenTask,
+            "n1",
+            script,
+        );
+        assert!(
+            !launch.contains("sudo ") && !launch.contains(SUDO_PROMPT_PREFIX),
+            "「无需提权」档不得出现 sudo 包装或密码提示标记：{launch}"
+        );
+        // 未包 sudo 时，环境加载方式必须真的生效（否则该档连 PATH 都和配置不符）。
+        assert!(
+            launch.starts_with("bash -l -c "),
+            "该档按主机配置的环境加载方式直接起 bash：{launch}"
+        );
+        let clean = privileged_launch_command(
+            SudoPolicy::NotNeeded,
+            ShellEnvMode::CleanThenTask,
+            "n1",
+            script,
+        );
+        assert!(
+            clean.starts_with("bash --noprofile --norc -c "),
+            "干净模式的该档同样要接上环境加载方式：{clean}"
+        );
     }
 
     #[test]

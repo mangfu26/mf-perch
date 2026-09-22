@@ -83,8 +83,17 @@ watch(
 
 const isEdit = computed(() => !!props.host);
 const title = computed(() => (isEdit.value ? t("host.edit") : t("host.add")));
+/**
+ * 是否存在"提权"这一步（D60）。
+ *
+ * `deny` 拒绝提权、`not_needed` 登录身份本身已是特权用户，两档都**没有口令可配**；
+ * 只有 `ask` / `auto` 才需要向用户要 sudo 密码。
+ */
+const usesElevation = computed(
+  () => sudoPolicy.value === "ask" || sudoPolicy.value === "auto",
+);
 const requiresSudoPassword = computed(
-  () => sudoPolicy.value !== "deny" && sudoPasswordSource.value === "own",
+  () => usesElevation.value && sudoPasswordSource.value === "own",
 );
 
 function submit() {
@@ -155,6 +164,7 @@ function submit() {
               { v: 'deny', label: t('host.sudoPolicyDeny'), desc: t('host.sudoPolicyDenyDesc'), tone: 'safe' },
               { v: 'ask', label: t('host.sudoPolicyAsk'), desc: t('host.sudoPolicyAskDesc'), tone: 'warn' },
               { v: 'auto', label: t('host.sudoPolicyAuto'), desc: t('host.sudoPolicyAutoDesc'), tone: 'warn' },
+              { v: 'not_needed', label: t('host.sudoPolicyNotNeeded'), desc: t('host.sudoPolicyNotNeededDesc'), tone: 'warn' },
             ]"
             :key="opt.v"
             class="flex cursor-pointer items-start gap-2.5 rounded-[9px] border px-3 py-2.5 transition-colors"
@@ -180,8 +190,8 @@ function submit() {
         </div>
       </FormField>
 
-      <!-- sudo 密码：仅在需要注入且选择单独配置时出现 -->
-      <template v-if="sudoPolicy !== 'deny'">
+      <!-- sudo 密码：只有确实存在"提权"这一步时才出现（D60） -->
+      <template v-if="usesElevation">
         <FormField :label="t('host.sudoPasswordSource')">
           <BaseInput v-model="sudoPasswordSource" as="select">
             <option value="reuse_login">{{ t("host.sudoPasswordReuse") }}</option>

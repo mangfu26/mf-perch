@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{new_id, now_rfc3339};
 
-/// sudo 密码处理策略（Q33，客户要求一期全部实现）。
+/// sudo 密码处理策略（Q33，客户要求一期全部实现；第四档见 D60）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SudoPolicy {
@@ -12,6 +12,15 @@ pub enum SudoPolicy {
     Ask,
     /// 自动注入：收到请求标记后立即注入密码。
     Auto,
+    /// 该主机的登录身份**本身就是特权用户**（人类声明，D60）。
+    ///
+    /// 与前三个取值的差别不是"什么时候给密码"，而是**根本不需要提权这一步**：
+    /// 特权通道不再包 `sudo`，`sudo_password_source` / `sudo_password` 两列
+    /// 一律忽略（库里不删，切回其它档位时无需重填）。
+    ///
+    /// 声明只表达意图，**事实由远端核实**：包装脚本仍打印 `${EUID}`，
+    /// 实际 uid 非 0 时按现有逻辑如实告警（见 D60 的"声明与核验"）。
+    NotNeeded,
 }
 
 impl Default for SudoPolicy {
@@ -27,6 +36,7 @@ impl SudoPolicy {
             Self::Deny => "deny",
             Self::Ask => "ask",
             Self::Auto => "auto",
+            Self::NotNeeded => "not_needed",
         }
     }
 
@@ -35,8 +45,17 @@ impl SudoPolicy {
             "deny" => Some(Self::Deny),
             "ask" => Some(Self::Ask),
             "auto" => Some(Self::Auto),
+            "not_needed" => Some(Self::NotNeeded),
             _ => None,
         }
+    }
+
+    /// 是否需要"提权"这一步，即特权通道要不要包 `sudo`（D60）。
+    ///
+    /// 只有 `NotNeeded` 为假：登录身份已经是特权用户，包 `sudo` 是恒等操作，
+    /// 却会带来 sudo 自己的语义（`env_reset` 重置 PATH、`requiretty` 拒绝）。
+    pub fn needs_elevation(self) -> bool {
+        !matches!(self, Self::NotNeeded)
     }
 }
 
@@ -231,6 +250,7 @@ mod tests {
             (SudoPolicy::Deny, "deny"),
             (SudoPolicy::Ask, "ask"),
             (SudoPolicy::Auto, "auto"),
+            (SudoPolicy::NotNeeded, "not_needed"),
         ];
         for (variant, want) in sudo_policy {
             assert_eq!(variant.as_str(), want, "SudoPolicy 的 DB 词表变了");

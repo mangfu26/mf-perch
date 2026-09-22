@@ -155,6 +155,7 @@ pub fn policy_description(policy: SudoPolicy) -> &'static str {
         SudoPolicy::Deny => "不允许 Agent 提权（默认，最安全）",
         SudoPolicy::Ask => "Agent 请求提权时通知你确认",
         SudoPolicy::Auto => "Agent 请求提权时自动使用该主机的提权密码",
+        SudoPolicy::NotNeeded => "该主机以特权身份登录，无需提权（不使用任何密码）",
     }
 }
 
@@ -163,6 +164,7 @@ pub fn policy_description(policy: SudoPolicy) -> &'static str {
 /// 返回 `Err` 时调用方应把原因告知用户——静默失效会让用户以为
 /// 策略已生效，而实际上 sudo 一直失败（P1：明确报错）。
 pub fn validate_for_policy(policy: SudoPolicy, has_password: bool) -> Result<()> {
+    // `deny` 与 `not_needed` 都不涉及口令，无需校验（D60：后者连"提权"这一步都没有）。
     if !matches!(policy, SudoPolicy::Ask | SudoPolicy::Auto) {
         return Ok(());
     }

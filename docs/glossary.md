@@ -28,7 +28,7 @@ mf-perch 的核心价值是"**让 AI Agent 通过 SSH 操作管理主机，人�
 
 > **sudo 提权不在此列**：Q33 已决定 `deny` / `ask` / `auto` 三模式**一期全部实现**，
 > 并已按 D47 / D48 / D49 落地为"双通道 + `run_as_root` 工具"
-> （见 [`design/sudo.md`](design/sudo.md) §0）。它与"核心链路"直接相关——
+> （见 [`design/sudo.md`](design/sudo.md) §0；**D60 起增第四档 `not_needed`**）。它与"核心链路"直接相关——
 > Agent 要装包、改配置就得提权，因此不能留给二期。
 
 **判断标准**：如果某个功能砍掉后，"Agent 能安全地通过 SSH 操作主机、人类能审计"这个核心闭环依然成立，它就不进 MVP。

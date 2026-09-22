@@ -205,6 +205,31 @@ async fn save_host_accepts_reuse_login_with_password_credential() {
 }
 
 #[tokio::test]
+async fn save_host_accepts_not_needed_without_any_password() {
+    // D60：以特权身份登录的主机没有"提权口令"这件事。同一份配置（密钥凭据 + 无口令）
+    // 在 auto 档会被拒绝保存（见 save_host_rejects_reuse_login_with_key_credential），
+    // 在 not_needed 档必须放行——否则"无需提权"这一档形同虚设。
+    let (state, _key) = test_state();
+    let cred_id = save_credential_inner(&state, credential_input("root", Some("pw")))
+        .await
+        .unwrap();
+    {
+        let conn = state.db.lock().await;
+        conn.execute("UPDATE credentials SET kind = 'key' WHERE id = ?1", [&cred_id])
+            .unwrap();
+    }
+
+    let mut input = host_input("10.0.0.13", Some(cred_id));
+    input.sudo_policy = "not_needed".into();
+    input.sudo_password_source = "reuse_login".into();
+    input.sudo_password = None;
+
+    save_host_inner(&state, input)
+        .await
+        .expect("「无需提权」不该要求任何口令");
+}
+
+#[tokio::test]
 async fn save_host_update_keeps_valid_when_password_blank() {
     // 编辑时留空表示保留原密码，因此校验必须把**已存的密码**算进去，
     // 否则用户改个名字就会被误判为"缺少密码"而无法保存。

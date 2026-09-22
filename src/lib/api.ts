@@ -6,7 +6,7 @@
  * 后端也不返回它们（D6 / Q10）。
  */
 
-export type SudoPolicy = "deny" | "ask" | "auto";
+export type SudoPolicy = "deny" | "ask" | "auto" | "not_needed";
 export type SudoPasswordSource = "own" | "reuse_login";
 export type ShellEnvMode = "login" | "clean";
 export type CredentialKind = "password" | "key";
