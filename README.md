@@ -1,3 +1,10 @@
+<p align="center">
+  <a href="https://github.com/mangfu26/mf-perch">
+    <img src="docs/assets/logo.png" width="160" height="160"
+         alt="mf-perch 图标：深空渐变底色上，一只紫色小鸟停在终端提示符旁">
+  </a>
+</p>
+
 # mf-perch
 
 **让 AI Agent 像人类使用终端软件一样，安全地通过 SSH 操作和管理主机。**

@@ -247,3 +247,18 @@
 | [`style-c-minimal-light.png`](mockups/style-c-minimal-light.png) | 亮色原始方案稿 |
 
 > 备选方案 B（Nord）与 D（Terminal Native）的稿件保留在 `mockups/` 目录，未采用，可作后续参考。
+
+## 7. 应用图标与 README 徽标（唯一来源）
+
+| 资产 | 是什么 | 谁在用它 |
+| ---- | ---- | ---- |
+| [`src-tauri/icons/`](../../src-tauri/icons/) | 应用图标整套资源 | 运行时（窗口 / 托盘）取构建时内嵌的默认图标（托盘见
+[`src-tauri/src/tray.rs`](../../src-tauri/src/tray.rs) 的 `default_window_icon()`）；
+打包用的尺寸清单在 `src-tauri/tauri.conf.json` 的 `bundle.icon` |
+| `src-tauri/icons/icon.png`（512×512） | 仓库内可见的**最高分辨率母版** | 其余尺寸是它的导出件 |
+| [`docs/assets/logo.png`](assets/logo.png)（320×320） | README 顶部徽标，由 `icon.png` **等比导出** | 只有 `README.md` 引用 |
+
+- **改图标先改母版，再重新导出 README 那张**；不要反过来拿 `docs/assets/logo.png` 去替换
+  `icons/`——它已经被缩小过一次，以它为原料只会一路掉分辨率。
+- **README 复用 app 图标、不另做横版字标**（Q40）：与安装包和托盘完全一致、零新增设计。
+  横版字标（透明底 + 文字标）是对外宣传时的独立交付，需要定字体，届时另开一轮。
