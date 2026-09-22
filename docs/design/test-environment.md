@@ -160,7 +160,7 @@ cargo test -j 2 --test ssh_integration -- --ignored --test-threads=1
 
 > 测试私钥位于 `.tmp-test/`（已被 `.gitignore` 排除，**绝不入库**）。
 
-### 4.5 门禁口径（规模数字不登记，见 **D57**）
+### 4.5 门禁口径（规模数字不登记，见 **D57 / D59**）
 
 > 本文**不写"当前有多少条测试"**：那种数字是代码的副本，一次与本文无关的提交就会失真。
 > 需要量级时现取——`cd src-tauri && cargo test -j 2`（默认门禁）、
