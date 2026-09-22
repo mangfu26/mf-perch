@@ -60,17 +60,31 @@ fn mem_conn() -> rusqlite::Connection {
     mf_perch_lib::store::db::open_in_memory().unwrap()
 }
 
-/// 清单正文：远端版本高于当前版本，且带本平台的安装包。
+/// 清单正文：远端版本高于当前版本，带本平台安装包，且**显式给出发布页地址**。
 fn newer_manifest() -> &'static str {
     r#"{
       "version": "99.0.0",
+      "release_url": "https://github.com/mangfu26/mf-perch/releases/tag/v99.0.0",
       "notes": "测试用新版本",
       "pub_date": "2026-09-10T00:00:00Z",
       "platforms": {
         "windows-x86_64": {
-          "url": "https://example.com/mf-perch.msi",
+          "url": "https://github.com/mangfu26/mf-perch/releases/download/v99.0.0/mf-perch.msi",
           "sha256": "deadbeef",
           "size": 2048
+        }
+      }
+    }"#
+}
+
+/// 清单正文：**没有** `release_url` 的老形态（v0.1.2 及更早的流水线产物就是这样）。
+fn legacy_manifest_without_release_url() -> &'static str {
+    r#"{
+      "version": "99.0.0",
+      "platforms": {
+        "windows-x86_64": {
+          "url": "https://github.com/mangfu26/mf-perch/releases/download/v99.0.0/mf-perch_99.0.0_x64_en-US.msi",
+          "sha256": "deadbeef"
         }
       }
     }"#
@@ -82,7 +96,7 @@ fn older_manifest() -> &'static str {
 }
 
 #[tokio::test]
-async fn detects_new_version_and_exposes_download() {
+async fn detects_new_version_and_exposes_release_page() {
     let (url, _hits) = serve_manifest(newer_manifest()).await;
     let conn = mem_conn();
     update::set_source_url(&conn, &url).unwrap();
@@ -92,18 +106,41 @@ async fn detects_new_version_and_exposes_download() {
     match status {
         update::UpdateStatus::Available {
             latest,
-            download_url,
+            release_url,
             sha256,
             size,
             notes,
             ..
         } => {
             assert_eq!(latest, "99.0.0");
-            assert_eq!(download_url.as_deref(), Some("https://example.com/mf-perch.msi"));
+            // 用户点开的必须是**该版本的 Release 页**（D58），不是 msi 直链：
+            // 同一个 Release 下并列着 msi 与 setup.exe，直链等于替用户挑了格式。
+            assert_eq!(
+                release_url.as_deref(),
+                Some("https://github.com/mangfu26/mf-perch/releases/tag/v99.0.0")
+            );
             assert_eq!(sha256.as_deref(), Some("deadbeef"));
             assert_eq!(size, Some(2048));
             assert_eq!(notes.as_deref(), Some("测试用新版本"));
         }
+        other => panic!("期望 Available，实际 {other:?}"),
+    }
+}
+
+/// 线上真实存在的清单形态：v0.1.2 及更早的流水线产物里**没有** `release_url`。
+/// 此时从安装包直链推导同一个 tag 的发布页，用户照样有入口可点。
+#[tokio::test]
+async fn legacy_manifest_without_release_url_still_yields_a_page() {
+    let (url, _hits) = serve_manifest(legacy_manifest_without_release_url()).await;
+    let conn = mem_conn();
+    update::set_source_url(&conn, &url).unwrap();
+
+    match update::check(&conn, true).await.unwrap() {
+        update::UpdateStatus::Available { release_url, .. } => assert_eq!(
+            release_url.as_deref(),
+            Some("https://github.com/mangfu26/mf-perch/releases/tag/v99.0.0"),
+            "老清单应推导出发布页地址"
+        ),
         other => panic!("期望 Available，实际 {other:?}"),
     }
 }
@@ -197,13 +234,14 @@ async fn manifest_without_platform_asset_still_reports_update() {
     let status = update::check(&conn, true).await.unwrap();
     match status {
         update::UpdateStatus::Available {
-            download_url,
+            release_url,
             latest,
             ..
         } => {
             assert_eq!(latest, "99.0.0");
-            // 没有对应平台包时仍应告知有新版本，只是没有下载地址。
-            assert!(download_url.is_none());
+            // 没有对应平台包、清单也没给发布页地址时，仍应告知有新版本，
+            // 只是界面退回到"自行到仓库 Releases 列表查找"。
+            assert!(release_url.is_none());
         }
         other => panic!("期望 Available，实际 {other:?}"),
     }

@@ -8,7 +8,7 @@
 //! - 语义化版本比对；**应用版本高于远端时不提示**（避免开发版被"降级"提醒）
 //! - 支持"忽略此版本"，同一版本不再重复提示
 //! - 可关闭自动检查
-//! - 不自动打开浏览器，仅返回下载地址由用户点击
+//! - 不自动打开浏览器，仅返回**该版本的 Release 页面**地址由用户点击（D58）
 //! - 返回 SHA256 供用户核对下载完整性
 
 use std::collections::HashMap;
@@ -68,6 +68,11 @@ fn platform_key_for(os: &str, arch: &str) -> &'static str {
 pub struct UpdateManifest {
     /// 最新版本号（语义化版本，如 `0.2.0`；也允许带 `v` 前缀）。
     pub version: String,
+    /// 该版本的 **Release 页面**地址（D58）。
+    ///
+    /// 由发布流水线写入；缺失时从安装包地址推导（见 [`release_url_for`]）。
+    #[serde(default)]
+    pub release_url: Option<String>,
     /// 发布说明（支持多行文本）。
     #[serde(default)]
     pub notes: Option<String>,
@@ -82,7 +87,8 @@ pub struct UpdateManifest {
 /// 某平台的安装包信息。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PlatformAsset {
-    /// 下载地址。
+    /// 安装包直链。**不是**给用户点的地址（D58：用户点到的是版本 Release 页），
+    /// 这里只用于核对完整性时定位文件、以及在清单没写 `release_url` 时推导发布页。
     pub url: String,
     /// 安装包 SHA256，供用户核对完整性。
     #[serde(default)]
@@ -109,7 +115,9 @@ pub enum UpdateStatus {
         latest: String,
         notes: Option<String>,
         published_at: Option<String>,
-        download_url: Option<String>,
+        /// 该版本的 Release 页面地址（D58）；`None` 表示清单既没给也没法推导。
+        release_url: Option<String>,
+        /// 本平台安装包的校验值与大小（仅供用户核对，下载入口不是它）。
         sha256: Option<String>,
         size: Option<u64>,
     },
@@ -320,10 +328,42 @@ pub fn evaluate(
         latest: manifest.version.clone(),
         notes: manifest.notes.clone(),
         published_at: manifest.pub_date.clone(),
-        download_url: asset.map(|a| a.url.clone()),
+        release_url: release_url_for(manifest, asset),
         sha256: asset.and_then(|a| a.sha256.clone()),
         size: asset.and_then(|a| a.size),
     }
+}
+
+/// 用户该点开哪个地址：**该版本的 Release 页面**，不是某个安装包文件（D58）。
+///
+/// 不直链文件的两个理由：
+/// - 同一个 Release 下往往并列多种安装包（Windows 就有 msi 与 setup.exe 之分），
+///   直链等于替用户挑了格式；将来多平台时还要替用户挑平台；
+/// - 清单缺当前平台的条目时（含平台标识为 `unknown` 的机器），直链会退化成
+///   "有新版本却没有入口"。发布页则与平台无关，永远点得开。
+///
+/// 优先取清单显式给出的 `release_url`（流水线写入）；老清单没有这个字段时，
+/// 从安装包直链推导同一个 tag 的发布页；两者都没有才返回 `None`。
+fn release_url_for(manifest: &UpdateManifest, asset: Option<&PlatformAsset>) -> Option<String> {
+    if let Some(url) = manifest.release_url.as_deref().map(str::trim) {
+        if !url.is_empty() {
+            return Some(url.to_string());
+        }
+    }
+    asset.and_then(|a| release_page_from_download(a.url.trim()))
+}
+
+/// 从 `…/releases/download/<tag>/<文件>` 推导 `…/releases/tag/<tag>`。
+///
+/// 形态不符（自建镜像的其它目录结构）返回 `None`，由调用方退回"无入口"提示——
+/// **不猜**地址：拼一个不存在的路径比不给链接更容易把用户带到 404。
+fn release_page_from_download(url: &str) -> Option<String> {
+    let (base, rest) = url.split_once("/releases/download/")?;
+    let (tag, _file) = rest.rsplit_once('/')?;
+    if base.is_empty() || tag.is_empty() {
+        return None;
+    }
+    Some(format!("{base}/releases/tag/{tag}"))
 }
 
 /// 从远端拉取清单并解析。
@@ -441,18 +481,22 @@ mod tests {
     fn manifest(version: &str) -> UpdateManifest {
         UpdateManifest {
             version: version.to_string(),
+            release_url: None,
             notes: Some("修复若干问题".into()),
             pub_date: Some("2026-09-10T00:00:00Z".into()),
             platforms: HashMap::new(),
         }
     }
 
+    /// 带本平台安装包、但**没有** `release_url` 的清单（老清单的真实形态）。
     fn manifest_with_asset(version: &str, platform: &str) -> UpdateManifest {
         let mut m = manifest(version);
         m.platforms.insert(
             platform.to_string(),
             PlatformAsset {
-                url: "https://example.com/pkg.msi".into(),
+                url: format!(
+                    "https://github.com/mangfu26/mf-perch/releases/download/v{version}/mf-perch_{version}_x64_en-US.msi"
+                ),
                 sha256: Some("abc123".into()),
                 size: Some(1024),
             },
@@ -544,13 +588,19 @@ mod tests {
         match s {
             UpdateStatus::Available {
                 latest,
-                download_url,
+                release_url,
                 sha256,
                 size,
                 ..
             } => {
                 assert_eq!(latest, "0.9.0");
-                assert_eq!(download_url.as_deref(), Some("https://example.com/pkg.msi"));
+                // 清单没写 release_url 时，从安装包直链推导**同一个 tag 的发布页**，
+                // 而不是把 msi 直链丢给用户（D58）。
+                assert_eq!(
+                    release_url.as_deref(),
+                    Some("https://github.com/mangfu26/mf-perch/releases/tag/v0.9.0"),
+                    "应指向版本发布页"
+                );
                 assert_eq!(sha256.as_deref(), Some("abc123"));
                 assert_eq!(size, Some(1024));
             }
@@ -560,20 +610,96 @@ mod tests {
 
     #[test]
     fn available_without_matching_platform_still_reports() {
-        // 清单里没有当前平台的包时，仍应告知有新版本，只是没有下载地址。
+        // 清单里没有当前平台的包时，仍应告知有新版本，只是没有校验值可展示。
         let m = manifest_with_asset("0.9.0", "linux-x86_64");
         let s = evaluate(&m, "0.1.0", None, "windows-x86_64");
         match s {
             UpdateStatus::Available {
-                download_url,
+                release_url,
                 sha256,
                 ..
             } => {
-                assert!(download_url.is_none());
+                assert!(release_url.is_none(), "无本平台包且清单未给地址：实际 {release_url:?}");
                 assert!(sha256.is_none());
             }
             other => panic!("期望 Available，实际 {other:?}"),
         }
+    }
+
+    /// D58 的实际收益：清单显式给出发布页地址时，**即使本平台没有安装包条目**，
+    /// 用户也仍然有一个能点开的入口（旧实现此时只剩一句提示文字）。
+    #[test]
+    fn explicit_release_url_survives_a_missing_platform_asset() {
+        let mut m = manifest("0.9.0");
+        m.release_url = Some("https://github.com/mangfu26/mf-perch/releases/tag/v0.9.0".into());
+        let s = evaluate(&m, "0.1.0", None, "windows-x86_64");
+        match s {
+            UpdateStatus::Available {
+                release_url,
+                sha256,
+                ..
+            } => {
+                assert_eq!(
+                    release_url.as_deref(),
+                    Some("https://github.com/mangfu26/mf-perch/releases/tag/v0.9.0")
+                );
+                assert!(sha256.is_none(), "没有本平台包就没有校验值");
+            }
+            other => panic!("期望 Available，实际 {other:?}"),
+        }
+    }
+
+    /// 发布页地址的推导表。守的是"别把用户带到 404"：形态不符一律 `None`，不猜。
+    #[test]
+    fn release_page_is_derived_only_from_the_release_download_layout() {
+        let cases: &[(&str, Option<&str>)] = &[
+            // GitHub 标准形态：msi 与 setup.exe 都落到同一个发布页（这正是 D58 的理由）。
+            (
+                "https://github.com/mangfu26/mf-perch/releases/download/v0.2.0/mf-perch_0.2.0_x64_en-US.msi",
+                Some("https://github.com/mangfu26/mf-perch/releases/tag/v0.2.0"),
+            ),
+            (
+                "https://github.com/mangfu26/mf-perch/releases/download/v0.2.0/mf-perch_0.2.0_x64-setup.exe",
+                Some("https://github.com/mangfu26/mf-perch/releases/tag/v0.2.0"),
+            ),
+            // 企业自建镜像同样用 releases/download 布局时也能推导。
+            (
+                "https://mirror.example.internal/mf-perch/releases/download/v0.2.0/pkg.msi",
+                Some("https://mirror.example.internal/mf-perch/releases/tag/v0.2.0"),
+            ),
+            // 形态不符：不是 releases/download 布局。
+            ("https://example.com/mf-perch.msi", None),
+            ("https://example.com/files/v0.2.0/pkg.msi", None),
+            // 形态不符：download 段后没有文件名（推导不出 tag）。
+            ("https://github.com/mangfu26/mf-perch/releases/download/", None),
+            ("https://github.com/mangfu26/mf-perch/releases/download/pkg.msi", None),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(
+                release_page_from_download(url).as_deref(),
+                *expected,
+                "从 {url} 推导发布页的结果不符"
+            );
+        }
+    }
+
+    /// 显式 `release_url` 优先于推导；空白等于没写。
+    #[test]
+    fn explicit_release_url_wins_over_derivation() {
+        let mut m = manifest_with_asset("0.9.0", "windows-x86_64");
+        m.release_url = Some("  https://example.com/rel/v0.9.0  ".into());
+        assert_eq!(
+            release_url_for(&m, m.platforms.get("windows-x86_64")).as_deref(),
+            Some("https://example.com/rel/v0.9.0"),
+            "显式地址应优先，且首尾空白不得带进链接"
+        );
+
+        m.release_url = Some("   ".into());
+        assert_eq!(
+            release_url_for(&m, m.platforms.get("windows-x86_64")).as_deref(),
+            Some("https://github.com/mangfu26/mf-perch/releases/tag/v0.9.0"),
+            "空白字段应视为未提供，回落到推导"
+        );
     }
 
     #[test]
@@ -706,7 +832,7 @@ mod tests {
             latest: "0.1.1".into(),
             notes: None,
             published_at: None,
-            download_url: None,
+            release_url: None,
             sha256: None,
             size: None,
         };
@@ -759,7 +885,7 @@ mod tests {
             latest: "0.2.0".into(),
             notes: Some("note".into()),
             published_at: None,
-            download_url: Some("https://x/y".into()),
+            release_url: Some("https://github.com/mangfu26/mf-perch/releases/tag/v0.2.0".into()),
             sha256: None,
             size: None,
         };

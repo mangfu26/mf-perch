@@ -1,5 +1,6 @@
 {
   "version": "0.2.0",
+  "release_url": "https://github.com/mangfu26/mf-perch/releases/tag/v0.2.0",
   "notes": "示例文件（展示格式，非线上清单）。\n\n线上 update.json 由发布流水线自动生成并回写 main，请勿手工编辑。",
   "pub_date": "2026-09-19T10:00:00Z",
   "platforms": {
