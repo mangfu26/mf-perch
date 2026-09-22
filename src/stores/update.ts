@@ -31,7 +31,8 @@ export type UpdateStatus =
       latest: string;
       notes: string | null;
       published_at: string | null;
-      download_url: string | null;
+      /** 该版本的 Release 页面地址（D58）；null 表示清单既没给也推导不出。 */
+      release_url: string | null;
       sha256: string | null;
       size: number | null;
     }

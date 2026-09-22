@@ -137,9 +137,11 @@ jobs:
             ${{ env.BUNDLE_DIR }}/nsis/*.exe
             ${{ env.BUNDLE_DIR }}/msi/*.msi
 
-      # 更新清单 update.json（D55）：version / url / sha256 / size 全部取自
+      # 更新清单 update.json（D55）：version / release_url / url / sha256 / size 全部取自
       # 真实 tag 与真实构建产物，随发布自动回写 main——程序读 raw/main/update.json，
       # 从此没有"忘记更新版本信息"这一类故障。
+      # release_url 是**给用户点的地址**（该版本的 Release 页，D58）：同一个 Release 下
+      # 并列着 msi 与 setup.exe，只挂一个直链等于替用户挑了安装包格式。
       - name: Publish update manifest to main
         shell: pwsh
         run: |
@@ -150,10 +152,11 @@ jobs:
           }
           if (-not $file) { throw "找不到安装包，无法生成清单" }
           $manifest = @{
-            version   = $ver
-            notes     = (Get-Content "$env:RUNNER_TEMP\notes.txt" -Raw).Trim()
-            pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-            platforms = @{
+            version     = $ver
+            release_url = "https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$env:RELEASE_TAG"
+            notes       = (Get-Content "$env:RUNNER_TEMP\notes.txt" -Raw).Trim()
+            pub_date    = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms   = @{
               'windows-x86_64' = @{
                 url    = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG/$($file.Name)"
                 sha256 = (Get-FileHash -Algorithm SHA256 $file.FullName).Hash.ToLower()

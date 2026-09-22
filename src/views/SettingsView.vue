@@ -15,7 +15,6 @@ import {
   RotateCcw,
   Eye,
   EyeOff,
-  Download,
   ExternalLink,
   Info,
   Check,
@@ -167,9 +166,12 @@ async function resetUpdateSource() {
 }
 
 /**
- * 打开下载页（D23：不自动打开浏览器，仅由用户点击触发）。
+ * 在系统浏览器里打开外部链接（D23：应用从不自动弹浏览器，一律由用户点击触发）。
+ *
+ * 更新提示传的是**该版本的 Release 页**而不是安装包直链（D58）：
+ * 同一个 Release 下并列 msi 与 setup.exe，将来还有别的平台，选哪个由用户决定。
  */
-async function openDownload(url: string) {
+async function openExternal(url: string) {
   try {
     await openUrl(url);
   } catch (e) {
@@ -545,12 +547,12 @@ async function confirmRegenerate() {
 
             <div class="mt-2.5 flex flex-wrap items-center gap-2">
               <BaseButton
-                v-if="update.result.download_url"
+                v-if="update.result.release_url"
                 size="sm"
                 variant="primary"
-                @click="openDownload(update.result.download_url)"
+                @click="openExternal(update.result.release_url)"
               >
-                <Download class="h-3.5 w-3.5" />
+                <ExternalLink class="h-3.5 w-3.5" />
                 {{ t("settings.updateDownload") }}
               </BaseButton>
               <span v-else class="text-[11.5px] text-text-muted">
@@ -565,12 +567,13 @@ async function confirmRegenerate() {
               </BaseButton>
             </div>
 
-            <!-- SHA256 供用户核对下载完整性 -->
+            <!-- 校验值只对应**本平台**那个安装包：发布页上并列着好几个文件，
+                 不写清楚会被拿去核对另一个包。 -->
             <p
               v-if="update.result.sha256"
               class="mt-2.5 break-all font-mono text-[10.5px] text-text-muted"
             >
-              SHA256: {{ update.result.sha256 }}
+              {{ t("settings.updateSha256") }} {{ update.result.sha256 }}
             </p>
           </div>
 
@@ -632,7 +635,7 @@ async function confirmRegenerate() {
           <BaseButton
             size="sm"
             variant="ghost"
-            @click="openDownload(REPO_URL)"
+            @click="openExternal(REPO_URL)"
           >
             <ExternalLink class="h-3.5 w-3.5" />
             {{ t("settings.sourceCode") }}

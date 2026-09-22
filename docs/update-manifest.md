@@ -1,7 +1,7 @@
 # 更新检查：update.json 清单格式
 
-> 对应决策 D23 / D42 / D55，问题 Q21 / Q34。
-> 应用从**可配置的 URL** 读取一个 JSON 版本清单，发现新版本时提示用户去下载。
+> 对应决策 D23 / D42 / D55 / D58，问题 Q21 / Q34。
+> 应用从**可配置的 URL** 读取一个 JSON 版本清单，发现新版本时提示用户去该版本的发布页下载。
 > 默认源与"随发布自动更新"的机制是 **D55**（开源化后取代 D23 的 Gist 方案第 2 点）。
 
 ---
@@ -31,6 +31,7 @@ https://raw.githubusercontent.com/mangfu26/mf-perch/main/update.json
 ```json
 {
   "version": "0.2.0",
+  "release_url": "https://github.com/mangfu26/mf-perch/releases/tag/v0.2.0",
   "notes": "本次更新内容，支持多行。",
   "pub_date": "2026-09-15T10:00:00Z",
   "platforms": {
@@ -48,10 +49,11 @@ https://raw.githubusercontent.com/mangfu26/mf-perch/main/update.json
 | 字段 | 必填 | 说明 |
 | ---- | ---- | ---- |
 | `version` | ✅ | 最新版本号。语义化版本，允许带 `v` 前缀（如 `v0.2.0`） |
+| `release_url` | —（流水线一定写） | **该版本的 Release 页面**地址，即界面上「前往发布页下载」按钮的目标（**D58**）。缺失时应用从 `platforms.<键>.url` 推导同一个 tag 的发布页（`…/releases/download/<tag>/<文件>` → `…/releases/tag/<tag>`），推导不出才没有按钮 |
 | `notes` | — | 更新说明，界面会原样展示（支持 `\n` 换行）。发布流水线取 CHANGELOG 对应小节 |
 | `pub_date` | — | 发布时间（RFC3339） |
 | `platforms` | — | 各平台安装包；键名为平台标识 |
-| `platforms.<键>.url` | ✅（若提供该平台） | 安装包下载地址 |
+| `platforms.<键>.url` | ✅（若提供该平台） | 安装包直链。**不是给用户点的地址**（D58），只用于标识本平台那个包、以及在上表 `release_url` 缺失时推导发布页 |
 | `platforms.<键>.sha256` | — | 安装包 SHA256，界面会展示供用户核对 |
 | `platforms.<键>.size` | — | 文件大小（字节） |
 
@@ -67,8 +69,16 @@ https://raw.githubusercontent.com/mangfu26/mf-perch/main/update.json
 | macOS Intel | `darwin-x86_64` |
 | Linux x64 | `linux-x86_64` |
 
+### 为什么按钮指向发布页而不是安装包（D58）
+
+- 同一个 Release 下并列着多种安装包（Windows 就有 msi 与 setup.exe 之分），
+  直链等于**替用户挑了格式**；将来多平台时还要替用户挑平台；
+- 清单缺当前平台条目时（含平台标识为 `unknown` 的机器），直链会退化成
+  "有新版本却没有入口"。发布页与平台无关，永远点得开。
+
 `platforms` 中缺少当前平台的条目时，应用**仍会提示有新版本**，
-但没有下载按钮，会引导用户去仓库 Release 页自行查找。
+并且只要 `release_url` 在（或能从直链推导），下载按钮照样可点；
+两者都没有时界面才退回"请到仓库 Releases 列表自行查找"的提示文字。
 
 ---
 
@@ -76,14 +86,15 @@ https://raw.githubusercontent.com/mangfu26/mf-perch/main/update.json
 
 | 情况 | 应用表现 |
 | ---- | ---- |
-| 远端版本 **高于** 本地 | 提示新版本，展示更新说明与下载按钮 |
+| 远端版本 **高于** 本地 | 提示新版本，展示更新说明与「前往发布页下载」按钮（**D58**：指向该版本的 Release 页面） |
 | 远端版本 **等于** 本地 | 提示"已是最新版本" |
 | 远端版本 **低于** 本地 | 判为最新——**不会提示降级**（避免开发版被诱导降级） |
 | 版本号无法解析 | 判为检查失败并给出原因，**不会误报有新版本** |
 | 用户点了「忽略此版本」 | 该版本不再提示；出现更新的版本时会重新提示 |
 | 网络不通 / 地址错误 | 自动检查**静默失败**（不打扰用户）；手动检查会明确告知原因 |
 
-**不会自动下载或安装**：只提示，由用户点击按钮打开下载页。
+**不会自动下载或安装**：只提示，由用户点击按钮在系统浏览器中打开该版本的发布页，
+自己挑平台与安装包格式。
 
 ---
 
@@ -106,7 +117,7 @@ https://raw.githubusercontent.com/mangfu26/mf-perch/main/update.json
 
 ## 5. 发版清单（人工部分只有两步）
 
-D55 之后，`update.json` 的 `version` / `url` / `sha256` / `size` 全部由**发布流水线**
+D55 之后，`update.json` 的 `version` / `release_url` / `url` / `sha256` / `size` 全部由**发布流水线**
 从真实 tag 与真实构建产物生成并回写 main（**D54** 的流水线，"Publish update manifest to
 main" 步骤），"忘记更新版本信息""文件名抄错导致 404"这类故障已从机制上消除。人工只剩：
 
