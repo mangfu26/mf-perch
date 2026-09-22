@@ -4,6 +4,8 @@
  *
  * 全局提示承载后端错误（如密钥未解锁、MCP 启动失败），
  * 避免错误只落在某个组件里被忽略（P1：明确报错）。
+ * 这里是**一条堆叠的队列**（`app.toasts`），悬停暂停倒计时；
+ * 规则见 `src/lib/toast.ts` 与 theme-spec「全局提示」。
  */
 import { onMounted, onUnmounted } from "vue";
 import { useI18n } from "vue-i18n";
@@ -86,45 +88,48 @@ onUnmounted(() => {
         Teleport 到 body，在根上下文以 z-50 压住整个外壳（1 < 50）。
         结果就是提示被表单遮住。覆盖层一律与弹窗同级挂在 body 上，
         层级才可比（60 > 50）。
+
+        容器 `items-end` 且贴住 bottom：新增提示排在**下方**（离角落最近），
+        旧的往上顶，因此整列从底部向上生长，不会盖住页面中部。
+        `pointer-events-none` 只为让条目之间的 gap 不吞掉点击，条目自己恢复接收。
       -->
-      <Transition
+      <TransitionGroup
+        tag="div"
+        class="pointer-events-none fixed bottom-5 right-5 z-60 flex flex-col items-end gap-2"
         enter-active-class="transition duration-200"
-        enter-from-class="opacity-0 translate-y-2"
+        enter-from-class="translate-y-2 opacity-0"
         leave-active-class="transition duration-150"
-        leave-to-class="opacity-0 translate-y-2"
+        leave-to-class="translate-y-2 opacity-0"
+        move-class="transition-transform duration-200"
       >
         <div
-          v-if="app.lastError"
-          class="fixed bottom-5 right-5 z-60 flex max-w-md items-start gap-2.5 rounded-xl border border-danger/30 bg-bg-elevated px-4 py-3 shadow-2xl"
+          v-for="toast in app.toasts"
+          :key="toast.id"
+          class="pointer-events-auto flex max-w-md items-start gap-2.5 rounded-xl border bg-bg-elevated px-4 py-3 shadow-2xl"
+          :class="
+            toast.kind === 'error' ? 'border-danger/30' : 'border-border-base'
+          "
+          @mouseenter="app.hold(toast.id)"
+          @mouseleave="app.release(toast.id)"
         >
-          <AlertCircle class="mt-0.5 h-4 w-4 shrink-0 text-danger" />
+          <AlertCircle
+            v-if="toast.kind === 'error'"
+            class="mt-0.5 h-4 w-4 shrink-0 text-danger"
+          />
+          <CheckCircle2 v-else class="mt-0.5 h-4 w-4 shrink-0 text-success" />
           <p class="text-[12.5px] leading-relaxed text-text-base">
-            {{ app.lastError }}
+            {{ toast.message }}
           </p>
           <button
+            v-if="toast.kind === 'error'"
             type="button"
             class="ml-1 rounded p-0.5 text-text-muted hover:text-text-base"
-            @click="app.clearError()"
+            @click="app.dismiss(toast.id)"
           >
             <X class="h-3.5 w-3.5" />
           </button>
         </div>
-      </Transition>
-
-      <Transition
-        enter-active-class="transition duration-200"
-        enter-from-class="opacity-0 translate-y-2"
-        leave-active-class="transition duration-150"
-        leave-to-class="opacity-0 translate-y-2"
-      >
-        <div
-          v-if="app.lastNotice"
-          class="fixed bottom-5 right-5 z-60 flex items-center gap-2.5 rounded-xl border border-border-base bg-bg-elevated px-4 py-3 shadow-2xl"
-        >
-          <CheckCircle2 class="h-4 w-4 shrink-0 text-success" />
-          <p class="text-[12.5px] text-text-base">{{ app.lastNotice }}</p>
-        </div>
-      </Transition>
+      </TransitionGroup>
     </Teleport>
 
     <!-- sudo 提权确认（Q33 ask 模式）：必须挂在外壳层，
