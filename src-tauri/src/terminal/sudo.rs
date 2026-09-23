@@ -14,6 +14,17 @@
 //! 数据面上的 `sudo` 由 [`crate::ssh::protocol::sudo_reject_shim`] 明确拒绝，
 //! 因此这里不再有"拦截是否被绕过"的问题——绕过也无处可取密码。
 //!
+//! ## 登录身份本身就是特权用户时（D60）
+//!
+//! 凭据可由人类声明"用这个身份登录拿到的就是特权用户"
+//! （`Credential::is_privileged`，落在凭据而不是主机上：一份凭据可被 N 台主机引用）。
+//! 此时 `ask` / `auto` 两档的**提权动作整体消失**：特权通道不包 `sudo`、不取口令
+//! 也不向人类确认——没有密码要投递，"是否允许注入密码"这个问题不成立。
+//!
+//! `deny` **仍然优先**：人类说的是"不许在这台机器上提权"，凭据上的标记不能替他放行。
+//! 数据面的 `sudo` 垫片照旧拒绝（D49"特权执行只有一个入口"不破），只是文案改成
+//! "直接执行即可"。实际 uid 仍由远端 `${EUID}` 核实，声明与事实不符时如实告警。
+//!
 //! ## 密码的存放与投递
 //!
 //! - 只在**应用内存**中，包一层 [`Zeroizing`]，会话结束即清零；
@@ -47,6 +58,11 @@ pub enum SudoPasswordSource {
 /// 降低内存转储或日志误打印带来的泄露风险。
 pub struct SudoContext {
     pub policy: SudoPolicy,
+    /// 该终端的登录身份被声明为特权用户（D60）。
+    ///
+    /// 为真时特权通道**不包 `sudo`、不取口令也不询问**；`deny` 在上面一层已经拒掉
+    /// 调用，所以这里不需要再判策略。
+    pub login_is_privileged: bool,
     /// 已解析的密码；`None` 表示该主机未配置密码。
     pub password: Option<Zeroizing<String>>,
 }
@@ -155,17 +171,22 @@ pub fn policy_description(policy: SudoPolicy) -> &'static str {
         SudoPolicy::Deny => "不允许 Agent 提权（默认，最安全）",
         SudoPolicy::Ask => "Agent 请求提权时通知你确认",
         SudoPolicy::Auto => "Agent 请求提权时自动使用该主机的提权密码",
-        SudoPolicy::NotNeeded => "该主机以特权身份登录，无需提权（不使用任何密码）",
     }
 }
 
-/// 校验 ask 模式所需的配置是否齐备。
+/// 校验 ask / auto 模式所需的配置是否齐备。
 ///
 /// 返回 `Err` 时调用方应把原因告知用户——静默失效会让用户以为
 /// 策略已生效，而实际上 sudo 一直失败（P1：明确报错）。
-pub fn validate_for_policy(policy: SudoPolicy, has_password: bool) -> Result<()> {
-    // `deny` 与 `not_needed` 都不涉及口令，无需校验（D60：后者连"提权"这一步都没有）。
-    if !matches!(policy, SudoPolicy::Ask | SudoPolicy::Auto) {
+///
+/// `login_is_privileged` 为真时**不校验**：这条路径不跑 sudo，没有口令可要，
+/// 要求它等于把一个已经成立的配置报成错误（D60）。
+pub fn validate_for_policy(
+    policy: SudoPolicy,
+    login_is_privileged: bool,
+    has_password: bool,
+) -> Result<()> {
+    if login_is_privileged || !matches!(policy, SudoPolicy::Ask | SudoPolicy::Auto) {
         return Ok(());
     }
     if has_password {
@@ -232,21 +253,33 @@ mod tests {
 
     #[test]
     fn validate_passes_for_deny_without_password() {
-        assert!(validate_for_policy(SudoPolicy::Deny, false).is_ok());
+        assert!(validate_for_policy(SudoPolicy::Deny, false, false).is_ok());
     }
 
     #[test]
     fn validate_rejects_ask_without_password() {
         // 配置为需要提权却没有密码：必须在建立终端时就明确报错，
         // 而不是让 Agent 在提权时收到一句莫名其妙的话（P1）。
-        assert!(validate_for_policy(SudoPolicy::Ask, false).is_err());
-        assert!(validate_for_policy(SudoPolicy::Auto, false).is_err());
+        assert!(validate_for_policy(SudoPolicy::Ask, false, false).is_err());
+        assert!(validate_for_policy(SudoPolicy::Auto, false, false).is_err());
     }
 
     #[test]
     fn validate_passes_when_password_provided() {
-        assert!(validate_for_policy(SudoPolicy::Ask, true).is_ok());
-        assert!(validate_for_policy(SudoPolicy::Auto, true).is_ok());
+        assert!(validate_for_policy(SudoPolicy::Ask, false, true).is_ok());
+        assert!(validate_for_policy(SudoPolicy::Auto, false, true).is_ok());
+    }
+
+    /// 判别性（D60）：特权登录身份不跑 sudo，因而**没有口令可要**。
+    /// 若把这一维漏掉，"用 root 登录"的用户会被要求去填一个永远用不上的提权密码。
+    #[test]
+    fn validate_skips_password_for_a_privileged_login() {
+        for policy in [SudoPolicy::Ask, SudoPolicy::Auto] {
+            assert!(
+                validate_for_policy(policy, true, false).is_ok(),
+                "{policy:?} 且登录身份已是特权用户时，不该要求提权口令"
+            );
+        }
     }
 
     #[test]
@@ -254,6 +287,7 @@ mod tests {
         // D6 / P2：密码不得经日志或 panic 信息泄露。
         let ctx = SudoContext {
             policy: SudoPolicy::Auto,
+            login_is_privileged: false,
             password: Some(Zeroizing::new("s3cret".to_string())),
         };
         let shown = format!("{ctx:?}");
@@ -265,6 +299,7 @@ mod tests {
     fn password_for_auto_only_returns_in_auto_mode() {
         let auto = SudoContext {
             policy: SudoPolicy::Auto,
+            login_is_privileged: false,
             password: Some(Zeroizing::new("pw".to_string())),
         };
         assert_eq!(auto.password_for_auto(), Some("pw"));
@@ -272,6 +307,7 @@ mod tests {
         // ask 模式必须走人类确认，不得被任何路径直接取走密码。
         let ask = SudoContext {
             policy: SudoPolicy::Ask,
+            login_is_privileged: false,
             password: Some(Zeroizing::new("pw".to_string())),
         };
         assert_eq!(ask.password_for_auto(), None, "ask 模式不应直接取密码");

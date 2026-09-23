@@ -428,6 +428,7 @@ async fn privileged_channel_runs_commands_as_root() {
         auth,
         Some(t.sudo_password.as_str()),
         SudoPolicy::Auto,
+        false,
     )
     .await
     .expect("提权通道应能建立（密码经本通道 stdin 投递）");
@@ -468,6 +469,7 @@ async fn privileged_channel_fails_fast_on_wrong_password() {
             auth,
             Some("definitely-wrong-password"),
             SudoPolicy::Auto,
+            false,
         ),
     )
     .await;

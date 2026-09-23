@@ -51,7 +51,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     }
 
     if current < 2 {
-        conn.execute_batch(V2_SUDO_NOT_NEEDED)
+        conn.execute_batch(V2_CREDENTIAL_IS_PRIVILEGED)
             .map_err(|e| AppError::Database(e))?;
     }
 
@@ -100,6 +100,10 @@ pub fn delete_setting(conn: &Connection, key: &str) -> Result<()> {
 
 /// v1 初始 schema。
 ///
+/// **已发布过的表形状不要就地改**：改这里只覆盖新建库，存量装机拿不到同一列，
+/// 与后续 `ALTER` 并存时还会撞 `duplicate column name`。结构变更一律作为
+/// `migrate()` 的增量步骤追加（已发布装机的必要性见 **D50** 的条件句与下面的 V2）。
+///
 /// 设计取舍：
 /// - 主键使用带前缀的文本 ID，便于日志与界面辨识。
 /// - 敏感字段（`*_enc`）为加密后的字节，绝不存明文（D6）。
@@ -126,9 +130,6 @@ CREATE TABLE IF NOT EXISTS credentials (
 );
 
 -- SSH 主机：sudo_password_enc 同样为密文；host_key 为 TOFU 记录的信任密钥（D10）
---
--- **这里的 `sudo_policy` CHECK 是 V1 的历史形状，不要就地改宽**：改这里只会让
--- 新建库跳过迁移，存量 V1 库仍然写不进 `not_needed`。放宽由 V2 负责（见下）。
 CREATE TABLE IF NOT EXISTS hosts (
     id                   TEXT PRIMARY KEY,
     name                 TEXT,
@@ -238,73 +239,23 @@ CREATE TRIGGER IF NOT EXISTS command_outputs_au AFTER UPDATE ON command_outputs 
 END;
 "#;
 
-/// V2：`hosts.sudo_policy` 允许第四档 `not_needed`（D60）。
+/// V2：`credentials` 增列 `is_privileged`（D60）。
 ///
 /// **为什么这次必须有迁移**，而不像 **D50** 那样只改建表语句：已发布版本（v0.1.1 起）
-/// 装机上的 `hosts` 表早已按三值 CHECK 建好，`CREATE TABLE IF NOT EXISTS` 不会重建它，
-/// 写入 `not_needed` 会以 `CHECK constraint failed` 失败——表现为"把提权策略改成
-/// 「无需提权」之后保存主机就报错"。D50 当时刻意不迁移的前提是"产品未发布、
-/// 只影响开发机本地数据"，并在同一条里写明"**首发前若已存在用户库，则必须改回迁移方案**"；
-/// 该前提现已不成立，本步就是它预留的那条路（实现形态取自 `53b5621` 删除的 V2）。
+/// 装机上的 `credentials` 表早已建好，`CREATE TABLE IF NOT EXISTS` 不会重建它，
+/// 读写这一列会以 `no such column` 失败——表现为"勾选特权身份后保存凭据就报错"。
+/// D50 当时刻意不迁移的前提是"产品未发布、只影响开发机本地数据"，并在同一条里写明
+/// "**首发前若已存在用户库，则必须改回迁移方案**"；该前提现已不成立，本步就是它预留的那条路。
 ///
-/// SQLite 不支持修改 CHECK，只能重建表。这里有三个**各自独立**的坑：
+/// 形态刻意选 `ADD COLUMN` 而**不重建任何表**：它只改 `credentials` 的元数据，
+/// 不搬行、不重建索引，`hosts` / `terminals` / `commands` 一律不碰，因此不存在
+/// "迁移把审计数据连带删掉"那一类风险，也就不需要 `PRAGMA foreign_keys = OFF`
+/// （顺带避开"`foreign_keys` 在事务内是 no-op"这个坑）。
 ///
-/// 1. **外键方向**：`hosts` 是 `terminals.host_id` 的**父表**且 `ON DELETE CASCADE`。
-///    若开着外键执行 `DROP TABLE hosts`，会把这些主机下的**全部终端与命令历史连带删光**
-///    ——迁移把一个约束改宽，代价却是把审计数据清了。因此必须临时关闭外键。
-/// 2. **`PRAGMA foreign_keys` 在事务内是 no-op**：把这两句写进 `BEGIN`/`COMMIT` 之间
-///    等于没关，正好踩回坑 1。所以它们单独放在事务之外（autocommit 下才生效）。
-/// 3. **索引**：`DROP TABLE` 连索引一起删，`idx_hosts_credential` 必须重建，
-///    否则主机列表按凭据过滤退化成全表扫描。
-///
-/// 重建方向刻意选"建新表 → 逐列拷数据 → 删旧表 → 把新表**改名成 `hosts`**"：
-/// 子表按**名字**引用 `hosts`，只要最终落到这个名字上，`terminals` 的外键仍然指对。
-/// 反过来的做法（先 `ALTER TABLE hosts RENAME TO hosts_old`）在 `legacy_alter_table=OFF`
-/// 下会连带改写子表的引用，把终端表挂到临时表上——那是这条路径上最容易踩的第四个坑。
-///
-/// `sudo_password_enc` 逐列原样搬运，**不重新加密**：密文由主密钥保护，与表结构无关。
-const V2_SUDO_NOT_NEEDED: &str = r#"
-PRAGMA foreign_keys = OFF;
-
-BEGIN;
-
-CREATE TABLE hosts_new (
-    id                   TEXT PRIMARY KEY,
-    name                 TEXT,
-    address              TEXT NOT NULL,
-    port                 INTEGER NOT NULL DEFAULT 22,
-    credential_id        TEXT REFERENCES credentials(id) ON DELETE SET NULL,
-    proxy_jump_host_id   TEXT REFERENCES hosts(id) ON DELETE SET NULL,
-    sudo_policy          TEXT NOT NULL DEFAULT 'deny'
-                         CHECK (sudo_policy IN ('deny', 'ask', 'auto', 'not_needed')),
-    sudo_password_source TEXT NOT NULL DEFAULT 'reuse_login'
-                         CHECK (sudo_password_source IN ('own', 'reuse_login')),
-    sudo_password_enc    TEXT,
-    shell_env_mode       TEXT NOT NULL DEFAULT 'login'
-                         CHECK (shell_env_mode IN ('login', 'clean')),
-    init_script          TEXT,
-    host_key             TEXT,
-    host_key_fingerprint TEXT,
-    created_at           TEXT NOT NULL,
-    updated_at           TEXT NOT NULL
-);
-
--- 逐列点名而不是 SELECT *：新旧表列顺序一旦不同，`*` 会静默错位。
-INSERT INTO hosts_new
-    SELECT id, name, address, port, credential_id, proxy_jump_host_id,
-           sudo_policy, sudo_password_source, sudo_password_enc,
-           shell_env_mode, init_script, host_key, host_key_fingerprint,
-           created_at, updated_at
-      FROM hosts;
-
-DROP TABLE hosts;
-ALTER TABLE hosts_new RENAME TO hosts;
-
-CREATE INDEX IF NOT EXISTS idx_hosts_credential ON hosts(credential_id);
-
-COMMIT;
-
-PRAGMA foreign_keys = ON;
+/// `DEFAULT 0` 是常量默认值，SQLite 因此不必回填每一行；已有凭据一律按**非特权**处理，
+/// 方向是 fail-closed：宁可让用户去界面勾一次，也不凭空给提权短路。
+const V2_CREDENTIAL_IS_PRIVILEGED: &str = r#"
+ALTER TABLE credentials ADD COLUMN is_privileged INTEGER NOT NULL DEFAULT 0;
 "#;
 
 #[cfg(test)]
@@ -350,17 +301,18 @@ mod tests {
         assert_eq!(v, SCHEMA_VERSION);
     }
 
-    /// 守的是**已发布装机升级**这条路径：V1 库（三值 CHECK）里有主机、终端、
-    /// 命令历史与提权口令密文，迁移之后四样都得还在，且新档位写得进去。
+    /// 守的是**已发布装机升级**这条路径：V1 库的 `credentials` 没有 `is_privileged`，
+    /// 里面有凭据、主机、终端与命令历史；迁移之后四样都得还在，新列读得到且写得进。
     ///
     /// 判别性（每一项都能抓一个真实缺陷，缺一即红）：
-    /// - `not_needed` 写不进 → 忘了放宽 CHECK；
-    /// - 终端/命令消失 → `DROP TABLE hosts` 开着外键，被 `ON DELETE CASCADE`
-    ///   连带删光——**审计数据被迁移清掉**，是最贵的一种错；
-    /// - `sudo_password_enc` 变了 → 拷数据时重新加密或列错位；
-    /// - `'yolo'` 写得进 → 重建时把 CHECK 整个丢了。
+    /// - 升级前就查得到这一列 → V1 形状被改过，本用例测不到升级（前置断言抓这个）；
+    /// - 升级后读不到 → 忘了追加 V2 步骤，装机上表现为"勾选特权身份后保存就报错"；
+    /// - 已有凭据取到 1 → 默认值写反，等于凭空给存量凭据提权短路（**fail-open**）；
+    /// - `secret_enc` 变了 → 迁移搬运了不该搬的表，或列错位；
+    /// - 终端/命令消失、`foreign_key_check` 非空 → 迁移形态被改成重建表并留下悬空引用；
+    /// - `not_needed` 写得进 → 有人又把第四档塞回 `hosts` 的 CHECK（它已挪到凭据上）。
     #[test]
-    fn upgrading_a_v1_database_widens_the_check_without_losing_rows() {
+    fn upgrading_a_v1_database_adds_the_flag_without_losing_rows() {
         // 手工摆出 V1 装机的形状：按 V1 建表、版本停在 1（不走 open_in_memory，
         // 那会直接迁到当前版本，测不到升级）。
         let conn = Connection::open_in_memory().expect("内存库");
@@ -369,14 +321,12 @@ mod tests {
         conn.pragma_update(None, "user_version", 1).unwrap();
 
         conn.execute_batch(
-            "INSERT INTO hosts (id, address, port, sudo_policy, sudo_password_enc,
-                                created_at, updated_at)
-             VALUES ('host_v1', '127.0.0.1', 22, 'auto', 'v1:nonce:cipher',
+            "INSERT INTO credentials (id, username, kind, secret_enc, created_at, updated_at)
+             VALUES ('cred_v1', 'root', 'password', 'v1:nonce:cipher', 'now', 'now');
+             INSERT INTO hosts (id, address, port, credential_id, sudo_policy,
+                                sudo_password_enc, created_at, updated_at)
+             VALUES ('host_v1', '127.0.0.1', 22, 'cred_v1', 'auto', 'v1:nonce:pw',
                      'now', 'now');
-             -- 自引用一行（跳板机）：`REFERENCES hosts(id)` 指向**本表**，
-             -- 重建 + 改名最容易把它指向一张不存在的表。
-             INSERT INTO hosts (id, address, port, proxy_jump_host_id, created_at, updated_at)
-             VALUES ('host_v1_jump', '10.0.0.2', 22, 'host_v1', 'now', 'now');
              INSERT INTO terminals (id, host_id, status, created_at, updated_at)
              VALUES ('term_v1', 'host_v1', 'active', 'now', 'now');
              INSERT INTO commands (id, terminal_id, seq, command, status, created_at)
@@ -384,21 +334,49 @@ mod tests {
         )
         .expect("V1 形状的样本数据");
 
+        // 前置：V1 真的没有这一列，否则下面的断言全是在测既有事实。
+        assert!(
+            conn.execute(
+                "UPDATE credentials SET is_privileged = 1 WHERE id = 'cred_v1'",
+                []
+            )
+            .is_err(),
+            "V1_SCHEMA 里已带 is_privileged：这条用例测不到升级路径"
+        );
+
         migrate(&conn).expect("V1 → V2 迁移");
 
-        let (cipher, policy): (String, String) = conn
+        let (flag, cipher): (i64, String) = conn
             .query_row(
-                "SELECT sudo_password_enc, sudo_policy FROM hosts WHERE id='host_v1'",
+                "SELECT is_privileged, secret_enc FROM credentials WHERE id = 'cred_v1'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .expect("主机行必须原样存活");
+            .expect("凭据行必须原样存活");
+        assert_eq!(
+            flag, 0,
+            "存量凭据应为非特权：默认给 1 等于无人确认就短路提权（fail-open）"
+        );
         assert_eq!(
             cipher, "v1:nonce:cipher",
-            "提口令密文不得被改写：它与表结构无关，重新加密只会解不开"
+            "密文不得被改写：它与表结构无关，重新加密只会解不开"
         );
-        assert_eq!(policy, "auto", "既有档位不得被重新解释");
 
+        conn.execute(
+            "UPDATE credentials SET is_privileged = 1 WHERE id = 'cred_v1'",
+            [],
+        )
+        .expect("升级后新列必须写得进");
+        let flag: i64 = conn
+            .query_row(
+                "SELECT is_privileged FROM credentials WHERE id = 'cred_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, 1, "写入未生效（默认值覆盖了显式赋值？）");
+
+        // `ADD COLUMN` 只该动 credentials 的元数据；下面三条守住"没动别的表"。
         let kept: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM terminals WHERE id='term_v1'",
@@ -406,36 +384,36 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(kept, 1, "终端被级联删掉了：迁移期间没关外键（见坑 1）");
+        assert_eq!(kept, 1, "终端没了：迁移动了不该动的表");
         let kept: i64 = conn
             .query_row("SELECT COUNT(*) FROM commands WHERE id='cmd_v1'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(kept, 1, "命令历史（审计的载体）被迁移删掉了");
-
-        // 新档位现在写得进去——这正是本条迁移存在的理由。
-        conn.execute(
-            "UPDATE hosts SET sudo_policy='not_needed' WHERE id='host_v1'",
-            [],
-        )
-        .expect("升级后必须接受 not_needed");
-        // 但 CHECK 仍在：放宽取值不等于取消约束。
-        assert!(
-            conn.execute("UPDATE hosts SET sudo_policy='yolo' WHERE id='host_v1'", [])
-                .is_err(),
-            "重建时丢了 CHECK，非法取值将静默入库"
-        );
-        // 索引也得跟着回来：DROP TABLE 会连索引一起删（见坑 3）。
-        let idx: i64 = conn
+        assert_eq!(kept, 1, "命令历史（审计的载体）没了");
+        let pw: String = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='index'
-                   AND name='idx_hosts_credential'",
+                "SELECT sudo_password_enc FROM hosts WHERE id='host_v1'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(idx, 1, "idx_hosts_credential 没重建：凭据过滤退化为全表扫描");
+        assert_eq!(pw, "v1:nonce:pw", "主机行的提口令密文被改写了");
 
-        // 外键完整性：上面几条断言只看"数据还在"，看不出"引用指向了不存在的表"。
+        // 提权策略仍只有三档：这一轮把"是否特权"挪到了凭据上，没有放宽 hosts。
+        assert!(
+            conn.execute(
+                "UPDATE hosts SET sudo_policy='not_needed' WHERE id='host_v1'",
+                []
+            )
+            .is_err(),
+            "hosts 不该接受第四档（它已改由 credentials.is_privileged 表达）"
+        );
+        assert!(
+            conn.execute("UPDATE hosts SET sudo_policy='yolo' WHERE id='host_v1'", [])
+                .is_err(),
+            "CHECK 丢了，非法取值将静默入库"
+        );
+
+        // 外键完整性：上面的断言只看"数据还在"，看不出"引用指向了不存在的表"。
         let mut stmt = conn.prepare("PRAGMA foreign_key_check").unwrap();
         let dangling: Vec<String> = stmt
             .query_map([], |r| r.get::<_, String>(0))
@@ -446,34 +424,52 @@ mod tests {
             dangling.is_empty(),
             "迁移留下了悬空外键引用（受影响的表）：{dangling:?}"
         );
-        let jump: Option<String> = conn
+    }
+
+    /// 新建库的终点形状必须与升级后的库一致：`credentials` 有 `is_privileged`（默认 0），
+    /// `hosts.sudo_policy` 仍只认三档。
+    ///
+    /// 判别性：追加 V2 步骤时把列名拼错、或把 ALTER 写成只作用于某张别的表，本用例即红；
+    /// 有人把第四档塞回 `V1_SCHEMA` 的 CHECK，本用例也红。存量装机那一半由上一条用例守。
+    #[test]
+    fn fresh_database_matches_the_upgraded_shape() {
+        let conn = open_in_memory().expect("open in-memory db");
+
+        let mut stmt = conn.prepare("PRAGMA table_info(credentials)").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>("name"))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            cols.iter().any(|c| c == "is_privileged"),
+            "新库缺 is_privileged 列，实际列为 {cols:?}"
+        );
+
+        conn.execute(
+            "INSERT INTO credentials (id, username, kind, secret_enc, created_at, updated_at)
+             VALUES ('cred_f', 'root', 'password', 'v1:nonce:cipher', 'now', 'now')",
+            [],
+        )
+        .unwrap();
+        let flag: i64 = conn
             .query_row(
-                "SELECT proxy_jump_host_id FROM hosts WHERE id='host_v1_jump'",
+                "SELECT is_privileged FROM credentials WHERE id = 'cred_f'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(
-            jump.as_deref(),
-            Some("host_v1"),
-            "自引用（跳板机）的值在搬运中丢了"
-        );
-    }
+        assert_eq!(flag, 0, "新建库的默认值应为非特权（fail-closed）");
 
-    /// 新建库的终点形状必须与升级后的库**完全一致**（V1 建表 + V2 重建两步都走）。
-    ///
-    /// 判别性：若有人图省事只改 `V1_SCHEMA` 的 CHECK，本用例仍会绿——但它守住的是
-    /// "两条路径收敛到同一形状"里另一条：忘了写 V2 时新库看似没问题，存量装机却
-    /// 永远升不上去。真正抓那半边的是上一条用例。
-    #[test]
-    fn fresh_database_accepts_the_fourth_policy() {
-        let conn = open_in_memory().expect("open in-memory db");
-        conn.execute(
-            "INSERT INTO hosts (id, address, port, sudo_policy, created_at, updated_at)
-             VALUES ('host_nn', '127.0.0.1', 22, 'not_needed', 'now', 'now')",
-            [],
-        )
-        .expect("新库应直接支持第四档");
+        assert!(
+            conn.execute(
+                "INSERT INTO hosts (id, address, port, sudo_policy, created_at, updated_at)
+                 VALUES ('host_nn', '127.0.0.1', 22, 'not_needed', 'now', 'now')",
+                [],
+            )
+            .is_err(),
+            "新库不该接受第四档"
+        );
     }
 
     #[test]

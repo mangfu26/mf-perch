@@ -33,6 +33,7 @@ const emit = defineEmits<{
 const name = ref("");
 const username = ref("");
 const kind = ref<CredentialKind>("password");
+const isPrivileged = ref(false);
 const password = ref("");
 const privateKey = ref("");
 const passphrase = ref("");
@@ -50,6 +51,8 @@ watch(
     name.value = c?.name ?? "";
     username.value = c?.username ?? "";
     kind.value = c?.kind ?? "password";
+    // 特权身份标记必须回填：编辑时漏回填，用户"只改个名字"就会把它静默清掉（B5 同类）。
+    isPrivileged.value = c?.is_privileged ?? false;
     // 正文与口令一律留空——后端从不返回它们，界面也不该回显。
     password.value = "";
     privateKey.value = "";
@@ -115,6 +118,7 @@ function submit() {
     name: name.value.trim() || null,
     username: username.value.trim(),
     kind: kind.value,
+    is_privileged: isPrivileged.value,
     secret: secret || null,
     passphrase: passphrase.value || null,
   });
@@ -137,6 +141,28 @@ function submit() {
           <option value="password">{{ t("credential.kindPassword") }}</option>
           <option value="key">{{ t("credential.kindKey") }}</option>
         </BaseInput>
+      </FormField>
+
+      <!-- 该身份是否登录即特权用户（D60）：标记落在认证信息上，
+           所有引用它的主机一起生效，不需要逐台改。 -->
+      <FormField :label="t('credential.isPrivileged')">
+        <label
+          class="flex cursor-pointer items-start gap-2.5 rounded-[9px] border px-3 py-2.5 transition-colors"
+          :class="
+            isPrivileged
+              ? 'border-warning bg-warning-soft'
+              : 'border-border-base hover:bg-surface-hover'
+          "
+        >
+          <input
+            v-model="isPrivileged"
+            type="checkbox"
+            class="mt-0.5 accent-[var(--accent)]"
+          />
+          <span class="text-[11.5px] leading-relaxed text-text-muted">
+            {{ t("credential.isPrivilegedHint") }}
+          </span>
+        </label>
       </FormField>
 
       <!-- 密码认证 -->

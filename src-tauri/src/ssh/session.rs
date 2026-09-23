@@ -61,15 +61,17 @@ pub struct Session {
 impl Session {
     /// 建立**数据面**会话：连接、认证（TOFU 校验）、启动包装脚本、等待就绪。
     ///
-    /// `sudo_policy` 决定数据面 sudo 垫片给出的指引（D48）：四种取值下 `sudo`
-    /// 都被拒绝（fail-closed，Q33 模式一），只有文案随策略不同。
+    /// `sudo_policy` 与 `login_is_privileged` 决定数据面 sudo 垫片给出的指引（D48 / D60）：
+    /// 各种组合下 `sudo` 都被拒绝（fail-closed，Q33 模式一），只有文案不同。
     pub async fn connect(
         terminal_id: impl Into<String>,
         host: &Host,
         auth: AuthMethod,
         sudo_policy: SudoPolicy,
+        login_is_privileged: bool,
     ) -> Result<(Self, mpsc::Receiver<SessionOutput>)> {
-        Self::connect_inner(terminal_id, host, auth, sudo_policy, false, None).await
+        Self::connect_inner(terminal_id, host, auth, sudo_policy, login_is_privileged, false, None)
+            .await
     }
 
     /// 建立**提权通道**（D47）：以 root 身份运行**同一套包装脚本**。
@@ -78,8 +80,8 @@ impl Session {
     /// 判定由 [`protocol::SudoAuthHandshake`] 负责：看到提示标记才写，
     /// **每条通道最多写一次**；凭证缓存有效时一个字都不写。
     ///
-    /// **`not_needed` 档不包 `sudo`、也不传密码**（D60，见 `sudo_policy` 参数）：
-    /// 该档下"提权通道"退化成"另开一条以当前（特权）身份运行的通道"，
+    /// **`login_is_privileged` 为真时不包 `sudo`、也不传密码**（D60）：该身份下
+    /// "提权通道"退化成"另开一条以当前（特权）身份运行的通道"，
     /// 分帧、cwd 继承与身份核实三件事一律不变。
     ///
     /// 提权通道**不部署** askpass 与 FIFO（不需要拦截 sudo），
@@ -90,8 +92,18 @@ impl Session {
         auth: AuthMethod,
         password: Option<&str>,
         sudo_policy: SudoPolicy,
+        login_is_privileged: bool,
     ) -> Result<(Self, mpsc::Receiver<SessionOutput>)> {
-        Self::connect_inner(terminal_id, host, auth, sudo_policy, true, password).await
+        Self::connect_inner(
+            terminal_id,
+            host,
+            auth,
+            sudo_policy,
+            login_is_privileged,
+            true,
+            password,
+        )
+        .await
     }
 
     async fn connect_inner(
@@ -99,28 +111,28 @@ impl Session {
         host: &Host,
         auth: AuthMethod,
         sudo_policy: SudoPolicy,
+        login_is_privileged: bool,
         privileged: bool,
         privileged_password: Option<&str>,
     ) -> Result<(Self, mpsc::Receiver<SessionOutput>)> {
         let terminal_id = terminal_id.into();
         let nonce = protocol::new_nonce();
-        // `not_needed` 之外才真的要"提权"：通道要不要包 sudo、要不要备着密码。
-        let needs_elevation = sudo_policy.needs_elevation();
-
+        // 特权登录身份下这条通道不跑 sudo：没有密码要写，也不该出现密码提示。
+        let runs_sudo = !login_is_privileged;
         /// 会话未就绪时的报错：三种场景的原因不同，提示也必须不同（P1：可操作）。
-        fn not_ready_error(privileged: bool, needs_elevation: bool) -> AppError {
+        fn not_ready_error(privileged: bool, runs_sudo: bool) -> AppError {
             if !privileged {
                 return AppError::SshConnect(format!(
                     "远端会话未在 {} 秒内就绪；请确认目标主机已安装 bash",
                     READY_TIMEOUT.as_secs()
                 ));
             }
-            if !needs_elevation {
+            if !runs_sudo {
                 // D60：这条通道没跑 sudo，所以不要提密码、也不要提 requiretty——
                 // 那两个原因都不存在，写上去会把人往错方向引。
                 return AppError::SudoElevationFailed(format!(
-                    "特权身份会话未在 {} 秒内就绪：该主机的提权策略为「无需提权」，\
-                     应用直接以登录身份启动 bash（未经过 sudo）。请确认登录凭据有效、\
+                    "特权身份会话未在 {} 秒内就绪：该登录身份被声明为特权用户，\
+                     应用直接以它启动 bash（未经过 sudo）。请确认登录凭据有效、\
                      且该账号的登录 shell 是 bash 或能执行 bash 脚本",
                     READY_TIMEOUT.as_secs()
                 ));
@@ -252,8 +264,13 @@ impl Session {
             .await
             .map_err(|e| AppError::SshConnect(format!("打开 SSH 会话通道失败：{e}")))?;
 
-        // sudo_policy 决定数据面 sudo 垫片给出的指引（D48）。
-        let script = protocol::wrapper_script(&nonce, host.init_script.as_deref(), sudo_policy);
+        // sudo_policy 与登录身份决定数据面 sudo 垫片给出的指引（D48 / D60）。
+        let script = protocol::wrapper_script(
+            &nonce,
+            host.init_script.as_deref(),
+            sudo_policy,
+            login_is_privileged,
+        );
 
         // 数据面：按该主机的"环境加载方式"启动（D4）——登录模式带 `-l`，
         // 干净模式带 `--noprofile --norc`。脚本作为 `-c` 的单个参数传入，
@@ -261,12 +278,12 @@ impl Session {
         //
         // 提权通道：同一套包装脚本，但**以 sudo -S 启动**（D47），
         // 这样提权命令的输出与退出码走同一套 NUL 分帧 + nonce 标记协议。
-        // 唯一的例外是 `not_needed`（D60）：登录身份已是特权用户，包 sudo 是
-        // 恒等操作，却会额外继承 `env_reset`（PATH 被重置）与 `requiretty` 两个
-        // 失败面，因此按数据面同一方式直接起 bash——分帧与身份核实都不受影响。
+        // 唯一的例外是特权登录身份（D60）：包 sudo 是恒等操作，却会额外继承
+        // `env_reset`（PATH 被重置）与 `requiretty` 两个失败面，因此按数据面
+        // 同一方式直接起 bash——分帧与身份核实都不受影响。
         let launch = if privileged {
             protocol::privileged_launch_command(
-                sudo_policy,
+                login_is_privileged,
                 host.shell_env_mode,
                 &nonce,
                 &script,
@@ -295,12 +312,12 @@ impl Session {
         while !ready {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err(not_ready_error(privileged, needs_elevation));
+                return Err(not_ready_error(privileged, runs_sudo));
             }
 
             let msg = tokio::time::timeout(remaining, reader.wait())
                 .await
-                .map_err(|_| not_ready_error(privileged, needs_elevation))?;
+                .map_err(|_| not_ready_error(privileged, runs_sudo))?;
 
             match msg {
                 Some(ChannelMsg::Data { data })
@@ -338,7 +355,7 @@ impl Session {
                         ask_for_password = false;
                         let Some(pw) = privileged_password else {
                             // 走到这里说明这条通道**没有在跑 `sudo -S`**（数据面，
-                            // 或 `not_needed` 档的特权通道，D60），却出现了密码提示。
+                            // 或特权登录身份的通道，D60），却出现了密码提示。
                             // 宁可失败也不要把密码写到别处。
                             return Err(AppError::SudoElevationFailed(
                                 "该通道未运行 sudo，却收到密码提示，已拒绝写入密码".into(),
@@ -355,7 +372,7 @@ impl Session {
                     }
                 }
                 Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                    return Err(if privileged && needs_elevation {
+                    return Err(if privileged && runs_sudo {
                         AppError::SudoElevationFailed(
                             "提权会话在就绪前即已关闭：sudo 拒绝了本次提权。\
                              最常见的原因是该主机的 sudoers 要求 TTY\
@@ -367,11 +384,12 @@ impl Session {
                                 .into(),
                         )
                     } else if privileged {
-                        // `not_needed` 档没有 sudo 这一步（D60）：拿"sudo 拒绝"去解释
+                        // 特权登录身份没有 sudo 这一步（D60）：拿"sudo 拒绝"去解释
                         // 会把人引向查密码、查 sudoers 这些根本不存在的原因。
                         AppError::SudoElevationFailed(
-                            "特权身份会话在就绪前即已关闭：该策略下应用直接以登录身份\
-                             启动 bash（未经过 sudo），请确认登录凭据有效、远端已安装 bash"
+                            "特权身份会话在就绪前即已关闭：该身份被声明为特权用户，\
+                             应用直接以登录身份启动 bash（未经过 sudo），\
+                             请确认登录凭据有效、远端已安装 bash"
                                 .into(),
                         )
                     } else {

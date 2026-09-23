@@ -6,7 +6,7 @@
  * 后端也不返回它们（D6 / Q10）。
  */
 
-export type SudoPolicy = "deny" | "ask" | "auto" | "not_needed";
+export type SudoPolicy = "deny" | "ask" | "auto";
 export type SudoPasswordSource = "own" | "reuse_login";
 export type ShellEnvMode = "login" | "clean";
 export type CredentialKind = "password" | "key";
@@ -51,6 +51,8 @@ export interface CredentialSummary {
   name: string | null;
   username: string;
   kind: CredentialKind;
+  /** 该身份是否被声明为"登录即特权用户"（D60）；主机表单据此判断 sudo 策略是否适用。 */
+  is_privileged: boolean;
   fingerprint: string | null;
   has_passphrase: boolean;
   used_by_hosts: string[];
@@ -63,6 +65,8 @@ export interface CredentialInput {
   name?: string | null;
   username: string;
   kind: CredentialKind;
+  /** 由人类声明该身份登录即特权用户；false 即不提权短路（fail-closed）。 */
+  is_privileged: boolean;
   /** 留空表示保持不变（更新场景）。 */
   secret?: string | null;
   passphrase?: string | null;

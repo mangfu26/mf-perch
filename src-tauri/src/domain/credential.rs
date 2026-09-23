@@ -40,6 +40,16 @@ pub struct Credential {
     pub name: Option<String>,
     pub username: String,
     pub kind: CredentialKind,
+    /// **由人类声明**：用该身份登录时拿到的本身就是特权用户（uid 0，D60）。
+    ///
+    /// 之所以落在**凭据**而不是主机上：它说的是"我是谁"，而 `sudo_policy` 那三档
+    /// 说的是"允许 Agent 在这台机器上使多大劲"——两份事实的粒度不同，
+    /// 一份凭据可被 N 台主机引用，标记跟着身份走才不用逐台改。
+    ///
+    /// 声明只表达意图，**事实由远端核实**：包装脚本仍打印 `${EUID}`，
+    /// 实际 uid 非 0 时如实告警（同一把密钥在 A 机是 root、在 B 机不是，就会走到这条）。
+    /// 为真时特权通道不包 `sudo`、不取口令也不向人类确认；`deny` 仍优先（见 D60）。
+    pub is_privileged: bool,
     /// 密码，或私钥正文（OpenSSH / PEM 格式）。
     ///
     /// **刻意不参与序列化**（V17）：`Debug` 已脱敏，但若允许 `Serialize`，
@@ -86,6 +96,7 @@ impl Credential {
             name: None,
             username: username.into(),
             kind,
+            is_privileged: false,
             secret: secret.into(),
             passphrase: None,
             fingerprint: None,
@@ -107,6 +118,8 @@ pub struct CredentialSummary {
     pub name: Option<String>,
     pub username: String,
     pub kind: CredentialKind,
+    /// 该身份是否被声明为登录即特权用户（D60）；供主机表单判断 sudo 策略是否适用。
+    pub is_privileged: bool,
     pub fingerprint: Option<String>,
     /// 是否有口令（不解开口令本身）。
     pub has_passphrase: bool,
@@ -123,6 +136,7 @@ impl From<&Credential> for CredentialSummary {
             name: c.name.clone(),
             username: c.username.clone(),
             kind: c.kind,
+            is_privileged: c.is_privileged,
             fingerprint: c.fingerprint.clone(),
             has_passphrase: c.passphrase.is_some(),
             used_by_hosts: Vec::new(),

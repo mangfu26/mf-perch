@@ -72,7 +72,6 @@ async function confirmDelete() {
 function sudoLabel(policy: string) {
   if (policy === "ask") return t("host.sudoPolicyAsk");
   if (policy === "auto") return t("host.sudoPolicyAuto");
-  if (policy === "not_needed") return t("host.sudoPolicyNotNeeded");
   return t("host.sudoPolicyDeny");
 }
 </script>

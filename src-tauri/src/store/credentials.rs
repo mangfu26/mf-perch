@@ -10,8 +10,8 @@ use crate::domain::now_rfc3339;
 use crate::error::{AppError, Result};
 use crate::store::crypto::{self, KEY_LEN};
 
-const COLS: &str = "id, name, username, kind, secret_enc, passphrase_enc, fingerprint, \
-                    created_at, updated_at";
+const COLS: &str = "id, name, username, kind, is_privileged, secret_enc, passphrase_enc, \
+                    fingerprint, created_at, updated_at";
 
 /// 插入认证信息（自动加密敏感字段）。
 pub fn insert(conn: &Connection, cred: &Credential, key: &[u8; KEY_LEN]) -> Result<()> {
@@ -23,13 +23,15 @@ pub fn insert(conn: &Connection, cred: &Credential, key: &[u8; KEY_LEN]) -> Resu
 
     conn.execute(
         "INSERT INTO credentials
-            (id, name, username, kind, secret_enc, passphrase_enc, fingerprint, created_at, updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            (id, name, username, kind, is_privileged, secret_enc, passphrase_enc, fingerprint,
+             created_at, updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         params![
             cred.id,
             cred.name,
             cred.username,
             cred.kind.as_str(),
+            cred.is_privileged,
             secret_enc,
             passphrase_enc,
             cred.fingerprint,
@@ -55,14 +57,15 @@ pub fn update(
         };
         conn.execute(
             "UPDATE credentials SET
-                name = ?2, username = ?3, kind = ?4, secret_enc = ?5,
-                passphrase_enc = ?6, fingerprint = ?7, updated_at = ?8
+                name = ?2, username = ?3, kind = ?4, is_privileged = ?5,
+                secret_enc = ?6, passphrase_enc = ?7, fingerprint = ?8, updated_at = ?9
              WHERE id = ?1",
             params![
                 cred.id,
                 cred.name,
                 cred.username,
                 cred.kind.as_str(),
+                cred.is_privileged,
                 secret_enc,
                 passphrase_enc,
                 cred.fingerprint,
@@ -70,11 +73,19 @@ pub fn update(
             ],
         )?
     } else {
+        // `is_privileged` 在这里也必须写：它是"是否换了密文"这条分支**无关**的字段，
+        // 漏掉就会让"只勾/只取消特权身份"的编辑静默失效（界面显示改了、库里没改）。
         conn.execute(
             "UPDATE credentials SET
-                name = ?2, username = ?3, updated_at = ?4
+                name = ?2, username = ?3, is_privileged = ?4, updated_at = ?5
              WHERE id = ?1",
-            params![cred.id, cred.name, cred.username, now_rfc3339()],
+            params![
+                cred.id,
+                cred.name,
+                cred.username,
+                cred.is_privileged,
+                now_rfc3339(),
+            ],
         )?
     };
 
@@ -91,6 +102,7 @@ fn row_to_credential(row: &Row<'_>) -> rusqlite::Result<(Credential, String, Opt
         name: row.get("name")?,
         username: row.get("username")?,
         kind: CredentialKind::parse(&kind_raw).unwrap_or(CredentialKind::Password),
+        is_privileged: row.get("is_privileged")?,
         // 密文占位，下面用解密结果替换。
         secret: String::new(),
         passphrase: None,
@@ -157,6 +169,22 @@ pub fn exists(conn: &Connection, id: &str) -> Result<bool> {
         |r| r.get(0),
     )?;
     Ok(n > 0)
+}
+
+/// 该认证信息是否被声明为"登录即特权用户"（D60）。
+///
+/// **只读这一列，不走 [`get`]**：主机保存期只关心这个布尔值，为它去解密私钥正文
+/// 既慢又无谓（解密后的明文本会多出一次必须清零的拷贝）。
+pub fn is_privileged(conn: &Connection, id: &str) -> Result<bool> {
+    let n: i64 = conn
+        .query_row(
+            "SELECT is_privileged FROM credentials WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| AppError::CredentialNotFound(id.to_string()))?;
+    Ok(n != 0)
 }
 
 #[cfg(test)]
@@ -315,6 +343,51 @@ mod tests {
             get(&conn, &c.id, &key),
             Err(AppError::CredentialNotFound(_))
         ));
+    }
+
+    /// 特权身份标记（D60）三条读路都要带上：整条解密读、轻量列读、界面摘要。
+    #[test]
+    fn privileged_flag_roundtrips_through_every_read_path() {
+        let (conn, key) = setup();
+        let mut c = Credential::new("root", CredentialKind::Password, "pw");
+        c.is_privileged = true;
+        insert(&conn, &c, &key).unwrap();
+
+        assert!(
+            get(&conn, &c.id, &key).unwrap().is_privileged,
+            "解密读取丢了这一列"
+        );
+        assert!(
+            is_privileged(&conn, &c.id).unwrap(),
+            "轻量读取与整条读取不一致：保存期校验会走偏"
+        );
+        let summary = list_summaries(&conn).unwrap().remove(0);
+        assert!(
+            summary.is_privileged,
+            "摘要没带这一列，界面回填时开关永远显示关着"
+        );
+    }
+
+    /// 判别性：把 `is_privileged` 从"不换密文"那条 UPDATE 分支里漏掉，用户在
+    /// **只勾开关、不改口令**时保存——界面显示改了、库里没改。
+    /// 与主机表单上踩过的 B5 是同一类缺陷（表单字段与 SQL 列没对齐）。
+    #[test]
+    fn toggling_the_flag_survives_a_name_only_update() {
+        let (conn, key) = setup();
+        let c = Credential::new("root", CredentialKind::Password, "original-pw");
+        insert(&conn, &c, &key).unwrap();
+
+        let mut edited = c.clone();
+        edited.is_privileged = true;
+        edited.secret = String::new(); // 调用方未提供新口令 → replace_secret = false
+        update(&conn, &edited, false, &key).unwrap();
+
+        let got = get(&conn, &c.id, &key).unwrap();
+        assert!(
+            got.is_privileged,
+            "只改标记的编辑被静默丢弃：未换密文的分支没写这一列"
+        );
+        assert_eq!(got.secret, "original-pw", "改标记不该顺带把口令清掉");
     }
 
     #[test]

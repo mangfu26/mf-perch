@@ -333,12 +333,20 @@ impl TerminalRuntime {
             // 锁在此释放——SSH 连接期间不占用数据库。
         };
 
-        // 数据面 sudo 垫片的指引随策略变化（D48）：deny 说明该主机已禁用提权，
-        // not_needed 说明它本来就是特权身份（D60）。
+        // 数据面 sudo 垫片的指引随策略与登录身份变化（D48 / D60）：deny 说明该主机
+        // 已禁用提权，特权登录身份说明它本来就是特权身份。
         let auth = AuthMethod::from_credential(&credential);
 
         // --- 阶段 2：建立会话（无数据库锁） ---
-        match Session::connect(&terminal.id, &host, auth, sudo_ctx.policy).await {
+        match Session::connect(
+            &terminal.id,
+            &host,
+            auth,
+            sudo_ctx.policy,
+            sudo_ctx.login_is_privileged,
+        )
+        .await
+        {
             Ok((session, rx)) => {
                 // --- 阶段 3：回写 TOFU 主机密钥与环境快照 ---
                 let mut terminal = terminal;
@@ -489,7 +497,14 @@ impl TerminalRuntime {
         };
 
         // --- 阶段 2：重建会话 ---
-        let (session, rx) = Session::connect(&terminal.id, &host, auth, sudo_ctx.policy).await?;
+        let (session, rx) = Session::connect(
+            &terminal.id,
+            &host,
+            auth,
+            sudo_ctx.policy,
+            sudo_ctx.login_is_privileged,
+        )
+        .await?;
         self.register(db, &terminal.id, session, rx, sudo_ctx, host_label(&host))
             .await;
 
@@ -552,7 +567,14 @@ impl TerminalRuntime {
 
         let (host, auth, sudo_ctx) = load_connection_context(db, key, &terminal).await?;
 
-        let (session, rx) = Session::connect(&terminal.id, &host, auth, sudo_ctx.policy).await?;
+        let (session, rx) = Session::connect(
+            &terminal.id,
+            &host,
+            auth,
+            sudo_ctx.policy,
+            sudo_ctx.login_is_privileged,
+        )
+        .await?;
         let note = format!(
             "原 SSH 会话已断开，已自动重建（主机 {}）；\
              shell 状态已重置：工作目录、环境变量、后台进程均不再保留",
@@ -1203,16 +1225,14 @@ fn build_sudo_context(
     use crate::domain::credential::CredentialKind;
     use zeroize::Zeroizing;
 
-    // 这两种策略都不涉及口令，直接返回，避免无谓地解密敏感数据：
-    // `deny` 不允许提权；`not_needed` 连"提权"这一步都没有（D60），
+    // 这两种情形都不涉及口令，直接返回，避免无谓地解密敏感数据：
+    // `deny` 不允许提权；"登录即特权身份"连"提权"这一步都没有（D60），
     // 主机的 sudo_password_source / sudo_password 一律按**忽略**处理
-    // （库里保留原值，切回 ask/auto 时不必重填）。
-    if matches!(
-        host.sudo_policy,
-        SudoPolicy::Deny | SudoPolicy::NotNeeded
-    ) {
+    // （库里保留原值，取消勾选时不必重填）。
+    if host.sudo_policy == SudoPolicy::Deny || credential.is_privileged {
         return Ok(SudoContext {
             policy: host.sudo_policy,
+            login_is_privileged: credential.is_privileged,
             password: None,
         });
     }
@@ -1228,12 +1248,13 @@ fn build_sudo_context(
 
     let ctx = SudoContext {
         policy: host.sudo_policy,
+        login_is_privileged: credential.is_privileged,
         password,
     };
 
     // 配置不自洽时立即报错：提前在创建终端时暴露，
     // 好过让 Agent 执行 sudo 时收到难以理解的失败。
-    validate_for_policy(host.sudo_policy, ctx.password.is_some())?;
+    validate_for_policy(host.sudo_policy, ctx.login_is_privileged, ctx.password.is_some())?;
 
     Ok(ctx)
 }
@@ -1387,29 +1408,41 @@ async fn run_root_locked(
         load_connection_context(&db, &key, &terminal).await?
     };
 
-    let password = match sudo_ctx.policy {
-        // not_needed：这条通道不跑 sudo，既没有口令可取，也没有需要人类确认的
-        // 注入动作（D60）。
-        SudoPolicy::NotNeeded => None,
-        // auto：直接取已配置的提权密码；没有密码则 fail-closed（不猜、不尝试）。
-        SudoPolicy::Auto => sudo_ctx.password_for_auto().map(|s| s.to_string()),
-        // ask：由人类确认后才投递密码（提权通道上的唯一一次询问）。
-        SudoPolicy::Ask => match ask_human(&entry).await.decision() {
-            SudoDecision::Allow => sudo_ctx.password.as_deref().map(|s| s.to_string()),
-            SudoDecision::Deny => None,
-        },
-        SudoPolicy::Deny => None,
+    // 优先级：`deny` 先于"登录即特权身份"（D60）。入口 `run_as_root` 已按终端
+    // **建立时**的策略拒过一次，这里读的是**当前**主机配置——人类中途改成
+    // 「禁止注入」之后，不能因为凭据标着特权身份就绕过他的否决。
+    if sudo_ctx.policy == SudoPolicy::Deny {
+        return Err(AppError::SudoElevationFailed(
+            "该主机已禁用提权（sudo 策略为「禁止注入」），已拒绝执行提权命令".into(),
+        ));
+    }
+
+    // 特权登录身份：这条通道不跑 `sudo`，因而既没有口令可取，也没有需要人类确认
+    // 的注入动作（D60）——`ask` 在这里不询问，因为不发生"把密码交给 sudo"这件事。
+    let password = if sudo_ctx.login_is_privileged {
+        None
+    } else {
+        match sudo_ctx.policy {
+            // auto：直接取已配置的提权密码；没有密码则 fail-closed（不猜、不尝试）。
+            SudoPolicy::Auto => sudo_ctx.password_for_auto().map(|s| s.to_string()),
+            // ask：由人类确认后才投递密码（提权通道上的唯一一次询问）。
+            SudoPolicy::Ask => match ask_human(&entry).await.decision() {
+                SudoDecision::Allow => sudo_ctx.password.as_deref().map(|s| s.to_string()),
+                SudoDecision::Deny => None,
+            },
+            // 上面已按 deny 拒绝，此分支只为穷尽。
+            SudoPolicy::Deny => None,
+        }
     };
 
-    // 只有"要提权却没有口令"才是配置错误；not_needed 没有口令是设计如此。
-    if password.is_none() && sudo_ctx.policy.needs_elevation() {
+    // 只有"要经 sudo 提权却没有口令"才是配置错误或人类的否决；
+    // 特权登录身份不带口令是设计如此（D60）。
+    if password.is_none() && !sudo_ctx.login_is_privileged {
         let reason = match sudo_ctx.policy {
             SudoPolicy::Auto => "该主机配置为「自动注入」但未提供提权密码",
             SudoPolicy::Ask => "本次提权未获人类允许（或该主机未配置提权密码）",
+            // 走不到：上面已按 deny 拒绝。这里如实写原因，不编"缺口令"的借口。
             SudoPolicy::Deny => "该主机已禁用提权",
-            // not_needed 从不要求口令，走到这里说明上面的判定改坏了：
-            // 如实报成内部不一致，而不是编一个"缺口令"的借口把人引向配置页。
-            SudoPolicy::NotNeeded => "内部错误：「无需提权」档不该要求提权口令（请反馈给开发者）",
         };
         return Err(AppError::SudoElevationFailed(format!(
             "{reason}，已拒绝执行提权命令"
@@ -1423,6 +1456,7 @@ async fn run_root_locked(
         auth,
         password.as_deref(),
         sudo_ctx.policy,
+        sudo_ctx.login_is_privileged,
     )
     .await?;
 

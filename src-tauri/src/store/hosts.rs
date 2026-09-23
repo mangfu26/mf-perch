@@ -498,6 +498,7 @@ mod tests {
             name: None,
             username: "root".into(),
             kind: CredentialKind::Password,
+            is_privileged: false,
             fingerprint: None,
             has_passphrase: false,
             used_by_hosts: Vec::new(),

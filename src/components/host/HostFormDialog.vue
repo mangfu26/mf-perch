@@ -84,13 +84,27 @@ watch(
 const isEdit = computed(() => !!props.host);
 const title = computed(() => (isEdit.value ? t("host.edit") : t("host.add")));
 /**
+ * 绑定的认证信息是否被声明为"登录即特权用户"（D60）。
+ *
+ * 标记落在认证信息上，所以这里只读不算：一台主机换凭据，提权语义随之改变。
+ */
+const boundCredentialIsPrivileged = computed(() => {
+  if (!credentialId.value) return false;
+  return (
+    credentials.credentials.find((c) => c.id === credentialId.value)
+      ?.is_privileged ?? false
+  );
+});
+/**
  * 是否存在"提权"这一步（D60）。
  *
- * `deny` 拒绝提权、`not_needed` 登录身份本身已是特权用户，两档都**没有口令可配**；
- * 只有 `ask` / `auto` 才需要向用户要 sudo 密码。
+ * `deny` 拒绝提权、绑定特权身份时登录本身已是特权用户，两种情况都**没有口令可配**；
+ * 只有 `ask` / `auto` 且以普通身份登录，才需要向用户要 sudo 密码。
  */
 const usesElevation = computed(
-  () => sudoPolicy.value === "ask" || sudoPolicy.value === "auto",
+  () =>
+    !boundCredentialIsPrivileged.value &&
+    (sudoPolicy.value === "ask" || sudoPolicy.value === "auto"),
 );
 const requiresSudoPassword = computed(
   () => usesElevation.value && sudoPasswordSource.value === "own",
@@ -156,28 +170,36 @@ function submit() {
         </BaseInput>
       </FormField>
 
-      <!-- sudo 策略：默认 deny，放宽需显式选择（Q33 / P2） -->
-      <FormField :label="t('host.sudoPolicy')">
-        <div class="grid gap-2">
+      <!-- sudo 策略：默认 deny，放宽需显式选择（Q33 / P2）。
+           绑定特权身份时整组置灰：那条路径上没有提权，选项不再有意义（D60）。 -->
+      <FormField
+        :label="t('host.sudoPolicy')"
+        :hint="boundCredentialIsPrivileged ? t('host.sudoPolicyPrivilegedNote') : undefined"
+      >
+        <div
+          class="grid gap-2"
+          :class="boundCredentialIsPrivileged ? 'opacity-60' : ''"
+        >
           <label
             v-for="opt in [
               { v: 'deny', label: t('host.sudoPolicyDeny'), desc: t('host.sudoPolicyDenyDesc'), tone: 'safe' },
               { v: 'ask', label: t('host.sudoPolicyAsk'), desc: t('host.sudoPolicyAskDesc'), tone: 'warn' },
               { v: 'auto', label: t('host.sudoPolicyAuto'), desc: t('host.sudoPolicyAutoDesc'), tone: 'warn' },
-              { v: 'not_needed', label: t('host.sudoPolicyNotNeeded'), desc: t('host.sudoPolicyNotNeededDesc'), tone: 'warn' },
             ]"
             :key="opt.v"
-            class="flex cursor-pointer items-start gap-2.5 rounded-[9px] border px-3 py-2.5 transition-colors"
-            :class="
-              sudoPolicy === opt.v
-                ? 'border-accent bg-accent-soft'
-                : 'border-border-base hover:bg-surface-hover'
-            "
+            class="flex items-start gap-2.5 rounded-[9px] border px-3 py-2.5 transition-colors"
+            :class="[
+              sudoPolicy === opt.v ? 'border-accent bg-accent-soft' : 'border-border-base',
+              boundCredentialIsPrivileged
+                ? 'cursor-default'
+                : 'cursor-pointer hover:bg-surface-hover',
+            ]"
           >
             <input
               v-model="sudoPolicy"
               type="radio"
               :value="opt.v"
+              :disabled="boundCredentialIsPrivileged"
               class="mt-0.5 accent-[var(--accent)]"
             />
             <span>
