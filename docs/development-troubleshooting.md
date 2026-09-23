@@ -600,6 +600,59 @@ icacls .tmp-test/id_test //inheritance:r //grant:r "$USERNAME:(R,W)" # System32 
 
 ---
 
+## 测试端口被别的进程占了：一切换机/装软件就出现"公钥被拒"，但 `authorized_keys` 没问题
+
+### 现象
+
+真实环境用例（`src-tauri/tests/ssh_integration.rs` / `sudo_e2e.rs` / `mcp_e2e.rs`）成批失败，
+报的都是认证层的错：
+
+```
+Permission denied (publickey,...)
+```
+
+而 WSL 侧什么都没改：`authorized_keys` 里公钥在、`sshd_config.d` 的 drop-in 在、
+`/etc/passwd` 里用户也在。上一轮还是全绿的三组用例，这一轮**一条都连不上**。
+
+### 原因
+
+**端口上没有那个 sshd**。`127.0.0.1` 是回环地址，任何本机进程都能绑上去；一旦别的进程
+先占了测试端口，客户端就连到了"另一个服务"——它同样会说 SSH 版本横幅甚至接受
+`publickey` 协商，但对仓库里这把测试私钥必然返回拒绝。于是症状长得极像"公钥配错了"，
+把人往 `authorized_keys`、文件权限、WSL 重置这些方向上带。
+
+本机实例（2026-09-23）：客户机器上的**远程协助工具**监听了 `127.0.0.1:2222`，
+测试 sshd 因此没能在该端口上服务。判据是这两条：
+
+```bash
+# ① 客户端确实提供了正确的公钥（指纹与 .tmp-test/id_test.pub 一致）
+ssh -i .tmp-test/id_test -p 2222 -o BatchMode=yes -vv mfperch@127.0.0.1 'true' 2>&1 | grep -i 'Offering\|Server accepts'
+# ② 该端口的 LISTEN 归属不是 sshd
+ss -ltnp | grep 2222
+```
+
+①里能看到 `Offering publickey ... SHA256:<与 id_test.pub 相同的指纹>` 而后被拒——
+**密钥没问题，是接电话的人不对**。
+
+### 解决办法
+
+换端口，不要去跟别人的进程抢 `2222`：
+
+1. 改 `.tmp-test/setup-wsl-test-env.sh` 里的 `Port`，重跑该脚本（幂等，会覆写 drop-in 并重启 sshd）；
+2. 改 `.tmp-test/mfperch_test_env.sh` 里的 `MFPERCH_TEST_PORT`；
+3. 同步 `docs/design/test-environment.md`（选型与端口事实在那里，本文不复述）。
+
+### 预防
+
+- **测试端口按 [`design/test-environment.md`](design/test-environment.md) §3 的护栏选**：
+  避开天然会被别的软件占用的常见替代端口。
+- 三组真实环境用例**同时**变红、且报的都是 `Permission denied`，第一反应应该是
+  "**还有没有人连着这台机器**"（远程协助、端口转发、IDE 的端口占用），而不是"公钥丢了"——
+  后者很少一次性影响所有用户与所有用例。
+- `ss -ltnp` 一条命令就能定性，跑在改配置之前。
+
+---
+
 ## Windows 上 `cargo test` 拉不起某个测试 exe：`请求的操作需要提升。(os error 740)`
 
 ### 现象

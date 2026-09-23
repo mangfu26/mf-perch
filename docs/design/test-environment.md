@@ -5,7 +5,7 @@
 
 ## 1. 环境选型
 
-测试目标环境 = **WSL Ubuntu 内的 `openssh-server`**（监听 `127.0.0.1:2222`），
+测试目标环境 = **WSL Ubuntu 内的 `openssh-server`**（监听 `127.0.0.1:2223`），
 Windows 侧通过**真实 SSH 协议**连接它，不用进程内 mock。
 **选型理由与替代方案（Docker / 客户远端主机）的取舍见 [D27](../decisions/D27.md)，不要在此重新评估。**
 
@@ -31,12 +31,14 @@ wsl --install -d Ubuntu
    ```
 2. 配置端口（避免与 Windows 侧冲突）：
    ```
-   Port 2222
+   Port 2223
    ```
+   **不要选 2222**：它是 SSH 的常见替代端口，客户机器上可能已有别的程序在监听；
+   撞端口的症状与判读见 [`development-troubleshooting.md`](../development-troubleshooting.md)。
    **本机做法：让 sshd 自己绑定，端口只有 `sshd_config` 一个来源**——
    `systemctl disable --now ssh.socket && systemctl enable --now ssh`。
    新版 Ubuntu 的 ssh 可能由 systemd socket 激活接管，此时最终监听端口未必由 `Port` 决定；
-   **换机后不要假设，以 WSL 内 `ss -ltn | grep 2222` 的实际输出为准**。
+   **换机后不要假设，以 WSL 内 `ss -ltn | grep 2223` 的实际输出为准**。
 3. 准备两种认证：
    - 密码认证：创建一个测试用户（如 `mfperch`）并设置密码；
    - 密钥认证：生成测试密钥对，公钥写入 `~/.ssh/authorized_keys`。
@@ -63,7 +65,7 @@ wsl --install -d Ubuntu
 
 | 项 | 期望 |
 | ---- | ---- |
-| openssh-server | 监听 `127.0.0.1:2222` |
+| openssh-server | 监听 `127.0.0.1:2223` |
 | 测试用户 `mfperch` | 可密钥登录；在 `sudo` 组且**提权需口令**（`sudo -n id -u` 必须失败） |
 | 免密 sudo 用户 `mfperch-nopass` | `sudo -n id -u` 返回 `0`（免密路径） |
 | 测试密钥对 | ed25519、**无 passphrase**（russh 直接读 PEM） |
@@ -74,7 +76,7 @@ wsl --install -d Ubuntu
 
 ### 4.2 实测验证结论（关键）
 
-**① 密钥认证与命令执行**：Windows 侧 `ssh -i ... -p 2222 mfperch@127.0.0.1` 成功登录并执行命令。
+**① 密钥认证与命令执行**：Windows 侧 `ssh -i ... -p 2223 mfperch@127.0.0.1` 成功登录并执行命令。
 
 **② 登录 shell 环境加载（验证 D4）**：
 
@@ -148,7 +150,7 @@ wsl --install -d Ubuntu
 
 ```bash
 export MFPERCH_TEST_HOST=127.0.0.1
-export MFPERCH_TEST_PORT=2222
+export MFPERCH_TEST_PORT=2223
 export MFPERCH_TEST_USER=mfperch
 export MFPERCH_TEST_KEY=<测试私钥路径>
 # sudo_e2e 必需：缺失时按 AGENTS.md §5.6 直接失败（不静默跳过）

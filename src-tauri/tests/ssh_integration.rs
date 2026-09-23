@@ -6,7 +6,7 @@
 //! ```bash
 //! # 先在 WSL 中确保证书已部署到 mfperch 用户，然后：
 //! export MFPERCH_TEST_HOST=127.0.0.1
-//! export MFPERCH_TEST_PORT=2222
+//! export MFPERCH_TEST_PORT=2223
 //! export MFPERCH_TEST_USER=mfperch
 //! export MFPERCH_TEST_KEY=/path/to/id_test
 //! cargo test --test ssh_integration -- --ignored --test-threads=1

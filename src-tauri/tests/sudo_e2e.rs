@@ -13,7 +13,7 @@
 //!
 //! ```bash
 //! export MFPERCH_TEST_HOST=127.0.0.1
-//! export MFPERCH_TEST_PORT=2222
+//! export MFPERCH_TEST_PORT=2223
 //! export MFPERCH_TEST_USER=mfperch
 //! export MFPERCH_TEST_KEY=<私钥路径>
 //! export MFPERCH_TEST_SUDO_PW=<测试用户的 sudo 密码>

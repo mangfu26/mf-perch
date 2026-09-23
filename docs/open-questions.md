@@ -371,7 +371,7 @@
 ### Q26 — 测试环境
 
 - 状态：**已答**（客户：Windows 10 + WSL；已安装 WSL Ubuntu 26.04）。
-- 结论一行：测试目标环境 = WSL Ubuntu 内的 openssh-server（`127.0.0.1:2222`），
+- 结论一行：测试目标环境 = WSL Ubuntu 内的 openssh-server（`127.0.0.1:2223`），
   Windows 侧走真实 SSH。选型与理由见 **D27**；环境现状、搭建步骤与实测读数见
   [`docs/design/test-environment.md`](design/test-environment.md)（此处不复述）。
 
