@@ -258,6 +258,34 @@ const V2_CREDENTIAL_IS_PRIVILEGED: &str = r#"
 ALTER TABLE credentials ADD COLUMN is_privileged INTEGER NOT NULL DEFAULT 0;
 "#;
 
+/// **已发布过的 schema 形状登记册**：`(该步骤执行后达到的版本号, SQL 原文, 原文的 SHA-256)`。
+///
+/// 库的完整形状是一条**重放链**：版本 N = 表中前 N 项原文依次执行的结果。
+/// 所以钉住每一项的原文，就等于钉住历史上每一种"发出去的装机形状"。
+///
+/// **为什么这里允许用摘要锁文本**（平时这样写会被 §5.3 判成锁死实现细节的假测试）：
+/// 这些 SQL 不是实现细节，而是**已发布的二进制能在用户机器上建出来的磁盘形状**，
+/// 属 §5.1 明列的"数据兼容性"。改一个字符就可能让某个老库升不上来，
+/// 而那种坏法在功能测试里看不出来——只有摘要会红。
+///
+/// **加新步骤时只追加，不改写既有项**（就地改 V1/V2 等于制造第二个 V1，见 D60）：
+/// ①新写一个 `const V3_…: &str = r#"…"#;`；②`SCHEMA_VERSION` 递增；
+/// ③在 `migrate()` 补一段 `if current < 3`；④在这里追加一行，第三项先随便填——
+/// `released_schema_texts_are_frozen` 的失败信息会打印实际摘要。
+/// 漏掉 ④ 会撞到 `released_schema_steps_cover_every_version`（版本号与条目必须一一对应）。
+const RELEASED_SCHEMA_STEPS: &[(i64, &str, &str)] = &[
+    (
+        1,
+        V1_SCHEMA,
+        "0c79667c504eed9a2876bf94613f906838e44463abd19b83e14de501c92b547b",
+    ),
+    (
+        2,
+        V2_CREDENTIAL_IS_PRIVILEGED,
+        "6428c201d50b4a97acdcb49be6d3e09e5e3c7728b5fedb587e884ac8433be114",
+    ),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,6 +498,78 @@ mod tests {
             .is_err(),
             "新库不该接受第四档"
         );
+    }
+
+    /// 守住 `RELEASED_SCHEMA_STEPS` 里每一项的**原文不可变**。
+    ///
+    /// 判别性：有人就地改 `V1_SCHEMA`（或改任何一个已发布步骤）来"顺手加个字段"时红——
+    /// 那种改法只作用于新建库，存量装机拿不到同一列，升级路径还会静默失配（D50 / D60）。
+    /// 摘要不符时失败信息直接打印实际值，按上面的四步流程追加新步骤后照抄即可。
+    ///
+    /// 第一条断言（不含 `\r`）守的是**摘要的可移植性**：登记摘要的前提是"这段文本在任何
+    /// 开发机上字节一致"。本机工作区的 `.rs` 是 CRLF（`core.autocrlf=true`），而 Rust 会把
+    /// 字符串字面量里的 CRLF 规范化为 LF，故该断言在两类行尾的机器上都是绿的（2026-09-23
+    /// 实测：CRLF 工作区上 `\r` 计数为 0）。留着它，是因为一旦哪天不再成立
+    /// （改 `.gitattributes`、或换编译器行为），摘要会随机器而变、这条测试就会
+    /// 一台绿一台红——那时先修行尾策略（`*.rs text eol=lf`），不要改摘要。
+    #[test]
+    fn released_schema_texts_are_frozen() {
+        use sha2::{Digest, Sha256};
+
+        for (version, sql, expected_sha) in RELEASED_SCHEMA_STEPS {
+            assert!(
+                !sql.contains('\r'),
+                "版本 {version} 的 schema 文本里出现了 \\r：摘要将随开发机的行尾配置而变，\
+                 换机器就会红。行尾策略见仓库根 .gitattributes"
+            );
+            let actual = Sha256::digest(sql.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            assert_eq!(
+                actual, *expected_sha,
+                "版本 {version} 的已发布 schema 原文被改动了（摘要不符）。实际摘要 = {actual}"
+            );
+        }
+    }
+
+    /// 守住**登记册与 `migrate()` 说的是同一件事**：版本号每 +1 就必须有一项登记，
+    /// 且按登记册重放出来的形状必须与 `migrate()` 建出来的完全一致。
+    ///
+    /// 判别性：把 `SCHEMA_VERSION` 抬到 3 却忘了在登记册追加（或反之，登记了却没在
+    /// `migrate()` 里执行）都会红。`sqlite_master` 逐行比对抓的是"登记册漏了一项 SQL"
+    /// 或"某一步实际没跑"——比字段清单更硬，因为它比的是磁盘上真正长出来的东西。
+    #[test]
+    fn released_schema_steps_cover_every_version() {
+        let versions: Vec<i64> = RELEASED_SCHEMA_STEPS.iter().map(|(v, _, _)| *v).collect();
+        let expected: Vec<i64> = (1..=SCHEMA_VERSION).collect();
+        assert_eq!(
+            versions, expected,
+            "登记册必须与版本号一一对应：加迁移 = 追加一项 + 递增 SCHEMA_VERSION"
+        );
+
+        let replayed = Connection::open_in_memory().expect("内存库");
+        for (_, sql, _) in RELEASED_SCHEMA_STEPS {
+            replayed.execute_batch(sql).expect("按登记册重放");
+        }
+        let migrated = open_in_memory().expect("open in-memory db");
+
+        let dump = |conn: &Connection| -> Vec<(String, String, String)> {
+            conn.prepare(
+                "SELECT type, name, sql FROM sqlite_master \
+                 WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        let (a, b) = (dump(&replayed), dump(&migrated));
+        assert_eq!(a.len(), b.len(), "登记册重放出的对象数量与 migrate() 不一致");
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x, y, "登记册与 migrate() 建出的形状不同：{x:?} vs {y:?}");
+        }
     }
 
     #[test]
