@@ -72,7 +72,7 @@ wsl --install -d Ubuntu
 | `~/.bash_profile`（`mfperch`） | 把 `/opt/mfperch-test-bin` 加进 PATH，且**不打印任何内容**；该目录内有可执行 `mfperch-test` |
 | `requiretty` | **不得**设置，否则提权通道不可用（能力边界见 [`AGENTS.md`](../../AGENTS.md) §4.4） |
 | 搭建脚本 | 幂等、可重跑；本机路径记在 `AGENTS.local.md`（不入库） |
-| Windows → WSL SSH 连通性 | Windows 侧可连通（NAT 模式下的实测见 §4.2 ①） |
+| Windows → WSL SSH 连通性 | Windows 侧可连通（NAT 模式下的实测见 §4.2 ①）。**注意 Windows 上那个端口监听由 WSL 的 localhost 转发代持，随 WSL 实例生命周期消失**——核对要在 WSL 有进程挂着时做，`netstat -ano \| findstr 2223` 为空即实例已停（判读见 [`development-troubleshooting.md`](../development-troubleshooting.md)） |
 
 ### 4.2 实测验证结论（关键）
 

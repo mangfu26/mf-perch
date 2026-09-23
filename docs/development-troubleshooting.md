@@ -653,6 +653,48 @@ ss -ltnp | grep 2222
 
 ---
 
+## Windows 侧连不上 WSL 里的 sshd：`Connection refused`，而 WSL 内一切正常
+
+### 现象
+
+上一节换完端口之后，症状**换了**一种：
+
+- WSL 内：`systemctl is-active ssh` = `active`，`ss -ltn` 有 `127.0.0.1:2223`；
+- Windows 侧：`ssh -p 2223` 报 `connect to host 127.0.0.1 port 2223: Connection refused`，
+  且 `netstat -ano | findstr 2223` **一行都没有**，`netsh interface portproxy show all` 为空。
+
+也就是说：**WSL 里有人在监听，Windows 的回环上却根本没有这个端口**。
+
+### 原因（观测结论，不是 WSL 内部实现结论）
+
+NAT 模式下 Windows 侧那个监听**不是 sshd 自己的**，而是 WSL 的 localhost 自动转发代持的，
+它**跟着 WSL 实例的生命周期走**：实例被回收（空闲停止）后 Windows 上就不再有这个端口，
+表现为 `Connection refused` 而不是超时或拒绝认证。
+
+本机实测：`uptime -s` 显示 VM 在每次探测前刚重启过；让开发者在 Windows 上开一个
+`wsl -d Ubuntu` 终端**保持不退出**之后，`2223` 立刻出现在 `netstat` 里，随后三组
+`--ignored` 用例全绿。
+
+### 判读三分法（先分类，再去改配置）
+
+| Windows `netstat` 有该端口？ | WSL `ss -ltn` 有？ | 结论 |
+| ---- | ---- | ---- |
+| 无 | 无 | WSL 实例没在跑 |
+| 无 | 有 | 本节：转发随实例消失 |
+| 有，但归属不是 sshd | — | 撞端口，见上一节 |
+
+### 解决办法与预防
+
+- **跑真实环境用例前，先确认 Windows 侧有该端口的监听**（`netstat -ano | findstr <端口>`），
+  一条命令就能定性；隔夜没碰 WSL 之后尤其要确认。
+- WSL 停止时**请开发者挂一个交互终端**（`wsl -d Ubuntu` 不退出）再跑。
+  **不要**为此改成"从 Windows 连 WSL 的 NAT 内网 IP"：NAT 模式下那个地址每次开机会变，
+  `MFPERCH_TEST_HOST` 就得跟着现取，等于把一条稳定判据换成一条易变项。
+- 报的错是 `Connection refused` 还是 `Permission denied`，**分别指向"端口上没人"与
+  "认证没通过"**，处置路径完全不同——前者不要去查 `authorized_keys`。
+
+---
+
 ## Windows 上 `cargo test` 拉不起某个测试 exe：`请求的操作需要提升。(os error 740)`
 
 ### 现象
