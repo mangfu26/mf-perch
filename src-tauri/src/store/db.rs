@@ -38,25 +38,46 @@ pub fn open_in_memory() -> Result<Connection> {
 }
 
 /// 依据 `user_version` 执行增量迁移。
+///
+/// 建表按版本号走，但**增列一类只按形状走**：`user_version` 只是某个构建写上去的断言，
+/// 标了不等于做到了，反之标小了也不必重跑（判据见 `has_column`）。
 pub fn migrate(conn: &Connection) -> Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-
-    if current >= SCHEMA_VERSION {
-        return Ok(());
-    }
 
     if current < 1 {
         conn.execute_batch(V1_SCHEMA)
             .map_err(|e| AppError::Database(e))?;
     }
 
-    if current < 2 {
+    // 增列一步**只按形状判定**，不看版本号，两个方向都覆盖：
+    // ①标记已到 2 却缺列 = 被"声称是 2、其实不是 2"的构建盖过章（本项目唯一一次：
+    //   开发分支上被撤销的第四档实现），只认版本号就永远修不回来，症状是运行期
+    //   `no such column`；②列已加但标记没写上（`ALTER` 与盖章之间被杀）——按版本号
+    //   会重跑 `ADD COLUMN` 并报 duplicate column。`ADD COLUMN` 幂等，问一句"列在不在"
+    //   就同时免疫这两种脱节。
+    if !has_column(conn, "credentials", "is_privileged")? {
         conn.execute_batch(V2_CREDENTIAL_IS_PRIVILEGED)
             .map_err(|e| AppError::Database(e))?;
     }
 
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    // 版本号只往上写：退回旧构建时（current 比本构建大）把标记改小，
+    // 会让下一次升级跳过中间那一级台阶。
+    if current < SCHEMA_VERSION {
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
     Ok(())
+}
+
+/// `table` 里是否已存在 `column`。
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info(?) WHERE name = ? LIMIT 1",
+            [table, column],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 /// 应用数据目录（D6 / Q12）：`%APPDATA%/mf-perch`（Windows）、
@@ -270,7 +291,8 @@ ALTER TABLE credentials ADD COLUMN is_privileged INTEGER NOT NULL DEFAULT 0;
 ///
 /// **加新步骤时只追加，不改写既有项**（就地改 V1/V2 等于制造第二个 V1，见 D60）：
 /// ①新写一个 `const V3_…: &str = r#"…"#;`；②`SCHEMA_VERSION` 递增；
-/// ③在 `migrate()` 补一段 `if current < 3`；④在这里追加一行，第三项先随便填——
+/// ③在 `migrate()` 补一段 `if current < 3`（**增列一类只写 `if !has_column(…)`**，
+/// 不要写成 `current < 3 || …`，理由同 V2 那段注释）；④在这里追加一行，第三项先随便填——
 /// `released_schema_texts_are_frozen` 的失败信息会打印实际摘要。
 /// 漏掉 ④ 会撞到 `released_schema_steps_cover_every_version`（版本号与条目必须一一对应）。
 const RELEASED_SCHEMA_STEPS: &[(i64, &str, &str)] = &[
@@ -327,6 +349,110 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    /// 守的是**版本号与形状脱节**这一类库：`user_version` 已被某个构建标成 2，
+    /// 但 `credentials` 里并没有 `is_privileged`。本项目真实踩过——开发分支上
+    /// 第四档实现（提交 `731abc9`，其 V2 只重建 `hosts`、不加列）给 dev 库盖了章，
+    /// 该实现随后被撤销、版本号 2 换成了别的形状，这台机器上的库就成了孤儿。
+    ///
+    /// 判别性：把 `migrate()` 改回"只看版本号"（`if current >= SCHEMA_VERSION { return }`），
+    /// 本用例立刻红在"列应存在"上；而 `credentials` 那行数据丢了也会红。
+    #[test]
+    fn a_stale_version_stamp_is_repaired_by_shape() {
+        let conn = Connection::open_in_memory().expect("内存库");
+        conn.execute_batch(V1_SCHEMA).expect("按 V1 建表");
+        conn.pragma_update(None, "user_version", 2).expect("盖章 2");
+        conn.execute(
+            "INSERT INTO credentials (id, username, kind, secret_enc, created_at, updated_at)
+             VALUES ('cred_stale', 'root', 'password', 'v1:nonce:cipher', 'now', 'now')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            !has_column(&conn, "credentials", "is_privileged").unwrap(),
+            "前置条件：这个库的形状与它的版本标记不符"
+        );
+
+        migrate(&conn).expect("迁移应把它补成真正的 2");
+
+        assert!(
+            has_column(&conn, "credentials", "is_privileged").unwrap(),
+            "缺列必须按形状补回来"
+        );
+        let flag: i64 = conn
+            .query_row(
+                "SELECT is_privileged FROM credentials WHERE id = 'cred_stale'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, 0, "补列后原有凭据仍按非特权处理（fail-closed）");
+        let enc: String = conn
+            .query_row(
+                "SELECT secret_enc FROM credentials WHERE id = 'cred_stale'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(enc, "v1:nonce:cipher", "补列不得动已有密文");
+    }
+
+    /// 守的是**升级做了一半就断掉**这条路径：`ALTER` 已经落盘、版本标记还没写上
+    /// （两步之间进程被杀 / 断电）。此时库里已有该列，若迁移仍按版本号重跑
+    /// `ADD COLUMN`，第二次启动会以 `duplicate column name: is_privileged` **永久起不来**。
+    ///
+    /// 判别性：判据写成 `current < 2 || !has_column(…)`（版本号优先）时，
+    /// 本用例红在 `migrate(…)` 那一句 `expect` 上，报 duplicate column。
+    #[test]
+    fn an_upgrade_that_lost_its_stamp_restarts_cleanly() {
+        let conn = Connection::open_in_memory().expect("内存库");
+        conn.execute_batch(V1_SCHEMA).expect("按 V1 建表");
+        conn.pragma_update(None, "user_version", 1)
+            .expect("盖章 1（已发布构建的终点状态）");
+        conn.execute(
+            "INSERT INTO credentials (id, username, kind, secret_enc, created_at, updated_at)
+             VALUES ('cred_half', 'root', 'password', 'v1:nonce:cipher', 'now', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(V2_CREDENTIAL_IS_PRIVILEGED)
+            .expect("模拟列已加上");
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 1, "前置条件：标记停在 1，形状却已是 2");
+
+        migrate(&conn).expect("第二次启动不该因为重跑 ADD COLUMN 而失败");
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION, "补上丢掉的版本标记");
+        let flag: i64 = conn
+            .query_row(
+                "SELECT is_privileged FROM credentials WHERE id = 'cred_half'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, 0, "列不该被重加，原值仍为默认 0");
+    }
+
+    /// 守的是**退回旧构建**这条路径：库的版本比本构建高时只跳过迁移，
+    /// 不能顺手把标记改小——那会让下次升级跳掉中间那一级台阶。
+    #[test]
+    fn a_newer_database_keeps_its_version_stamp() {
+        let conn = open_in_memory().expect("内存库");
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .expect("模拟更新的库");
+
+        migrate(&conn).expect("更新的库不迁移");
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION + 1, "版本标记不得被改小，实际 {v}");
     }
 
     /// 守的是**已发布装机升级**这条路径：V1 库的 `credentials` 没有 `is_privileged`，
