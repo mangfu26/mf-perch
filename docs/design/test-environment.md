@@ -5,7 +5,7 @@
 
 ## 1. 环境选型
 
-测试目标环境 = **WSL Ubuntu 内的 `openssh-server`**（监听 `127.0.0.1:2222`），
+测试目标环境 = **WSL Ubuntu 内的 `openssh-server`**（监听 `127.0.0.1:2223`），
 Windows 侧通过**真实 SSH 协议**连接它，不用进程内 mock。
 **选型理由与替代方案（Docker / 客户远端主机）的取舍见 [D27](../decisions/D27.md)，不要在此重新评估。**
 
@@ -31,19 +31,25 @@ wsl --install -d Ubuntu
    ```
 2. 配置端口（避免与 Windows 侧冲突）：
    ```
-   Port 2222
+   Port 2223
    ```
+   **不要选 2222**：它是 SSH 的常见替代端口，客户机器上可能已有别的程序在监听；
+   撞端口的症状与判读见 [`development-troubleshooting.md`](../development-troubleshooting.md)。
    **本机做法：让 sshd 自己绑定，端口只有 `sshd_config` 一个来源**——
    `systemctl disable --now ssh.socket && systemctl enable --now ssh`。
    新版 Ubuntu 的 ssh 可能由 systemd socket 激活接管，此时最终监听端口未必由 `Port` 决定；
-   **换机后不要假设，以 WSL 内 `ss -ltn | grep 2222` 的实际输出为准**。
+   **换机后不要假设，以 WSL 内 `ss -ltn | grep 2223` 的实际输出为准**。
 3. 准备两种认证：
    - 密码认证：创建一个测试用户（如 `mfperch`）并设置密码；
    - 密钥认证：生成测试密钥对，公钥写入 `~/.ssh/authorized_keys`。
-4. 配置 sudo 三种模式用于测试：
+4. 配置 sudo 各档策略用于测试：
    - 默认用户有 sudo 密码 → 测 `ask` / `auto`；
    - 另建一个 `NOPASSWD` 用户 → 测免密路径；
-   - `deny` 模式无需特殊配置。
+   - `deny` 模式无需特殊配置；
+   - **特权身份免提权**（D60 的 `credentials.is_privileged`）**需要一台以 root 身份登录的主机**，
+     即 sshd 开 `PermitRootLogin`。该选项改动的是测试机的 sshd 配置，**需客户授权后才动**；
+     未开时该路径的真实端到端**未实测**（诚实标注见 **D60**，
+     进程内不变式由 `only_a_privileged_login_launches_the_privileged_channel_without_sudo` 守住）。
 5. 验证 `bash -l` 能加载 profile（写入一个测试用的 `~/.bash_profile`）。
 
 ## 4. 环境现状与实测记录
@@ -59,18 +65,18 @@ wsl --install -d Ubuntu
 
 | 项 | 期望 |
 | ---- | ---- |
-| openssh-server | 监听 `127.0.0.1:2222` |
+| openssh-server | 监听 `127.0.0.1:2223` |
 | 测试用户 `mfperch` | 可密钥登录；在 `sudo` 组且**提权需口令**（`sudo -n id -u` 必须失败） |
 | 免密 sudo 用户 `mfperch-nopass` | `sudo -n id -u` 返回 `0`（免密路径） |
 | 测试密钥对 | ed25519、**无 passphrase**（russh 直接读 PEM） |
 | `~/.bash_profile`（`mfperch`） | 把 `/opt/mfperch-test-bin` 加进 PATH，且**不打印任何内容**；该目录内有可执行 `mfperch-test` |
 | `requiretty` | **不得**设置，否则提权通道不可用（能力边界见 [`AGENTS.md`](../../AGENTS.md) §4.4） |
 | 搭建脚本 | 幂等、可重跑；本机路径记在 `AGENTS.local.md`（不入库） |
-| Windows → WSL SSH 连通性 | Windows 侧可连通（NAT 模式下的实测见 §4.2 ①） |
+| Windows → WSL SSH 连通性 | Windows 侧可连通（NAT 模式下的实测见 §4.2 ①）。**注意 Windows 上那个端口监听由 WSL 的 localhost 转发代持，随 WSL 实例生命周期消失**——核对要在 WSL 有进程挂着时做，`netstat -ano \| findstr 2223` 为空即实例已停（判读见 [`development-troubleshooting.md`](../development-troubleshooting.md)） |
 
 ### 4.2 实测验证结论（关键）
 
-**① 密钥认证与命令执行**：Windows 侧 `ssh -i ... -p 2222 mfperch@127.0.0.1` 成功登录并执行命令。
+**① 密钥认证与命令执行**：Windows 侧 `ssh -i ... -p 2223 mfperch@127.0.0.1` 成功登录并执行命令。
 
 **② 登录 shell 环境加载（验证 D4）**：
 
@@ -101,8 +107,9 @@ wsl --install -d Ubuntu
 
 **⑤ ~~fail-closed 验证~~（结论已被 D47 / D49 取代）**：
 - 旧：`sudo -A -p ''` 无 askpass 时报 `sudo: No askpass program specified in SUDO_ASKPASS`，退出码 1 → 天然拒绝提权。
-- 现：数据面包装脚本注入 `sudo` shell 垫片（`protocol::sudo_reject_shim`），**三种模式下都**非 0 返回 +
-  一句可操作说明（策略允许提权时指引改用 `run_as_root` 工具；`deny` 时说明该主机已禁用提权）。
+- 现：数据面包装脚本注入 `sudo` shell 垫片（`protocol::sudo_reject_shim`），**三档策略 × 两种身份
+  都**非 0 返回 + 一句可操作说明（普通身份允许提权时指引改用 `run_as_root` 工具；`deny` 时说明
+  该主机已禁用提权；凭据声明特权身份时说明"已是特权身份，直接执行即可"，D60）。
   现行验证：单测 `wrapper_script_always_installs_reject_shim` 与 `reject_shim_refuses_and_guides_to_the_tool`；
   真实环境见 `src-tauri/tests/sudo_e2e.rs`。
 
@@ -120,7 +127,8 @@ wsl --install -d Ubuntu
 - 密码认证 / 密钥认证 / passphrase 密钥；
 - 方案 C 的包装脚本（NUL 分帧、状态保留、结束标记、退出码）；
 - `bash -l` vs 干净模式；
-- sudo `deny` / `ask` / `auto` 三模式；
+- sudo `deny` / `ask` / `auto` 三档；**特权身份免提权（D60）不在其列**——它需要以 root 登录，
+  而本环境未开 `PermitRootLogin`（改它需客户授权，见上面第 3 节第 4 条与 **D60**）；
 - 免密 sudo 快速路径；
 - 长命令异步执行与轮询；
 - 连接断开、终端 broken 状态、归档与恢复。
@@ -142,7 +150,7 @@ wsl --install -d Ubuntu
 
 ```bash
 export MFPERCH_TEST_HOST=127.0.0.1
-export MFPERCH_TEST_PORT=2222
+export MFPERCH_TEST_PORT=2223
 export MFPERCH_TEST_USER=mfperch
 export MFPERCH_TEST_KEY=<测试私钥路径>
 # sudo_e2e 必需：缺失时按 AGENTS.md §5.6 直接失败（不静默跳过）
@@ -179,4 +187,5 @@ cargo test -j 2 --test ssh_integration -- --ignored --test-threads=1
   真实环境用例整组跑可能超过一条命令的时限，分组更稳。
 
 覆盖范围：协议解析、输出截断、加解密、密钥分层、仓储与配额、MCP 工具契约与鉴权、
-sudo 三模式、更新检查、跨语言 IPC 契约。
+sudo 提权（`deny` / `ask` / `auto` 走真实环境；特权身份免提权仅进程内，见 §3 第 4 条与 **D60**）、
+更新检查、跨语言 IPC 契约。

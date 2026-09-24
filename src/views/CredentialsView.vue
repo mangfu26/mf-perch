@@ -162,6 +162,10 @@ async function confirmDelete() {
                 : t("credential.kindPassword")
             }}
           </StatusTag>
+          <!-- 特权身份直接标在卡片上：它会影响所有引用该凭据的主机（D60） -->
+          <StatusTag v-if="cred.is_privileged" tone="warning">
+            {{ t("credential.isPrivileged") }}
+          </StatusTag>
           <StatusTag v-if="cred.has_passphrase" tone="warning">
             {{ t("credential.passphrase") }}
           </StatusTag>

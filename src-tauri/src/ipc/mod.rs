@@ -235,6 +235,20 @@ fn credential_is_password(
     Ok(cred.kind == CredentialKind::Password)
 }
 
+/// 该主机绑定的凭据是否被声明为"登录即特权用户"（D60）。
+///
+/// 未绑定凭据时为 `false`：没有身份可言，按"需要提权"处理（fail-closed）。
+/// 上面已校验过凭据存在，因此这里不再判 `NotFound`。
+fn bound_credential_is_privileged(
+    conn: &rusqlite::Connection,
+    input: &HostInput,
+) -> Result<bool, AppError> {
+    match input.credential_id.as_deref() {
+        Some(cid) => Ok(credentials::is_privileged(conn, cid)?),
+        None => Ok(false),
+    }
+}
+
 async fn save_host_inner(state: &AppState, input: HostInput) -> Result<String, AppError> {
     let key = master_key(state).await?;
 
@@ -253,6 +267,9 @@ async fn save_host_inner(state: &AppState, input: HostInput) -> Result<String, A
             return Err(AppError::CredentialNotFound(cid.clone()));
         }
     }
+    // 「登录即特权用户」记在凭据上（D60）：这一身份下提权通道不跑 sudo，
+    // 因此 ask / auto 两档都不该再要求一个用不上的提权口令。
+    let login_is_privileged = bound_credential_is_privileged(&conn, &input)?;
 
     match &input.id {
         Some(id) => {
@@ -280,7 +297,7 @@ async fn save_host_inner(state: &AppState, input: HostInput) -> Result<String, A
                 }
                 SudoPasswordSource::ReuseLogin => credential_is_password(&conn, &input, &key)?,
             };
-            validate_for_policy(policy, has_password)?;
+            validate_for_policy(policy, login_is_privileged, has_password)?;
 
             hosts::update(&conn, &host)?;
 
@@ -300,7 +317,7 @@ async fn save_host_inner(state: &AppState, input: HostInput) -> Result<String, A
                     .is_some_and(|s| !s.is_empty()),
                 SudoPasswordSource::ReuseLogin => credential_is_password(&conn, &input, &key)?,
             };
-            validate_for_policy(policy, has_password)?;
+            validate_for_policy(policy, login_is_privileged, has_password)?;
 
             let host = Host {
                 id: crate::domain::new_id("host"),
@@ -365,6 +382,8 @@ pub struct CredentialInput {
     pub name: Option<String>,
     pub username: String,
     pub kind: String,
+    /// 由人类声明"该身份登录即特权用户"（D60）。留 `false` 即不提权短路，fail-closed。
+    pub is_privileged: bool,
     /// 留空表示保持不变（更新场景）。
     pub secret: Option<String>,
     pub passphrase: Option<String>,
@@ -413,6 +432,7 @@ async fn save_credential_inner(
                 name: input.name.clone(),
                 username: input.username.clone(),
                 kind,
+                is_privileged: input.is_privileged,
                 secret: input.secret.clone().unwrap_or_default(),
                 passphrase: input.passphrase.clone(),
                 fingerprint: fingerprint.or_else(|| existing.fingerprint.clone()),
@@ -439,6 +459,7 @@ async fn save_credential_inner(
             }
             let mut cred = Credential::new(input.username.clone(), kind, secret);
             cred.name = input.name.clone();
+            cred.is_privileged = input.is_privileged;
             cred.passphrase = input.passphrase.clone();
             cred.fingerprint = fingerprint;
             credentials::insert(&conn, &cred, &key)?;

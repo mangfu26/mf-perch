@@ -13,7 +13,7 @@
 //!
 //! ```bash
 //! export MFPERCH_TEST_HOST=127.0.0.1
-//! export MFPERCH_TEST_PORT=2222
+//! export MFPERCH_TEST_PORT=2223
 //! export MFPERCH_TEST_USER=mfperch
 //! export MFPERCH_TEST_KEY=<私钥路径>
 //! export MFPERCH_TEST_SUDO_PW=<测试用户的 sudo 密码>
@@ -422,10 +422,16 @@ async fn privileged_channel_runs_commands_as_root() {
     let t = target();
     let (host, auth) = privileged_target(&t);
 
-    let (session, mut rx) =
-        Session::connect_privileged("term_priv", &host, auth, &t.sudo_password)
-            .await
-            .expect("提权通道应能建立（密码经本通道 stdin 投递）");
+    let (session, mut rx) = Session::connect_privileged(
+        "term_priv",
+        &host,
+        auth,
+        Some(t.sudo_password.as_str()),
+        SudoPolicy::Auto,
+        false,
+    )
+    .await
+    .expect("提权通道应能建立（密码经本通道 stdin 投递）");
 
     session
         .send_command("cmd_priv", "id -u")
@@ -457,7 +463,14 @@ async fn privileged_channel_fails_fast_on_wrong_password() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(45),
-        Session::connect_privileged("term_priv_bad", &host, auth, "definitely-wrong-password"),
+        Session::connect_privileged(
+            "term_priv_bad",
+            &host,
+            auth,
+            Some("definitely-wrong-password"),
+            SudoPolicy::Auto,
+            false,
+        ),
     )
     .await;
 

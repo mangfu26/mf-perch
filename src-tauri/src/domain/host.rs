@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use super::{new_id, now_rfc3339};
 
 /// sudo 密码处理策略（Q33，客户要求一期全部实现）。
+///
+/// 这里只回答"允许 Agent 在这台主机上使多大劲"。**"登录身份本身就是特权用户"
+/// 不是这里的一档**，它是凭据的属性（`Credential::is_privileged`，D60）：
+/// 一份凭据可被 N 台主机引用，标记跟着身份走才不用逐台改。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SudoPolicy {
@@ -245,6 +249,13 @@ mod tests {
             );
             assert_eq!(SudoPolicy::parse(want), Some(variant));
         }
+        // 「登录即特权用户」这一档已挪到凭据上（D60）：策略词表里不该再出现它，
+        // 否则同一件事会有两处表达，界面与库里各说一套。
+        assert_eq!(
+            SudoPolicy::parse("not_needed"),
+            None,
+            "not_needed 必须由 credentials.is_privileged 表达，不是第四档策略"
+        );
 
         let shell_env_mode = [
             (ShellEnvMode::LoginThenTask, "login"),

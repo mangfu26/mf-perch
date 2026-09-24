@@ -62,6 +62,8 @@ export default {
     sudoPolicyAskDesc: "Agent 请求提权时通过系统通知征得你的同意",
     sudoPolicyAuto: "自动提权",
     sudoPolicyAutoDesc: "Agent 请求提权时自动使用该主机的提权密码",
+    sudoPolicyPrivilegedNote:
+      "该认证信息已标记为特权身份，登录即已是特权用户：没有提权这一步，不会索要 sudo 口令，也不会再通知你确认。此处选择仅决定 Agent 能否走提权通道执行命令（「不允许提权」仍会拒绝）。",
     sudoPasswordSource: "sudo 密码来源",
     sudoPasswordOwn: "单独配置",
     sudoPasswordReuse: "复用 SSH 登录密码",
@@ -105,6 +107,9 @@ export default {
     passphraseHint: "私钥若设有口令，请填写以便解锁",
     fingerprint: "指纹",
     fingerprintHint: "出于安全考虑，私钥正文不会回显",
+    isPrivileged: "该身份是特权用户",
+    isPrivilegedHint:
+      "登录该身份即已是特权用户（如 root）：勾选后不必再配置 sudo 口令，主机也不会执行 sudo。实际 uid 由远端核实，不符时会如实告警。此标记随认证信息生效于所有引用它的主机。",
     usedBy: "被以下主机引用",
     deleteConfirm: "确定删除该认证信息吗？",
     deleteWarning: "引用该认证信息的主机将无法连接。",

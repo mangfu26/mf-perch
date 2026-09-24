@@ -26,6 +26,7 @@ fn credential_input(username: &str, secret: Option<&str>) -> CredentialInput {
         name: Some("test".into()),
         username: username.into(),
         kind: "password".into(),
+        is_privileged: false,
         secret: secret.map(|s| s.to_string()),
         passphrase: None,
     }
@@ -87,6 +88,18 @@ async fn save_host_rejects_invalid_policy_value() {
 
     let err = save_host_inner(&state, input).await.unwrap_err();
     assert!(matches!(err, crate::error::AppError::InvalidArgument(_)));
+
+    // D60：「登录即特权用户」已挪到凭据上，不再是一档策略。旧值必须被明确拒绝，
+    // 而不是静默回落到默认值——那会让用户以为配置生效了。
+    let mut legacy = host_input("10.0.0.1", None);
+    legacy.sudo_policy = "not_needed".into();
+    assert!(
+        matches!(
+            save_host_inner(&state, legacy).await.unwrap_err(),
+            AppError::InvalidArgument(_)
+        ),
+        "not_needed 不再是一档策略，应当报错"
+    );
 }
 
 #[tokio::test]
@@ -202,6 +215,36 @@ async fn save_host_accepts_reuse_login_with_password_credential() {
     save_host_inner(&state, input)
         .await
         .expect("密码类凭据 + 复用登录密码是自洽配置");
+}
+
+#[tokio::test]
+async fn save_host_accepts_privileged_credential_without_any_password() {
+    // D60：以特权身份登录的主机没有"提权口令"这件事。同一份配置（密钥凭据 + 无任何口令）
+    // 在 auto 档会被拒绝保存（另一半见 save_host_rejects_reuse_login_with_key_credential），
+    // 凭据标为特权身份后必须放行——否则这一维形同虚设。
+    let (state, _key) = test_state();
+    let mut cred_in = credential_input("root", Some("-----BEGIN OPENSSH PRIVATE KEY-----"));
+    cred_in.kind = "key".into(); // 密钥凭据：复用登录密码这条路本来就不成立
+    cred_in.is_privileged = true;
+    let cred_id = save_credential_inner(&state, cred_in).await.unwrap();
+
+    // 先确认 IPC 把这一维真的落库了——否则下面的"放行"可能只是校验本身失效。
+    {
+        let conn = state.db.lock().await;
+        assert!(
+            credentials::is_privileged(&conn, &cred_id).unwrap(),
+            "IPC 保存时丢了 is_privileged，界面勾了等于没勾"
+        );
+    }
+
+    let mut input = host_input("10.0.0.13", Some(cred_id));
+    input.sudo_policy = "auto".into();
+    input.sudo_password_source = "reuse_login".into();
+    input.sudo_password = None;
+
+    save_host_inner(&state, input)
+        .await
+        .expect("特权登录身份不该要求任何提权口令");
 }
 
 #[tokio::test]
