@@ -295,6 +295,10 @@ ALTER TABLE credentials ADD COLUMN is_privileged INTEGER NOT NULL DEFAULT 0;
 /// 不要写成 `current < 3 || …`，理由同 V2 那段注释）；④在这里追加一行，第三项先随便填——
 /// `released_schema_texts_are_frozen` 的失败信息会打印实际摘要。
 /// 漏掉 ④ 会撞到 `released_schema_steps_cover_every_version`（版本号与条目必须一一对应）。
+///
+/// 标 `#[cfg(test)]`：这份登记册只服务上面那两条守护，生产路径不读它（放在这里是让
+/// 追加步骤的人一眼看到 ④，不要挪进 `tests` 模块）。
+#[cfg(test)]
 const RELEASED_SCHEMA_STEPS: &[(i64, &str, &str)] = &[
     (
         1,
