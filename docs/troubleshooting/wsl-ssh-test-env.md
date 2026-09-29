@@ -44,7 +44,7 @@ icacls .tmp-test/id_test //inheritance:r //grant:r "$USERNAME:(R,W)" # System32 
   **不校验文件权限**。不要因为 `ssh` 连不上就去怀疑测试环境或 `authorized_keys`。
 - 判据顺序：先 `BatchMode=yes -vv` 看客户端有没有"Load key"报错，再看 WSL 侧
   `/var/log/auth.log` 有没有 `Accepted publickey`。两边都正常才是网络/端口问题。
-- 换开发机时，`AGENTS.local.md`（gitignored）里的重建步骤应包含这一步——
+- 换开发机时，重建步骤（本文档与 [`test-environment.md`](../design/test-environment.md)）应包含这一步——
   私钥是在 Windows 侧生成的，权限校验也就只在 Windows 侧触发。
 
 ---
