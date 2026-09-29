@@ -1,0 +1,67 @@
+# 可复用工作流：AGENTS.md §5.10 的**默认门禁**（不含带 #[ignore] 的真实环境用例，
+# 它们依赖开发机上的 WSL SSH 服务器）。
+# 这里只定义一次：日常提交由 ci.yml 引用、发版由 release.yml 引用，
+# 改门禁只需改这一处，不会出现"CI 绿了但发布时跑的其实是另一套步骤"。
+name: Gate
+
+on:
+  workflow_call:
+
+jobs:
+  gate:
+    name: Default gate (Windows)
+    runs-on: windows-latest
+
+    steps:
+      # ref 取默认值即调用方的 ref：tag 触发时是 tag（release 场景正是如此），
+      # PR 触发时是 PR 的合并提交——不需要也不应该在这里写死
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 与开发机的 pnpm 主次版本保持一致
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Gate - secret scan
+        run: pnpm check:secrets
+
+      - name: Gate - IPC contract
+        run: pnpm check:ipc
+
+      # 文档预算门禁：超限即红灯，防止文档随功能一起无声膨胀
+      # （脚本本体在 package.json 的 scripts.check:docs，不在本文件里定义）
+      - name: Gate - docs budget
+        run: pnpm check:docs
+
+      - name: Gate - frontend tests
+        run: pnpm test
+
+      # typecheck 排在 cargo test 之前：它只要十几秒，而 cargo test 是分钟级，
+      # 类型错误先亮红灯可以省掉后面整段编译
+      - name: Gate - typecheck
+        run: pnpm typecheck
+
+      - name: Gate - cargo test
+        working-directory: src-tauri
+        # 并行度取默认值：-j 2 是针对**低内存 / target 在慢盘**的开发机降级，
+        # runner 不属于该条件，压成两路只是白等
+        run: cargo test

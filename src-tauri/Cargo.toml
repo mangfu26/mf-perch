@@ -17,7 +17,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 # MCP Server 是产品核心能力（D1），默认开启。
-# 保留特性开关是为了让纯 SSH 引擎的测试可在不编译 MCP 依赖时快速运行。
+# 关掉它可让纯 SSH / store 引擎的检查不编译 rmcp / axum / schemars：
+#   cargo check --lib --no-default-features
+#   cargo test  --lib --no-default-features <模块>
+# 两条边界（理由见 docs/agent/testing.md §5.10）：
+#   ① 裁掉的只是 MCP 相关依赖，tauri / rusqlite / ring / rustls 等大头仍在，节省有限；
+#   ② 特性集合不同 = 另一套编译指纹，**在两种配置间来回切会反复重编**，
+#      因此它适合"整段时间只做 SSH / store 侧工作"，不适合当日常主循环。
 default = ["mcp"]
 mcp = ["dep:rmcp", "dep:axum", "dep:schemars"]
 
@@ -93,6 +99,14 @@ semver = "1"
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+
+# 开发 / 测试档位：只保留行号级调试信息（file:line 仍可用于 panic 定位），
+# 砍掉完整 debuginfo 的 codegen 与链接开销——这是开发机上"跑一次测试很久"的主要成本之一。
+# 需要完整调试信息（附加调试器、看局部变量）时临时覆盖，不必改文件：
+#   $env:CARGO_PROFILE_DEV_DEBUG = "2"
+# 依据与测量方式见 docs/agent/testing.md §5.11。
+[profile.dev]
+debug = "line-tables-only"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

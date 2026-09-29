@@ -13,6 +13,9 @@
 //! `{ ok: true, data }` 或 `{ ok: false, code, message }`，
 //! 前端据 `code` 做差异化提示。
 
+// MCP 管理命令依赖 `crate::mcp`，因此与它同属 `mcp` 特性（见 Cargo.toml 的 features 说明）：
+// 关掉特性时模块与 lib.rs 里注册的命令一起消失，`--no-default-features` 才能编过。
+#[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod settings;
 pub mod update;

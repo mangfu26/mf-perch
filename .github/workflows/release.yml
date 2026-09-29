@@ -31,9 +31,17 @@ env:
   BUNDLE_DIR: src-tauri/target/release/bundle
 
 jobs:
+  # 发版前的默认门禁与日常提交共用同一个可复用工作流（AGENTS.md §5.10），
+  # 不在这里内联步骤：否则"CI 绿了"与"发布时跑的"会各自演化成两套。
+  gate:
+    name: Gate
+    uses: ./.github/workflows/gate.yml
+
   release:
     name: Build & Release (Windows)
     runs-on: windows-latest
+    # 门禁红灯就不构建、不创建 Release、不回写 update.json
+    needs: gate
 
     steps:
       - name: Checkout
@@ -79,27 +87,6 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-
-      # ── 门禁：AGENTS.md §5.10 的默认门禁。
-      # 带 #[ignore] 的真实环境用例不在 CI 跑——它们依赖开发机上的 WSL SSH 服务器。
-      - name: Gate - secret scan
-        run: pnpm check:secrets
-
-      - name: Gate - IPC contract
-        run: pnpm check:ipc
-
-      - name: Gate - frontend tests
-        run: pnpm test
-
-      # typecheck 单独提前跑，失败时省掉后面 cargo test 的几分钟编译
-      # （tauri build 的 beforeBuildCommand 会再跑一次 vue-tsc，幂等）
-      - name: Gate - typecheck
-        run: pnpm typecheck
-
-      - name: Gate - cargo test
-        working-directory: src-tauri
-        # 并行度取默认值：-j 2 是低内存 / target 在慢盘上的开发机降级，runner 不属于该条件
-        run: cargo test
 
       # ── 构建：bundle.targets = "all" → 一次出 nsis/*.exe 与 msi/*.msi
       - name: Build installers
