@@ -9,6 +9,10 @@
 Windows 侧通过**真实 SSH 协议**连接它，不用进程内 mock。
 **选型理由与替代方案（Docker / 客户远端主机）的取舍见 [D27](../decisions/D27.md)，不要在此重新评估。**
 
+> **本文只是"方式 ①"的搭建说明**：真实环境测试**跑之前先问客户用哪种方式**——
+> ① 本机 WSL（本文），② 客户提供一台真实主机的连接信息（含安全边界，见
+> [`docs/agent/testing.md`](../agent/testing.md) §5.6）。取值只在会话内提供，不落本机长期文件。
+
 > 操作提醒：**Git Bash 不是 Linux 测试目标**——它是 Cygwin，`bash` 内建行为差异大，
 > 在它里面跑出来的结论不成立；本文的命令一律在 WSL 内执行。
 
@@ -54,9 +58,9 @@ wsl --install -d Ubuntu
 
 ## 4. 环境现状与实测记录
 
-- **环境因机器而异**：本机的取值、私钥路径与重建入口记在仓库根部的
-  **`AGENTS.local.md`**（gitignored，规则见 [`AGENTS.md`](../../AGENTS.md) §5.6.2）——
-  换开发机时重建它，不要照抄下面这张表的取值。
+- **环境因机器而异**：本机的取值与私钥路径**不落本机长期文件**——按
+  [`AGENTS.md`](../../AGENTS.md) §5.6 在测试前向客户确认方式与取值；
+  换开发机时按本文重建环境，**不要照抄下面这张表的取值**。
   参考实测：2026-09-21 一台开发机为 **WSL Ubuntu 26.04.1**（内核 6.18、systemd 已启用、
   bash 5.3.9、OpenSSH 10.2p1），下表各项在该机复验一致。
   选型与客户答复见 **D27 / Q26**，此处不复述。
@@ -71,7 +75,7 @@ wsl --install -d Ubuntu
 | 测试密钥对 | ed25519、**无 passphrase**（russh 直接读 PEM） |
 | `~/.bash_profile`（`mfperch`） | 把 `/opt/mfperch-test-bin` 加进 PATH，且**不打印任何内容**；该目录内有可执行 `mfperch-test` |
 | `requiretty` | **不得**设置，否则提权通道不可用（能力边界见 [`AGENTS.md`](../../AGENTS.md) §4.4） |
-| 搭建脚本 | 幂等、可重跑；本机路径记在 `AGENTS.local.md`（不入库） |
+| 搭建脚本 | 幂等、可重跑；本机路径不入库（见 §4 第一条） |
 | Windows → WSL SSH 连通性 | Windows 侧可连通（NAT 模式下的实测见 §4.2 ①）。**注意 Windows 上那个端口监听由 WSL 的 localhost 转发代持，随 WSL 实例生命周期消失**——核对要在 WSL 有进程挂着时做，`netstat -ano \| findstr 2223` 为空即实例已停（判读见 [`development-troubleshooting.md`](../development-troubleshooting.md)） |
 
 ### 4.2 实测验证结论（关键）
@@ -146,7 +150,7 @@ wsl --install -d Ubuntu
 | `session_handles_quoting_and_special_chars` | 含引号与 `$` 的命令无需转义（NUL 分帧的价值） | ✅ |
 | `session_is_not_confused_by_marker_like_output` | 输出中出现形似结束标记的文本时**不误判**（nonce 机制） | ✅ |
 
-运行方式（需先导出目标主机信息）：
+运行方式（目标信息按 [`docs/agent/testing.md`](../agent/testing.md) §5.6 在会话内提供，不落本机文件）：
 
 ```bash
 export MFPERCH_TEST_HOST=127.0.0.1

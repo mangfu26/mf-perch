@@ -1,0 +1,24 @@
+# 日常提交的远程门禁：分支 push 与进 main 的 PR 都跑一遍 AGENTS.md §5.10 的默认门禁，
+# 不必每次都靠开发机上的全量验证（那里冷编译以十分钟计）。
+# 门禁步骤只在 gate.yml 里定义一次，这里只负责触发与取消策略。
+name: CI
+
+on:
+  push:
+    # 只覆盖开发分支：main 由 pull_request 触发把关，避免合并与推送跑两遍同样的门禁
+    branches:
+      - 'develop/**'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# 同一 ref 上只保留最新一次运行：连推几个 commit 时，被取代的那次没有继续验证的价值
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Gate
+    uses: ./.github/workflows/gate.yml

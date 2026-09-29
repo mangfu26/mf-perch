@@ -100,13 +100,21 @@ pub fn run() {
             ipc::search_history,
             ipc::history_stats,
             // 设置：无通用读写入口（V18），一律走下列类型化命令
-            // MCP 管理
+            // MCP 管理（`mcp` 特性关闭时这些命令不编译；`generate_handler!` 支持在条目上带
+            // 属性并把它们转发到生成的 match 分支，见 tauri-macros 的 CommandDef::parse）
+            #[cfg(feature = "mcp")]
             ipc::mcp::mcp_status,
+            #[cfg(feature = "mcp")]
             ipc::mcp::mcp_start,
+            #[cfg(feature = "mcp")]
             ipc::mcp::mcp_stop,
+            #[cfg(feature = "mcp")]
             ipc::mcp::mcp_regenerate_token,
+            #[cfg(feature = "mcp")]
             ipc::mcp::mcp_set_allow_remote,
+            #[cfg(feature = "mcp")]
             ipc::mcp::mcp_set_auto_start,
+            #[cfg(feature = "mcp")]
             ipc::mcp::mcp_client_config,
             // sudo 确认（Q33 ask 模式）
             sudo_bridge::sudo_respond,

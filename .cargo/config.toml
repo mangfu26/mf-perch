@@ -1,0 +1,11 @@
+# Cargo 别名：只为「少打字、少记错」，不改变任何构建语义。
+#
+# 刻意**不**设置 `[build] jobs`：并行度是机器相关的（可用内存有限、且 target 落在慢盘时需要
+# `-j 2`，否则会耗尽 Windows 页面文件并写坏 target 产物），而 CI runner 不属于该条件、
+# 需要默认并行度。写进配置会连带影响 CI，因此并行度只由调用方显式给出。
+# 依据与运行方式见 docs/agent/testing.md §5.10 / §5.11。
+[alias]
+# cargo t  = cargo test -j 2
+t = "test -j 2"
+# cargo tl <模块>  = cargo test -j 2 --lib <模块>（日常主力：只跑受影响模块）
+tl = "test -j 2 --lib"

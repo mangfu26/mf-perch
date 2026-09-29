@@ -50,18 +50,41 @@ for (const f of rustFiles) {
 // ───────────────────────── 2) Rust：注册清单 ─────────────────────────
 const registered = new Map();
 let handlerWhere = null;
+let handlerParseError = null;
 for (const f of rustFiles) {
   const text = readFileSync(f, "utf8");
   const at = text.indexOf("generate_handler!");
   if (at === -1) continue;
   handlerWhere = show(f);
   const open = text.indexOf("[", at);
-  const close = text.indexOf("]", open);
+  // **不能取"第一个 `]`"**：清单条目可以带属性（如 `#[cfg(feature = "mcp")]`），
+  // 属性自带方括号，取第一个 `]` 会把清单截断在属性处，
+  // 把其后的命令全部误判成"未注册"（本项目实际踩过：gate 因此红灯）。
+  // 属性里的括号成对出现，所以做括号配对得到的就是清单自身的结尾。
+  let close = -1;
+  let depth = 0;
+  for (let i = open; i < text.length; i += 1) {
+    if (text[i] === "[") depth += 1;
+    else if (text[i] === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        close = i;
+        break;
+      }
+    }
+  }
+  if (close === -1) {
+    handlerParseError = `\`generate_handler!\` 的注册清单没有配对的 \`]\`（${handlerWhere}），无法完成检查`;
+    break;
+  }
   // 注意：仓库里 .rs 是 CRLF 行尾。`\/\/.*$` 在这种文本上**匹配不到**——
   // 不带 `m` 标志时 `$` 只匹配字符串末尾，而 `.` 匹配不了 `\r`。
   // 因此这里按 `\r?\n` 切分，并用不带 `$` 的注释正则。
   for (const raw of text.slice(open + 1, close).split(/\r?\n/)) {
-    const code = raw.replace(/\/\/.*/, "").trim(); // 去掉整行/行尾注释
+    const code = raw
+      .replace(/\/\/.*/, "") // 去掉整行/行尾注释
+      .replace(/#\[[^\]]*\]/g, "") // 去掉条目上的属性（如 #[cfg(feature = "mcp")]）
+      .trim();
     if (!code) continue;
     const name = code.replace(/,$/, "").split("::").pop().trim();
     if (name) registered.set(name, handlerWhere);
@@ -102,6 +125,9 @@ const warnings = [];
 
 if (!handlerWhere) {
   errors.push("找不到 `tauri::generate_handler!` 注册清单，无法完成检查");
+}
+if (handlerParseError) {
+  errors.push(handlerParseError);
 }
 
 for (const [name, where] of rustDefs) {
