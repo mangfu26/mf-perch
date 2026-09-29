@@ -12,9 +12,13 @@
     "typecheck": "vue-tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:fast": "node scripts/test-fast.mjs",
+    "test:rust": "cargo test -j 2 --lib --test version_check_e2e --test mcp_e2e --manifest-path src-tauri/Cargo.toml",
+    "gate": "pnpm check:secrets && pnpm check:ipc && pnpm check:docs && pnpm test && pnpm typecheck && pnpm test:rust",
     "dev:clean": "node scripts/clean-dev.mjs",
     "check:secrets": "node scripts/check-secrets.mjs",
     "check:ipc": "node scripts/check-ipc-contract.mjs",
+    "check:docs": "node scripts/check-docs.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
